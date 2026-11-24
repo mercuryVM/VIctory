@@ -259,6 +259,18 @@ pub fn track(
             }
         }
     }
+    let built = out.descriptors.iter().flat_map(|d| {
+        d.source.leaves().into_iter().filter_map(|l| match l {
+            Source::Built { address, .. } => Some(*address),
+            _ => None,
+        })
+    });
+    let addresses: Vec<Address> = out.scalar.iter().map(|s| s.1).chain(built).collect();
+    for pair in addresses.into_iter().filter_map(|a| t.pair(a)) {
+        if !out.pairs.contains(&pair) {
+            out.pairs.push(pair);
+        }
+    }
     // The proof needs the per-lane form. Without it nothing is emitted, and
     // its failure is the one to report, so the reads stay unproven here.
     if t.lanes.is_none() {
@@ -285,18 +297,6 @@ pub fn track(
             out.waterfall.compares.extend(proof.compares);
             out.waterfall.reads.extend(proof.reads);
             out.waterfall.loads.extend(loads);
-        }
-    }
-    let built = out.descriptors.iter().flat_map(|d| {
-        d.source.leaves().into_iter().filter_map(|l| match l {
-            Source::Built { address, .. } => Some(*address),
-            _ => None,
-        })
-    });
-    let addresses: Vec<Address> = out.scalar.iter().map(|s| s.1).chain(built).collect();
-    for pair in addresses.into_iter().filter_map(|a| t.pair(a)) {
-        if !out.pairs.contains(&pair) {
-            out.pairs.push(pair);
         }
     }
     Ok(out)
