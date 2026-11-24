@@ -238,32 +238,7 @@ impl Bools {
     /// `b` where `holds`, its negation where not. Yes when the search grows
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
-        let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
-    }
-
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
-        let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
-        if all.iter().any(fails) {
-            return false;
-        }
-        all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
-        if all.is_empty() || *budget == 0 {
-            return true;
-        }
-        *budget -= 1;
-        let top = |b: Bool| self.nodes[b.0 as usize].0;
-        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
-            let next = all
-                .iter()
-                .map(|&(b, holds)| {
-                    let (lo, hi) = self.split(b, v);
-                    (if value { hi } else { lo }, holds)
-                })
-                .collect();
-            self.meet_in(next, budget)
-        })
+        Meet::new(self).solve(all.to_vec())
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
@@ -325,6 +300,222 @@ impl Bools {
             }
         }
         b
+    }
+}
+
+/// Ephemeral SAT solver for [`Bools::meet`] over immutable BDD nodes.
+struct Meet<'a> {
+    bools: &'a Bools,
+    extra: Vec<(u32, Bool, Bool)>,
+    extra_unique: Map<(u32, Bool, Bool), Bool>,
+    restrict_memo: Map<Bool, Bool>,
+    forced: Map<u32, bool>,
+    failed: HashSet<Vec<(Bool, bool)>, BuildHasherDefault<Fx>>,
+    budget: usize,
+    overflow: bool,
+}
+
+impl<'a> Meet<'a> {
+    fn new(bools: &'a Bools) -> Self {
+        Self {
+            bools,
+            extra: Vec::new(),
+            extra_unique: Map::default(),
+            restrict_memo: Map::default(),
+            forced: Map::default(),
+            failed: HashSet::with_hasher(BuildHasherDefault::default()),
+            budget: MAX_MEET,
+            overflow: false,
+        }
+    }
+
+    fn node(&self, b: Bool) -> (u32, Bool, Bool) {
+        let idx = b.0 as usize;
+        if idx < self.bools.nodes.len() {
+            self.bools.nodes[idx]
+        } else {
+            self.extra[idx - self.bools.nodes.len()]
+        }
+    }
+
+    fn split(&self, b: Bool, v: u32) -> (Bool, Bool) {
+        match self.node(b) {
+            (bv, lo, hi) if bv == v => (lo, hi),
+            _ => (b, b),
+        }
+    }
+
+    fn mk(&mut self, v: u32, lo: Bool, hi: Bool) -> Bool {
+        if lo == hi {
+            return lo;
+        }
+        if let Some(&b) = self.bools.unique.get(&(v, lo, hi)) {
+            return b;
+        }
+        if let Some(&b) = self.extra_unique.get(&(v, lo, hi)) {
+            return b;
+        }
+        if self.extra.len() >= MAX_NODES
+            || self.bools.nodes.len() + self.extra.len() >= u32::MAX as usize
+        {
+            self.overflow = true;
+            return Bool::FALSE;
+        }
+        let b = Bool((self.bools.nodes.len() + self.extra.len()) as u32);
+        self.extra.push((v, lo, hi));
+        self.extra_unique.insert((v, lo, hi), b);
+        b
+    }
+
+    fn restrict(&mut self, b: Bool, forced: &Map<u32, bool>, max_v: u32) -> Bool {
+        let (bv, lo, hi) = self.node(b);
+        if bv == TERMINAL || bv > max_v || self.overflow {
+            return b;
+        }
+        if let Some(&r) = self.restrict_memo.get(&b) {
+            return r;
+        }
+        let r = if let Some(&value) = forced.get(&bv) {
+            self.restrict(if value { hi } else { lo }, forced, max_v)
+        } else {
+            let l = self.restrict(lo, forced, max_v);
+            let h = self.restrict(hi, forced, max_v);
+            if self.overflow {
+                return Bool::FALSE;
+            }
+            if l == lo && h == hi {
+                b
+            } else {
+                self.mk(bv, l, h)
+            }
+        };
+        self.restrict_memo.insert(b, r);
+        r
+    }
+
+    /// Canonicalizes constraints and propagates forced top-variable assignments to
+    /// a fixed point before branching into larger BDDs.
+    fn propagate(&mut self, all: &mut Vec<(Bool, bool)>) -> Option<bool> {
+        loop {
+            let mut i = 0;
+            while i < all.len() {
+                let (b, holds) = all[i];
+                if b == if holds { Bool::FALSE } else { Bool::TRUE } {
+                    return Some(false);
+                }
+                if b == Bool::FALSE || b == Bool::TRUE {
+                    all.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            all.sort_unstable();
+            all.dedup();
+            if all.windows(2).any(|w| w[0].0 == w[1].0 && w[0].1 != w[1].1) {
+                return Some(false);
+            }
+            if all.len() <= 1 {
+                // Any single non-constant reduced ROBDD node attains both `false` and `true`.
+                return Some(true);
+            }
+
+            let mut forced = std::mem::take(&mut self.forced);
+            forced.clear();
+            let mut max_v = 0u32;
+            let mut conflict = false;
+            for &(b, holds) in all.iter() {
+                let (v, lo, hi) = self.node(b);
+                debug_assert_ne!(v, TERMINAL);
+                let bad = if holds { Bool::FALSE } else { Bool::TRUE };
+                let req = if lo == bad {
+                    Some(true)
+                } else if hi == bad {
+                    Some(false)
+                } else {
+                    None
+                };
+                if let Some(val) = req {
+                    if let Some(prev) = forced.insert(v, val) {
+                        if prev != val {
+                            conflict = true;
+                            break;
+                        }
+                    } else {
+                        max_v = max_v.max(v);
+                    }
+                }
+            }
+            if conflict {
+                self.forced = forced;
+                return Some(false);
+            }
+            if forced.is_empty() {
+                self.forced = forced;
+                return None;
+            }
+            self.restrict_memo.clear();
+            for (b, _) in all.iter_mut() {
+                *b = self.restrict(*b, &forced, max_v);
+            }
+            self.forced = forced;
+            if self.overflow {
+                return Some(true);
+            }
+        }
+    }
+
+    fn solve(&mut self, mut all: Vec<(Bool, bool)>) -> bool {
+        if self.bools.overflow {
+            return true;
+        }
+        if let Some(res) = self.propagate(&mut all) {
+            return res;
+        }
+        if self.failed.contains(&all) {
+            return false;
+        }
+        if self.budget == 0 {
+            return true;
+        }
+        self.budget -= 1;
+        let v = all
+            .iter()
+            .map(|&(b, _)| self.node(b).0)
+            .min()
+            .expect("not empty");
+        let mut score = [0usize; 2];
+        for &(b, holds) in &all {
+            let (bv, lo, hi) = self.node(b);
+            if bv == v {
+                let good = if holds { Bool::TRUE } else { Bool::FALSE };
+                if lo == good {
+                    score[0] += 1;
+                }
+                if hi == good {
+                    score[1] += 1;
+                }
+            }
+        }
+        let order = if score[1] > score[0] {
+            [true, false]
+        } else {
+            [false, true]
+        };
+        for value in order {
+            let next = all
+                .iter()
+                .map(|&(b, holds)| {
+                    let (lo, hi) = self.split(b, v);
+                    (if value { hi } else { lo }, holds)
+                })
+                .collect();
+            if self.solve(next) {
+                return true;
+            }
+        }
+        // Both branches returned false cleanly, so `all` is genuinely UNSAT.
+        self.failed.insert(all);
+        false
     }
 }
 
@@ -1404,5 +1595,180 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn meet_pins_forced_variables_across_deep_diamond_chain() {
+        let mut b = Bools::new();
+        let val = Value;
+        let mut reach = Bool::TRUE;
+        for i in 0..24u32 {
+            let x = b.atom(Atom::Lane(val(2 * i + 1)), i as usize);
+            let y = b.atom(Atom::Lane(val(2 * i + 2)), i as usize);
+            let clause = b.or(x, y);
+            reach = b.and(reach, clause);
+        }
+        let tail = b.atom(Atom::Lane(val(100)), 30);
+        let not_tail = b.not(tail);
+        let guarded = b.and(reach, not_tail);
+        // Without bottom-up forced-var restriction, branching on the 24 (x | y) diamonds
+        // explores 3^24 paths and hits MAX_MEET, falsely returning `true`.
+        assert!(!b.meet(&[(guarded, true), (tail, true)]));
+        assert!(b.meet(&[(guarded, true), (tail, false)]));
+
+        // Cascading unit propagation through a forced chain at the bottom.
+        let gate = b.atom(Atom::Uniform(val(101)), 31);
+        let cascade = b.ite(tail, gate, Bool::FALSE);
+        assert!(!b.meet(&[(guarded, true), (cascade, true)]));
+        assert!(b.meet(&[(reach, true), (cascade, true)]));
+    }
+
+    #[test]
+    fn meet_memoizes_diamonds_without_forced_root_vars() {
+        let mut b = Bools::new();
+        let val = Value;
+        let mut reach = Bool::TRUE;
+        for i in 0..22u32 {
+            let x = b.atom(Atom::Lane(val(2 * i + 1)), i as usize);
+            let y = b.atom(Atom::Lane(val(2 * i + 2)), i as usize);
+            let clause = b.or(x, y);
+            reach = b.and(reach, clause);
+        }
+        // Keep the conflict (z0 & !z0) below all 22 diamonds so no variable is
+        // forced at the root; failed-state memoization collapses the DAG.
+        let z0 = b.atom(Atom::Lane(val(200)), 30);
+        let z1 = b.atom(Atom::Lane(val(201)), 30);
+        let eq = b.xor(z0, z1);
+        let c1 = b.and(reach, z0);
+        let nz0 = b.not(z0);
+        let c2 = b.and(reach, nz0);
+        assert!(!b.meet(&[(c1, true), (c2, true)]));
+
+        let same_side = b.and(reach, eq);
+        assert!(b.meet(&[(c1, true), (same_side, true)]));
+        assert!(!b.meet(&[(c1, true), (c1, false)]));
+    }
+
+    #[test]
+    fn meet_handles_canonical_dedup_and_trivial_constraints() {
+        let mut b = Bools::new();
+        let x = b.atom(Atom::Lane(Value(1)), 0);
+        let nx = b.not(x);
+        assert!(b.meet(&[]));
+        assert!(b.meet(&[(Bool::TRUE, true), (Bool::FALSE, false)]));
+        assert!(!b.meet(&[(Bool::FALSE, true)]));
+        assert!(!b.meet(&[(Bool::TRUE, false)]));
+        assert!(b.meet(&[(x, true), (x, true)]));
+        assert!(!b.meet(&[(x, true), (x, false)]));
+        assert!(!b.meet(&[(x, false), (nx, false)]));
+    }
+
+    #[test]
+    fn resource_lane_phi_prunes_dead_arm_behind_diamond_chain() {
+        use crate::native::{HwStage, RootParam, RootType::Table};
+
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0602,
+            0xFA00_0000, // s_load_dwordx4 s[24:27], s[4:5], 0x0
+            0xF408_0802,
+            0xFA00_0020, // s_load_dwordx4 s[32:35], s[4:5], 0x20
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        // Prepend 20 (a_i | b_i) early-cull diamonds so `reach` carries 3^20 paths into
+        // the `lane_phi` + waterfall below; each cbranch targets the shared final s_endpgm.
+        const DIAMONDS: usize = 20;
+        let mut cbranch_sites = Vec::with_capacity(DIAMONDS);
+        for _ in 0..DIAMONDS {
+            words.extend_from_slice(&[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE8A_036A, // s_mov_b32 s10, vcc_lo
+                0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+                0x886A_6A0A, // s_or_b32 vcc_lo, s10, vcc_lo
+                0xBE8A_3C6A, // s_and_saveexec_b32 s10, vcc_lo
+                0xBF88_0000, // s_cbranch_execz -> patched to final s_endpgm
+            ]);
+            cbranch_sites.push(words.len() - 1);
+        }
+        // Waterfall descriptor join guarded by `s30` (`24 > v0`); the `!s30` arm never runs
+        // inside the waterfall loop and must be proven dead despite the 20 diamonds above.
+        words.extend_from_slice(&[
+            0xD4C4_001E,
+            0x0002_0098, // v_cmp_gt_u32_e64 s30, 24, v0
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0x8914_147E, // s_xor_b32 s20, exec_lo, s20
+            0xBF88_0004, // s_cbranch_execz -> +4
+            0x7E08_0218, // v_mov_b32 v4, s24
+            0x7E0A_0219, // v_mov_b32 v5, s25
+            0x7E0C_021A, // v_mov_b32 v6, s26
+            0x7E0E_021B, // v_mov_b32 v7, s27
+            0xBE94_3D14, // s_or_saveexec_b32 s20, s20
+            0x897E_147E, // s_xor_b32 exec_lo, exec_lo, s20
+            0xBF88_0007, // s_cbranch_execz -> +7
+            0xBE9F_3C1E, // s_and_saveexec_b32 s31, s30
+            0xBF88_0004, // s_cbranch_execz -> +4
+            0x7E08_0220, // v_mov_b32 v4, s32
+            0x7E0A_0221, // v_mov_b32 v5, s33
+            0x7E0C_0222, // v_mov_b32 v6, s34
+            0x7E0E_0223, // v_mov_b32 v7, s35
+            0x887E_1F7E, // s_or_b32 exec_lo, exec_lo, s31
+            0x887E_147E, // s_or_b32 exec_lo, exec_lo, s20
+            0xBE97_3C1E, // s_and_saveexec_b32 s23, s30
+            0xBF88_0013, // s_cbranch_execz -> +19
+            0xBE9D_037E, // s_mov_b32 s29, exec_lo
+            0x7E18_0504, // v_readfirstlane_b32 s12, v4
+            0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+            0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+            0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+            0xD4E2_0015,
+            0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
+            0xD4E2_0016,
+            0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+            0x8715_1615, // s_and_b32 s21, s21, s22
+            0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+            0xE030_1000,
+            0x8003_0C10, // buffer_load_dword v12, v16, s[12:15], 0 offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+            0xBF89_FFF1, // s_cbranch_execnz -> loop
+            0xBEFE_031D, // s_mov_b32 exec_lo, s29
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            0x887E_177E, // s_or_b32 exec_lo, exec_lo, s23
+            S_ENDPGM,
+        ]);
+        let end_idx = words.len() - 1;
+        for site in cbranch_sites {
+            let rel = (end_idx - site - 1) as u16;
+            words[site] = 0xBF88_0000 | u32::from(rel);
+        }
+        let p = build(&words, false);
+        let s = structure(&p).unwrap();
+        let layout = [
+            RootParam {
+                root: Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 1,
+                slot: 0,
+            },
+        ];
+        let r = crate::resource::track(&p, &layout, HwStage::Cs, Some(&s)).unwrap();
+        assert_eq!(r.waterfall.reads.len(), 4, "{r:?}");
+        assert!(!r.descriptors.is_empty(), "{r:?}");
     }
 }
