@@ -4,8 +4,8 @@ Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
 read only their own half run as two 32-lane waves. Groups of one console
 wave also run in the console flow: masks read whole, lanes of the other
 half, divergent branches and loops, LDS shared in the console's
-instruction order, and (in groups of exactly 64 threads) whole-wave
-reductions and prefix sums, of integers and floats. A group of several
+instruction order, and (in groups of exactly 64 threads, or of 32 or
+fewer) whole-wave reductions and prefix sums, of integers and floats. A group of several
 console waves that share no LDS runs as one host group per wave. Still
 open: groups whose waves share LDS, whole-wave sections in other group
 sizes, and `ds_permute`; each stops with its own reason. (`ds_bpermute` gathers within each 32-lane half
@@ -123,7 +123,7 @@ does (step 5, `lower::CONSOLE_FLOW`):
 flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
 console structure. Eligible: wave64 compute on a host without 64-lane
 waves, at most 64 threads per group, no `ds_permute`, and whole-wave
-sections only in a group of exactly 64 threads.
+sections only in a group of exactly 64 threads or of 32 or fewer.
 
 **LDS.** The console runs an instruction in all 64 lanes before the next,
 so one wave shares LDS without `s_barrier`: a lane reads what a lane of the
@@ -146,7 +146,11 @@ halves, where the section is lowered: each half's reduction is exchanged
 and the two are combined with the section's own operation (sum, and, or,
 xor, minimum, maximum of integers); a prefix sum in the upper half adds the
 lower half's total. Only in a group of exactly 64 threads, so both halves
-are whole. Floats cross as their bits: minimum and maximum stay exact, and
+are whole, or of 32 threads or fewer, which is the lower half alone: the
+console wave's other lanes are in no mask a section reduces over, so the
+one host wave's reduction is the console wave's and nothing is exchanged
+(combined as in a full wave, a minimum or an AND would take the absent
+half's 0). Floats cross as their bits: minimum and maximum stay exact, and
 a sum is each half's sum added last, one more order of additions next to
 the console's and the host wave's own (the last bits may differ, as they
 already may in one host wave). A title run on #439 put sections next: 24
@@ -154,7 +158,7 @@ of the 45 programs the stack still stopped.
 
 What still stops says why: `console wave64 lanes in a group of more than 64
 threads`, `ds_permute across the halves`, or `a whole-wave section` (in
-other groups), each `on a host without 64-lane waves`.
+groups of 33 to 63 threads), each `on a host without 64-lane waves`.
 
 ### Groups of several console waves
 
