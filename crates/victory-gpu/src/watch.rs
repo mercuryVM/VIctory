@@ -11,10 +11,8 @@
 //! takes the first write to it: it notes the block as written and gives the
 //! write access back. The runtime tells us when it maps or unmaps views
 //! ([`title_memory_remapped`]), which resets their protection. Blocks found
-//! unmapped are not asked about again until it maps them: view memory
-//! comes from placeholders, which only the runtime's mapping fills.
-//! shortcut: so memory committed otherwise into such a block (a range
-//! reaching from a view into a plain reservation) is not seen.
+//! wholly uncommitted are skipped while they remain so; one query can
+//! confirm a whole region, including ordinary reservations between views.
 //!
 //! shortcut: writes into physical pages through another view (xmem's
 //! `write_physical`, DirectStorage's page destinations) are not seen at
@@ -191,12 +189,8 @@ struct Guards {
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
-    /// Blocks found unmapped (not committed) when a copy took them: the
-    /// copy holds their zeros until the runtime maps them
-    /// ([`title_memory_remapped`]). Without this, every asking found them
-    /// "written" again (they cannot be made read-only) and the copy read
-    /// them page by page through the kernel's failing reads, hundreds of
-    /// MB per world frame.
+    /// Blocks already copied as zeros. While they remain wholly uncommitted,
+    /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
 }
 
@@ -222,8 +216,20 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let mut uncommitted_until = first;
     for block in first..=last {
-        let open = block < last && !g.clean.contains(&block) && !g.absent.contains(&block);
+        let mut open = block < last && !g.clean.contains(&block);
+        if open && g.absent.contains(&block) {
+            // Ordinary commits need no runtime mapping notification. Reuse
+            // this asking's query for the following blocks in the same region.
+            if block >= uncommitted_until {
+                uncommitted_until = uncommitted_end(block);
+            }
+            open = block >= uncommitted_until;
+            if open {
+                g.absent.remove(&block);
+            }
+        }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
@@ -315,20 +321,26 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     for block in from..to {
         if set(block, block + 1) {
             note(g, block, block + 1);
-        } else if unmapped(block * BLOCK) {
+        } else if block < uncommitted_end(block) {
             g.absent.insert(block);
         }
     }
 }
 
-/// Whether nothing is committed at `at` (a placeholder between views).
-fn unmapped(at: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+/// The end (exclusive) of the whole uncommitted blocks starting at `block`.
+fn uncommitted_end(block: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{
+        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State != MEM_COMMIT
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
+        (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
+    } else {
+        block
+    }
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
@@ -666,6 +678,64 @@ mod tests {
             )
         };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    #[test]
+    fn writes_in_partly_committed_view_blocks_are_reported() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            SEC_RESERVE, UnmapViewOfFile,
+        };
+
+        const SIZE: usize = 3 * BLOCK;
+        struct View(MEMORY_MAPPED_VIEW_ADDRESS);
+        impl Drop for View {
+            fn drop(&mut self) {
+                title_memory_remapped(self.0.Value as usize, SIZE);
+                // SAFETY: our view is still mapped.
+                unsafe { UnmapViewOfFile(self.0) };
+            }
+        }
+        // SAFETY: a new reserved pagefile section. The view holds its own
+        // reference after we close the handle, including on assertion failure.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            View(view)
+        };
+        let start = view.0.Value as usize;
+        let commit = |at: usize, len| {
+            // SAFETY: these pages belong to our reserved view.
+            let committed = unsafe { VirtualAlloc(at as _, len, MEM_COMMIT, PAGE_READWRITE) };
+            assert_eq!(committed as usize, at);
+        };
+        let early = start + BLOCK + 3 * KERNEL_PAGE;
+        let late = start + 2 * BLOCK + 3 * KERNEL_PAGE;
+        commit(start, BLOCK);
+        commit(early, KERNEL_PAGE);
+        let refresh = || guard(start, start + SIZE).unwrap();
+        assert_eq!(refresh(), [start / PAGE, early / PAGE, late / PAGE]);
+        // The last block is still entirely reserved.
+        assert!(!refresh().contains(&(late / PAGE)));
+
+        commit(late, KERNEL_PAGE); // Ordinary commit, without a runtime mapping notification.
+        for at in [early, late] {
+            assert!(writable(at));
+            // SAFETY: each address is inside its committed read-write page.
+            unsafe { (at as *mut u8).write_volatile(1) };
+        }
+        assert_eq!(refresh(), [early / PAGE, late / PAGE]);
     }
 
     /// Blocks of a placeholder between views are reported once, then not
