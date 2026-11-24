@@ -498,16 +498,17 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             (n @ ("v_permlane16_b32" | "v_permlanex16_b32"), Some(a)) => {
                 // Lane i of a row picks nibble i of {src2, src1}: from its
                 // own row (permlane16) or from the other row of its half of
-                // 32 lanes (permlanex16). Only with every lane active: the
-                // opsel bits (fi, bound_ctrl) decide what an inactive lane
-                // reads.
+                // 32 lanes (permlanex16). A lane not in EXEC gives its value
+                // with op_sel[0] (FI, fetch inactive); else the lane reading
+                // it takes 0 with op_sel[1] (BOUND_CTRL), or keeps its own.
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
+                let (fi, bound_ctrl) = (v.opsel & 1 != 0, v.opsel & 2 != 0);
                 match (sel(1), sel(2)) {
-                    (Some(s1), Some(s2)) if exec == all || v.opsel & 1 != 0 => {
+                    (Some(s1), Some(s2)) => {
                         let s = u64::from(s1) | u64::from(s2) << 32;
                         (0..wave)
                             .map(|l| {
@@ -517,7 +518,14 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                                     (l & !31) | ((l & 16) ^ 16)
                                 };
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                moved(a[(row | pick) as usize], row | pick, l)
+                                let from = row | pick;
+                                if fi || exec >> from & 1 != 0 {
+                                    moved(a[from as usize], from, l)
+                                } else if bound_ctrl {
+                                    Sym::K(0)
+                                } else {
+                                    old[l as usize]
+                                }
                             })
                             .collect()
                     }
@@ -865,6 +873,76 @@ mod tests {
             shapes.get(&total),
             Some(&Shape::Active(Op::AddU, x, saved, 0))
         );
+    }
+
+    /// A Wave64 exclusive prefix sum as the console compiler expands it:
+    /// `row_shr` steps, then lane 15 of each even row added to the odd row
+    /// above it by `v_permlanex16` with EXEC on the odd rows only (the
+    /// lanes it reads are not in EXEC), then lane 31's total added to the
+    /// upper half, and the lane's own term taken off. `permlane` is the
+    /// `v_permlanex16`'s first dword (its op_sel bits).
+    fn wave64_prefix(permlane: u32) -> Program {
+        build(
+            &[
+                0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+                0xD501_0002,
+                0x0002_0080, // v_cndmask_b32_e64 v2, 0, v0, s[0:1]
+                0x7E02_0302, // v_mov_b32 v1, v2
+                0x4A02_02FA,
+                0xFF09_1101, // v_add_nc_u32_dpp v1, v1, v1 row_shr:1 bound_ctrl:1
+                0x4A02_02FA,
+                0xFF01_1201, // v_add_nc_u32_dpp v1, v1, v1 row_shr:2
+                0x4A02_02FA,
+                0xFF01_1401, // v_add_nc_u32_dpp v1, v1, v1 row_shr:4
+                0x4A02_02FA,
+                0xFF01_1801, // v_add_nc_u32_dpp v1, v1, v1 row_shr:8
+                0xBEFE_03FF,
+                0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
+                0xBEFF_03FF,
+                0xFFFF_0000, // s_mov_b32 exec_hi, 0xffff0000
+                permlane,
+                0x0305_8301, // v_permlanex16_b32 v4, v1, -1, -1
+                0x4A02_0304, // v_add_nc_u32_e32 v1, v4, v1
+                0xD760_0006,
+                0x0001_3F01, // v_readlane_b32 s6, v1, 31
+                0xBEFE_0380, // s_mov_b32 exec_lo, 0
+                0xBEFF_03C1, // s_mov_b32 exec_hi, -1
+                0x4A02_0206, // v_add_nc_u32_e32 v1, s6, v1
+                0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+                0x4C02_0501, // v_sub_nc_u32_e32 v1, v1, v2
+                0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+                0xBF81_0000, // s_endpgm
+            ],
+            true,
+        )
+    }
+
+    #[test]
+    fn permlanex16_fetching_lanes_outside_exec_carries_a_prefix() {
+        // op_sel:[1,0]: FI, the inactive lanes give their values.
+        let p = wave64_prefix(0xD778_0804);
+        let insts = &p.blocks[0].insts;
+        let (saved, x) = (
+            insts[0].write(Reg::S(0)).unwrap(),
+            insts[1].read(Reg::V(0)).unwrap(),
+        );
+        let found = sections(&p, 0);
+        let exclusive = insts[16].write(Reg::V(1)).unwrap();
+        assert_eq!(
+            found[&0].shapes.get(&exclusive),
+            Some(&Shape::Prefix(Op::AddU, x, saved, 0, false))
+        );
+    }
+
+    #[test]
+    fn permlanex16_without_fi_keeps_its_lanes_where_the_source_is_off() {
+        // No op_sel: the lanes read are not in EXEC, so v4 keeps its old
+        // value (no prefix), and nothing is made of it.
+        let p = wave64_prefix(0xD778_0004);
+        let insts = &p.blocks[0].insts;
+        let found = sections(&p, 0);
+        let exclusive = insts[16].write(Reg::V(1)).unwrap();
+        assert_eq!(found[&0].shapes.get(&exclusive), None);
     }
 
     #[test]

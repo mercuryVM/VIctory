@@ -98,6 +98,8 @@ mod lower;
 #[cfg(test)]
 mod mtbuf_tests;
 mod sampler;
+#[cfg(all(test, windows))]
+mod section_tests;
 mod shader;
 #[cfg(all(test, windows))]
 mod split_tests;
