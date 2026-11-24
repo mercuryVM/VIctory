@@ -626,23 +626,16 @@ impl State {
         }
     }
 
-    /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
-    ///
-    /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    /// Gives tables with shader resources or constants slots owned by the
+    /// command list. Later title descriptor writes cannot change what a
+    /// recorded draw samples. Constants also get 256-byte-aligned storage,
+    /// filled at submission. Identical descriptors share slots within a list.
     fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
+            .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
             .map(|u| u.slot)
             .collect();
         // Tables reaching past a host heap smaller than the title's (the
@@ -694,6 +687,13 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            let last = table + u64::from(n - 1) * 32;
+            if heap.index(last).is_none() {
+                for u in entries {
+                    self.table_entry(list, u, compute);
+                }
+                continue;
+            }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -716,6 +716,10 @@ impl State {
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
+                once!(n, "descriptor table did not fit in command-list slots");
+                for u in entries {
+                    self.table_entry(list, u, compute);
+                }
                 continue;
             };
             self.fresh_tables.insert(key, first);
