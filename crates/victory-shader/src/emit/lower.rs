@@ -9023,7 +9023,7 @@ mod tests {
             0xBE82_036A, // s_mov_b32 s2, vcc_lo (106)
             S_ENDPGM,
         ];
-        lowers(&words, 0).unwrap();
+        lowers(&words).unwrap();
     }
 
     #[test]
@@ -9035,7 +9035,7 @@ mod tests {
             0x0001_0700, // v_readlane_b32 s2, v0, 3
             S_ENDPGM,
         ];
-        lowers(&words, 0).unwrap();
+        lowers(&words).unwrap();
     }
 
     #[test]
