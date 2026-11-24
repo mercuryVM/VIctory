@@ -76,8 +76,11 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            timed("made", &self.shaders, || {
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            })
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -86,10 +89,75 @@ impl Pending {
     /// Makes the host pipeline for the library only (see the module notes).
     fn build_ahead(&self) {
         if self.made.get().is_none() {
-            drop(HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+            drop(timed("built ahead", &self.shaders, || {
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            }));
             BUILT_AHEAD.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// A host pipeline taking this long to make is logged (wall time).
+const SLOW: Duration = Duration::from_secs(10);
+
+/// Runs `make` (a host pipeline's creation, which translates its shaders
+/// first if they are not yet): one taking [`SLOW`] or more is logged with
+/// its shaders and this thread's CPU time, to tell a slow driver compile
+/// (CPU time near the wall time) from a worker that waited for the CPU.
+fn timed<T>(what: &str, shaders: &[Arc<Shader>], make: impl FnOnce() -> T) -> T {
+    let (started, cpu) = (Instant::now(), thread_cpu_ms());
+    let made = make();
+    let wall = started.elapsed();
+    if wall >= SLOW {
+        let (user, kernel) = thread_cpu_ms();
+        let hashes: Vec<String> = shaders
+            .iter()
+            .map(|s| format!("{} {}", s.stage, s.hash))
+            .collect();
+        tracing::info!(
+            what,
+            ms = wall.as_millis() as u64,
+            user_ms = user.saturating_sub(cpu.0),
+            kernel_ms = kernel.saturating_sub(cpu.1),
+            shaders = ?hashes,
+            "a host pipeline was slow to make"
+        );
+    }
+    made
+}
+
+/// This thread's user and kernel CPU time so far, in ms (zeros off Windows
+/// or if the system does not say).
+fn thread_cpu_ms() -> (u64, u64) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        // SAFETY: the current thread's pseudo-handle and our own out values.
+        if unsafe {
+            GetThreadTimes(
+                GetCurrentThread(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        }
+        .is_ok()
+        {
+            let ms = |t: FILETIME| {
+                ((u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)) / 10_000
+            };
+            return (ms(user), ms(kernel));
+        }
+    }
+    (0, 0)
 }
 
 /// Whether every pipeline the title creates is built ahead
@@ -359,11 +427,19 @@ fn workers() -> bool {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                    // At the title's own priority: below it, the workers
+                    // starved in the world while the title kept every core
+                    // busy, and about a thousand pipelines draws wait for
+                    // stayed unmade for minutes (RTX 5070, 16 threads).
+                    // `VICTORY_PIPELINE_PRIORITY=below` keeps the old one.
+                    if std::env::var("VICTORY_PIPELINE_PRIORITY").is_ok_and(|v| v.trim() == "below")
+                    {
+                        // SAFETY: a plain call on our own thread.
+                        unsafe {
+                            use windows::Win32::System::Threading::*;
+                            let _ =
+                                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
                     }
                     loop {
                         let (p, job) = next();
