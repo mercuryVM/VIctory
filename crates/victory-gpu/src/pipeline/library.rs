@@ -91,8 +91,35 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
-    let library = make(&[]).ok()?;
-    Some(Library { library, _blob: Vec::new(), added: 0 })
+    // An empty library is asked for with no blob at all, which `make` cannot
+    // say: an empty slice still has an address, and vkd3d-proton refuses an
+    // address with no bytes behind it. That left it with no library at all.
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: no blob is read; a success that wrote a pointer wrote an owned
+    // ID3D12PipelineLibrary.
+    let made = unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+            Interface::as_raw(device),
+            std::ptr::null(),
+            0,
+            &ID3D12PipelineLibrary::IID,
+            &mut raw,
+        )
+        .ok()
+        .and_then(|()| {
+            if raw.is_null() {
+                return Err(windows::Win32::Foundation::E_POINTER.into());
+            }
+            ID3D12PipelineLibrary::from_raw(raw).cast::<ID3D12PipelineLibrary1>()
+        })
+    };
+    match made {
+        Ok(library) => Some(Library { library, _blob: Vec::new(), added: 0 }),
+        Err(e) => {
+            tracing::info!(error = %e, "the host refused an empty pipeline library");
+            None
+        }
+    }
 }
 
 /// A pipeline's name in the library: the hash of what its host
