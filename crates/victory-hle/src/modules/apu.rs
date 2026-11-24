@@ -31,6 +31,24 @@ const INVALID_STREAM: HRESULT = 0x8AC8_1003_u32 as i32;
 const ALREADY_ACTIVE: HRESULT = 0x8AC8_1005_u32 as i32;
 const BAD_PACKET: HRESULT = 0x8AC8_1008_u32 as i32;
 
+/// Warns once when the host has no audio output device. The title's audio
+/// then never drains its command buffers and, seconds later, its loading
+/// screen stops on an assert of its own (title+0x4dcbc9d in Grand Theft
+/// Auto VI), which says nothing about audio. Under Wine this is a missing
+/// sound driver: Fedora ships it apart from Wine, as `wine-pulseaudio`.
+fn warn_if_no_output() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: no arguments; counts the host's output devices.
+        if unsafe { windows_sys::Win32::Media::Audio::waveOutGetNumDevs() } == 0 {
+            tracing::warn!(
+                "the host has no audio output device: the title may stop on an assert \
+                 seconds later (under Wine, install its PulseAudio or ALSA driver)"
+            );
+        }
+    });
+}
+
 /// Processing kinds; only plain decoding is implemented.
 const DECODE_OPUS: u32 = 1;
 
@@ -192,6 +210,7 @@ pub extern "system" fn XApuConnect(
         options = input.options,
         "audio decoder connected"
     );
+    warn_if_no_output();
     let connection = Box::new(Connection {
         memory,
         layout,
