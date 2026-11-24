@@ -351,6 +351,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -4012,6 +4013,41 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
             }
+            "v_permlanex16_b32" => {
+                // Each lane reads src0 of a lane of the *other* row of 16 in
+                // its 32-lane half; lane i's pick is nibble i of the {src2,
+                // src1} selector (v_permlane16_b32 reads the same row). Both
+                // stay inside a 32-lane half, so the lane math is unchanged
+                // when a console wave64 program runs as two wave32 halves.
+                if v.opsel != 0 {
+                    return Err("op_sel on v_permlanex16_b32");
+                }
+                let (a, lo, hi) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                self.cross_lane(false)?;
+                let lane = self.lane_index();
+                let (k2, k8, k15, k16, k31, n31) = (
+                    self.s.m.i32(2),
+                    self.s.m.i32(8),
+                    self.s.m.i32(15),
+                    self.s.m.i32(16),
+                    self.s.m.i32(31),
+                    self.s.m.i32(!31),
+                );
+                let nib = self.s.m.bin(c, Bin::And, lane, k15);
+                let sh = self.s.m.bin(c, Bin::Shl, nib, k2);
+                let sh = self.s.m.bin(c, Bin::And, sh, k31);
+                let top = self.s.m.cmp(c, pred::IUGE, nib, k8);
+                let word = self.s.m.select(c, top, hi, lo);
+                let pick = self.s.m.bin(c, Bin::LShr, word, sh);
+                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+                let half = self.s.m.bin(c, Bin::And, lane, n31);
+                let row = self.s.m.bin(c, Bin::And, lane, k16);
+                let row = self.s.m.bin(c, Bin::Xor, row, k16);
+                let base = self.s.m.bin(c, Bin::Or, half, row);
+                let idx = self.s.m.bin(c, Bin::Or, base, pick);
+                let val = self.read_lane(a, idx);
+                int(self, val)
+            }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
@@ -6622,6 +6658,63 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|_| ())
+    }
+
+    /// Lowers a compute program of constants that allocates 512 bytes of LDS
+    /// (`COMPUTE_PGM_RSRC2`'s granule field): whether it translates.
+    fn lowers_lds(words: &[u32]) -> Result<(), crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15,
+                threads: [32, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .map(|_| ())
+    }
+
+    /// `v_permlanex16_b32` reads a lane of the *other* row of 16 in the
+    /// lane's 32-lane half, the pick from nibble i of {src2, src1}. Before
+    /// the rule its write was missing and the LDS store consuming it failed
+    /// the whole translation.
+    #[test]
+    fn permlanex16_reads_a_lane_of_the_other_row() {
+        let words = [
+            // The selector: lane i of a row reads lane i of the other.
+            0xBE80_03FF,
+            0x7654_3210, // s_mov_b32 s0, 0x76543210
+            0xBE81_03FF,
+            0xFEDC_BA98, // s_mov_b32 s1, 0xfedcba98
+            // v0 is the thread id; lane i reads the lane its nibble names.
+            0xD778_0001,
+            0x0004_0100, // v_permlanex16_b32 v1, v0, s0, s1
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0xD834_0000,
+            0x0000_0102, // ds_write_b32 v2, v1
+            S_ENDPGM,
+        ];
+        lowers_lds(&words).unwrap();
     }
 
     #[test]
