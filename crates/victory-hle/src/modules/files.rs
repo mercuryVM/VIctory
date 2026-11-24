@@ -151,25 +151,25 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let drives = drives();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
     let tail = &rest[2..];
-    if prefix.is_empty() && root.len() + tail.len() >= LONG {
+    let mut out = if !prefix.is_empty() {
+        // The title already asked for the `\\?\` form, which disables the
+        // host's own clean-up. Resolve `.` and `..` here too, not just `/`.
         let mut out = verbatim(root, tail);
-        out.push(0);
-        return Some(out);
-    }
-    let mut out = prefix.to_vec();
-    out.extend_from_slice(root);
-    // `X:` and `X:name` are relative to the root.
-    if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
-        out.push(b'\\'.into());
-    }
-    let verbatim = !prefix.is_empty();
-    out.extend(tail.iter().map(|&c| {
-        if verbatim && c == u16::from(b'/') {
-            b'\\'.into()
-        } else {
-            c
+        if tail.is_empty() {
+            out.push(b'\\'.into());
         }
-    }));
+        out
+    } else if root.len() + tail.len() >= LONG {
+        verbatim(root, tail)
+    } else {
+        let mut out = root.to_vec();
+        // `X:` and `X:name` are relative to the root.
+        if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
+            out.push(b'\\'.into());
+        }
+        out.extend_from_slice(tail);
+        out
+    };
     out.push(0);
     Some(out)
 }
@@ -865,5 +865,22 @@ mod tests {
         assert!(!f.is_null());
         fclose(f);
         assert!(dir.path().join("plain.txt").is_file());
+    }
+
+    /// A title that already uses `\\?\` must get the same clean-up as a
+    /// long non-extended path: that form turns off the host's own resolution.
+    #[test]
+    fn extended_paths_clean_dot_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        mount_at('J', dir.path());
+        let tr = |s: &str| translate(&w(s)[..s.encode_utf16().count()]).map(|v| text(&v));
+        let root = dir.path().display();
+        assert_eq!(
+            tr(r"\\?\J:/a/./b/../f.txt"),
+            Some(format!(r"\\?\{root}\a\f.txt"))
+        );
+        assert_eq!(tr(r"\\?\J:"), Some(format!(r"\\?\{root}\")));
+        assert_eq!(tr(r"\\?\J:name"), Some(format!(r"\\?\{root}\name")));
+        assert_eq!(tr(r"\\?\J:/a/b"), Some(format!(r"\\?\{root}\a\b")));
     }
 }
