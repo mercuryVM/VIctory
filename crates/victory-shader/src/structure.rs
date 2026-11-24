@@ -266,6 +266,68 @@ impl Bools {
         })
     }
 
+    /// Whether two lanes that both satisfy every Bool of `within`, and agree
+    /// on every atom `varies` does not name, can differ on `b`: lanes share
+    /// such atoms (SCC values, compares of data that is the same in every
+    /// lane), each picks the others for itself. Yes when the search grows
+    /// too large to finish.
+    pub fn varies(&self, b: Bool, within: &[Bool], varies: &dyn Fn(Atom) -> bool) -> bool {
+        let lane = |holds: bool| {
+            within
+                .iter()
+                .map(|&w| (w, true))
+                .chain([(b, holds)])
+                .collect::<Vec<_>>()
+        };
+        let mut budget = MAX_MEET;
+        self.differ_in(lane(true), lane(false), varies, &mut budget)
+    }
+
+    fn differ_in(
+        &self,
+        mut a: Vec<(Bool, bool)>,
+        mut b: Vec<(Bool, bool)>,
+        varies: &dyn Fn(Atom) -> bool,
+        budget: &mut usize,
+    ) -> bool {
+        let fails = |&(x, holds): &(Bool, bool)| x == if holds { Bool::FALSE } else { Bool::TRUE };
+        if a.iter().any(fails) || b.iter().any(fails) {
+            return false;
+        }
+        a.retain(|&(x, _)| x != Bool::FALSE && x != Bool::TRUE);
+        b.retain(|&(x, _)| x != Bool::FALSE && x != Bool::TRUE);
+        if a.is_empty() && b.is_empty() || *budget == 0 {
+            return true;
+        }
+        *budget -= 1;
+        let top = |x: Bool| self.nodes[x.0 as usize].0;
+        let v = a
+            .iter()
+            .chain(&b)
+            .map(|&(x, _)| top(x))
+            .min()
+            .expect("not empty");
+        let set = |all: &[(Bool, bool)], value: bool| -> Vec<(Bool, bool)> {
+            all.iter()
+                .map(|&(x, holds)| {
+                    let (lo, hi) = self.split(x, v);
+                    (if value { hi } else { lo }, holds)
+                })
+                .collect()
+        };
+        if varies(self.atoms[v as usize]) {
+            [false, true].into_iter().any(|va| {
+                [false, true]
+                    .into_iter()
+                    .any(|vb| self.differ_in(set(&a, va), set(&b, vb), varies, budget))
+            })
+        } else {
+            [false, true]
+                .into_iter()
+                .any(|value| self.differ_in(set(&a, value), set(&b, value), varies, budget))
+        }
+    }
+
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE

@@ -81,6 +81,9 @@ mod container;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod gather_tests;
+mod halves;
+#[cfg(all(test, windows))]
+mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;

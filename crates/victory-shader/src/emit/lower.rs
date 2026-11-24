@@ -229,6 +229,12 @@ struct Lower<'a> {
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
+    /// Wave64 mesh: values that may differ between a console wave's lanes
+    /// (see [`super::halves::varying`]).
+    varying: Option<super::halves::Varying<'a>>,
+    /// Mesh: IR blocks every thread of the group runs exactly once, where
+    /// group barriers can exchange lanes (see [`super::halves`]).
+    all_threads: Vec<bool>,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
@@ -239,6 +245,8 @@ struct Lower<'a> {
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
     cur_ir: usize,
+    /// Index of the instruction being lowered in it.
+    cur_i: usize,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
@@ -283,10 +291,20 @@ enum MaskData {
     /// Mesh programs: their lanes and waves (LDS per console wave) are the
     /// console's but no host wave size can be declared.
     None,
+    /// Mesh programs written for 64-lane waves: each console wave's ballot
+    /// is exchanged through group-shared memory (see [`super::halves`]),
+    /// so it is the console's bit for bit whatever waves the host forms,
+    /// where every thread of the group gets to the mask's block.
+    Exchanged,
 }
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+
+/// A wave64 mesh program reads a lane mask as a number where not every
+/// thread of its group gets, so the console wave's ballot cannot be
+/// exchanged there (see [`super::halves`]).
+const SPLIT_MASK: Why = "a wave64 mesh lane mask read as data where not every thread gets";
 
 /// Not a DXIL operation: a gather at a level given at run time, made of
 /// four samples (`Lower::image`).
@@ -736,9 +754,17 @@ impl<'a> Lower<'a> {
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
+                HwStage::Ms if x.native.wave64 => MaskData::Exchanged,
                 _ => MaskData::None,
             },
             mask_ok: false,
+            varying: (x.native.stage == HwStage::Ms && x.native.wave64)
+                .then(|| super::halves::varying(p, x.st)),
+            all_threads: if x.native.stage == HwStage::Ms {
+                super::halves::all_threads(x.st)
+            } else {
+                vec![false; p.blocks.len()]
+            },
             ballots: HashMap::new(),
             balloting: HashSet::new(),
             def_block: p
@@ -754,6 +780,7 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
+            cur_i: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
@@ -996,7 +1023,7 @@ impl<'a> Lower<'a> {
                 (op, src, mask, ident, Some(inclusive))
             }
         };
-        if self.mask_data == MaskData::None {
+        if matches!(self.mask_data, MaskData::None | MaskData::Exchanged) {
             return Err("a wave reduction in a mesh shader");
         }
         let c = self.cur;
@@ -1168,7 +1195,7 @@ impl<'a> Lower<'a> {
                 }
                 i += 1;
             }
-            self.mask_ok = self.mask_data == MaskData::Console;
+            self.mask_ok = matches!(self.mask_data, MaskData::Console | MaskData::Exchanged);
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
@@ -1498,6 +1525,15 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
+                if self.mask_data == MaskData::Exchanged {
+                    let b = self.def_block.get(&lo).copied().unwrap_or(0);
+                    if !self.all_threads[b] {
+                        return Err(SPLIT_MASK);
+                    }
+                    let xy = self.console_ballot(bit, at);
+                    self.ballots.insert(lo, xy);
+                    return Ok(if high { xy.1 } else { xy.0 });
+                }
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -1510,6 +1546,103 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Wave64 mesh: dwords of the exchange buffer per console wave, two
+    /// for its ballot and one per lane for a first-lane read.
+    const XCH_WAVE: u32 = 2 + 64;
+
+    /// Wave64 mesh: the console wave of this thread, its lane, and the
+    /// exchange buffer's first dword for that wave.
+    fn console_wave(&mut self) -> (V, V, V) {
+        let e = self.s.entry;
+        let flat = self.mesh_thread();
+        let (k6, k63) = (self.s.m.i32(6), self.s.m.i32(63));
+        let wave = self.s.m.bin(e, Bin::LShr, flat, k6);
+        let lane = self.s.m.bin(e, Bin::And, flat, k63);
+        let per = self.s.m.i32(Self::XCH_WAVE);
+        let base = self.s.m.bin(e, Bin::Mul, wave, per);
+        (wave, lane, base)
+    }
+
+    /// Wave64 mesh: dword `k` (a value) of this console wave's part of the
+    /// exchange buffer, at `at`.
+    fn xch_dword(&mut self, at: usize, base: V, k: V) -> V {
+        let threads = self.s.threads.expect("mesh")[0];
+        let waves = threads.div_ceil(64);
+        let buf = self.s.xch(waves * Self::XCH_WAVE);
+        let i = self.s.m.bin(at, Bin::Add, base, k);
+        self.s.m.element(at, buf, i)
+    }
+
+    fn group_barrier(&mut self, at: usize) {
+        // Thread-group sync with a group-shared memory fence.
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// Wave64 mesh: the console wave's ballot of `bit` (low and high dword),
+    /// in block `at`, which every thread of the group runs. Each lane ORs
+    /// its bit into its wave's two dwords between group barriers; the first
+    /// barrier keeps the buffer from an earlier exchange's readers.
+    fn console_ballot(&mut self, bit: V, at: usize) -> (V, V) {
+        let (_, lane, base) = self.console_wave();
+        let (z, one, k1, k5, k31) = (
+            self.s.m.i32(0),
+            self.s.m.i32(1),
+            self.s.m.i32(1),
+            self.s.m.i32(5),
+            self.s.m.i32(31),
+        );
+        self.group_barrier(at);
+        let lo = self.xch_dword(at, base, z);
+        let hi = self.xch_dword(at, base, k1);
+        self.s.m.store(at, lo, z);
+        self.s.m.store(at, hi, z);
+        self.group_barrier(at);
+        let half = self.s.m.bin(at, Bin::LShr, lane, k5);
+        let word = self.xch_dword(at, base, half);
+        let sh = self.s.m.bin(at, Bin::And, lane, k31);
+        let mine = self.s.m.bin(at, Bin::Shl, one, sh);
+        let mine = self.s.m.select(at, bit, mine, z);
+        self.s.m.atomic(at, super::bitcode::Rmw::Or, word, mine);
+        self.group_barrier(at);
+        let x = self.s.m.load(at, lo);
+        let y = self.s.m.load(at, hi);
+        (x, y)
+    }
+
+    /// Wave64 mesh: `v_readfirstlane_b32` of `x` over the console wave,
+    /// where `on` is the lane's EXEC bit: the value of the lowest lane with
+    /// it set (lane 0 when none is), in the current block, which every
+    /// thread of the group runs.
+    fn console_first_lane(&mut self, x: V, on: V) -> V {
+        let at = self.cur;
+        let (lo, hi) = self.console_ballot(on, at);
+        let (_, lane, base) = self.console_wave();
+        let (z, k2, k32) = (self.s.m.i32(0), self.s.m.i32(2), self.s.m.i32(32));
+        let i32t = self.s.t.i32;
+        let slot = self.s.m.bin(at, Bin::Add, lane, k2);
+        let mine = self.xch_dword(at, base, slot);
+        self.s.m.store(at, mine, x);
+        self.group_barrier(at);
+        // firstbitlo: -1 for no bit.
+        let low = self
+            .s
+            .op(at, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+        let high = self
+            .s
+            .op(at, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+        let high = self.s.m.bin(at, Bin::Add, high, k32);
+        let none_lo = self.s.m.cmp(at, pred::EQ, lo, z);
+        let none_hi = self.s.m.cmp(at, pred::EQ, hi, z);
+        let first = self.s.m.select(at, none_hi, z, high);
+        let first = self.s.m.select(at, none_lo, first, low);
+        let slot = self.s.m.bin(at, Bin::Add, first, k2);
+        let theirs = self.xch_dword(at, base, slot);
+        self.s.m.load(at, theirs)
     }
 
     // ---- operands ----
@@ -2693,12 +2826,27 @@ impl<'a> Lower<'a> {
 
     // ---- instructions ----
 
+    /// Wave64 mesh: `v_readfirstlane_b32` (the current instruction) reads
+    /// data that can differ between the lanes of its console wave that run
+    /// it, so the host wave's first lane need not hold the console's value.
+    fn first_lane_varies(&self, inst: &Inst) -> bool {
+        let Some(var) = &self.varying else {
+            return false;
+        };
+        inst.reads.iter().any(|r| {
+            matches!(r.0, Reg::V(_))
+                && var.contains(&r.1)
+                && !var.uniform_at(r.1, self.cur_ir, self.cur_i)
+        })
+    }
+
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
+        self.cur_i = i;
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
         self.mask_ok = match self.mask_data {
-            MaskData::Console => true,
+            MaskData::Console | MaskData::Exchanged => true,
             MaskData::Host => {
                 name.starts_with("s_bcnt1_i32_")
                     || name.starts_with("s_ff1_i32_")
@@ -5074,6 +5222,23 @@ impl<'a> Lower<'a> {
                 let a = s(self, 0)?;
                 int(self, a)
             }
+            "v_readfirstlane_b32"
+                if self.all_threads[self.cur_ir] && self.first_lane_varies(inst) =>
+            {
+                // The console wave's first lane, which need not be in this
+                // host wave: exchanged (see `super::halves`).
+                let a = s(self, 0)?;
+                let on = guard.unwrap_or(self.s.m.bool(true));
+                let r = self.console_first_lane(a, on);
+                self.write_i(inst, r, None)
+            }
+            // shortcut: elsewhere in a wave64 mesh program, a first-lane read
+            // of data that differs between lanes reads the host wave's first
+            // lane, so each 32-lane half of a console wave takes its own
+            // (still a lane of that console wave). The title's such reads
+            // pick one lane's value as the wave's (a level of detail from
+            // per-vertex distances); exchanging there needs every thread of
+            // the group to run the code, as in #439's console flow.
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
