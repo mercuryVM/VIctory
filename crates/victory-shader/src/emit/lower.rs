@@ -3963,15 +3963,44 @@ impl<'a> Lower<'a> {
         x
     }
 
+    /// Correctly rounded f32 bits of `value / (2^n - 1)`, for a signed or
+    /// unsigned integer already clamped to the normalized range.
+    fn norm_bits(&mut self, value: V, n: u32) -> V {
+        let c = self.cur;
+        // All normalized fields fit in signed i32 and convert to f32 exactly.
+        let f = self.s.m.cast(c, Cast::SiToFp, value, self.s.t.f32);
+        let bits = self.as_int(f);
+        if n == 1 {
+            return bits;
+        }
+        // Start at |value| / 2^n. In units of its last place, its magnitude
+        // is the 24-bit significand M. Multiplying by 2^n / (2^n - 1)
+        // adds M / (2^n - 1) ULPs. The denominator is odd, so rounding the
+        // correction has no ties. Only a full-scale input reaches the next
+        // exponent, and adding the correction to the bits carries into it.
+        let mask = self.s.m.i32(0x7f_ffff);
+        let implicit = self.s.m.i32(1 << 23);
+        let fraction = self.s.m.bin(c, Bin::And, bits, mask);
+        let significand = self.s.m.bin(c, Bin::Or, fraction, implicit);
+        let max = (1 << n) - 1;
+        let half = self.s.m.i32(max / 2);
+        let divisor = self.s.m.i32(max);
+        let biased = self.s.m.bin(c, Bin::Add, significand, half);
+        let correction = self.s.m.bin(c, Bin::UDiv, biased, divisor);
+        let scale = self.s.m.i32(n << 23);
+        let base = self.s.m.bin(c, Bin::Sub, bits, scale);
+        let rounded = self.s.m.bin(c, Bin::Add, base, correction);
+        let zero = self.s.m.i32(0);
+        let is_zero = self.s.m.cmp(c, pred::EQ, value, zero);
+        self.s.m.select(c, is_zero, zero, rounded)
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds), elements of 4
-    // bytes or more as dword-aligned. Norm formats divide, which the AMD
-    // driver does 1 ULP off the hardware's correctly rounded conversion for
-    // some values; correct it with an integer check if a title compares
-    // converted values exactly.
+    // bytes or more as dword-aligned.
     fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
@@ -4030,20 +4059,13 @@ impl<'a> Lower<'a> {
             };
             let f32t = self.s.t.f32;
             let x = match numeric {
-                Numeric::Unorm => {
-                    let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
-                    let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
-                    float(self, q)
-                }
+                Numeric::Unorm => self.norm_bits(field, w),
                 Numeric::Snorm => {
                     let s = signed(self);
-                    let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
-                    let max = self.s.m.f32((((1u64 << (w - 1)) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
-                    let lo = self.s.m.f32((-1.0f32).to_bits());
-                    let q = self.binary(35, q, lo);
-                    float(self, q)
+                    let min = self.s.m.i32(1u32.wrapping_sub(1 << (w - 1)));
+                    let below = self.s.m.cmp(c, pred::SLT, s, min);
+                    let clamped = self.s.m.select(c, below, min, s);
+                    self.norm_bits(clamped, w - 1)
                 }
                 Numeric::Uscaled => {
                     let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
