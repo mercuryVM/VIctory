@@ -15,7 +15,7 @@ use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
-use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
+use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -501,7 +501,20 @@ fn mask_spills(p: &Program, st: &Structured) -> HashSet<Value> {
 }
 
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
-    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    reads_as_data(i, |v| {
+        st.masks.contains_key(&v) || st.highs.contains_key(&v)
+    })
+}
+
+/// Whether `v` is a lane mask in any form the structure knows: a mask, the
+/// high dword of one, or one held as a number ([`Structured::others`], as
+/// an exit mask grown from 0 is).
+fn any_mask(st: &Structured, v: Value) -> bool {
+    st.masks.contains_key(&v) || st.highs.contains_key(&v) || st.others.contains_key(&v)
+}
+
+/// Instructions that read a value `is_mask` says is a lane mask as a number.
+fn reads_as_data(i: &Inst, is_mask: impl Fn(Value) -> bool) -> bool {
     let ops: Vec<&Operand> = match &i.fields {
         // A mask operation (its result a mask) is no data use.
         Fields::Sop { .. }
@@ -520,7 +533,7 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
         _ => return false,
     };
     ops.into_iter().any(|op| match *op {
-        Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
+        Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(&is_mask),
         _ => false,
     })
 }
@@ -896,6 +909,25 @@ impl<'a> Lower<'a> {
                     .exits
                     .iter()
                     .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
+                && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
+            // A lane mask joined where lanes arrive by different paths (a
+            // loop its lanes leave at different iterations, a branch only
+            // some take) is, per lane, what that lane's path saw of it. Read
+            // as a number after the join (a count, a first bit, a compare)
+            // it gave each lane its own answer, or stopped the program; on
+            // the console the mask is the wave's. Such a program takes the
+            // console flow too, and keeps the per-lane form if that cannot
+            // lower it. (On a host without the console's wave size it
+            // already needs the console's lanes for the read.)
+            let joined_mask = p.blocks.iter().zip(&x.st.divergent_joins).any(|(b, &d)| {
+                d && b.phis.iter().any(|phi| {
+                    matches!(phi.reg, Reg::S(r) if ![EXEC, EXEC + 1, VCC, VCC + 1].contains(&r))
+                        && any_mask(x.st, phi.value)
+                })
+            });
+            wants_console_flow |= x.target.runs(wave)
+                && joined_mask
+                && insts().any(|i| reads_as_data(i, |v| any_mask(x.st, v)))
                 && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
             if x.console_cf {
                 console_lanes = true;
