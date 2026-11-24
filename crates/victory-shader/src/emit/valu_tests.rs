@@ -710,3 +710,43 @@ fn bfe_signed_and_unsigned_match_rdna2() {
         );
     });
 }
+
+#[test]
+fn cvt_f32_f64_matches_rdna2() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f)
+    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+
+    let cases: &[(f64, f32)] = &[
+        (0.0, 0.0),
+        (-0.0, -0.0),
+        (1.0, 1.0),
+        (-1.0, -1.0),
+        (3.141592653589793, 3.1415927),
+        (65536.5, 65536.5),
+        (1.0e-30, (1.0e-30f64) as f32),
+        (1.0e38, 1.0e38),
+    ];
+
+    let inputs: Vec<[u32; 4]> = cases
+        .iter()
+        .map(|&(d, _)| {
+            let bits = d.to_bits();
+            [bits as u32, (bits >> 32) as u32, 0, 0]
+        })
+        .collect();
+
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = cases[i].1.to_bits();
+        assert_eq!(
+            got,
+            want,
+            "{}: v_cvt_f32_f64({}) = {:#010x} ({}), want {:#010x} ({})",
+            backend,
+            cases[i].0,
+            got,
+            f32::from_bits(got),
+            want,
+            cases[i].1,
+        );
+    });
+}

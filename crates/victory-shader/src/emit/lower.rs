@@ -3797,6 +3797,14 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
                 int(self, r)
             }
+            "v_cvt_f32_f64" => {
+                let a = self.src64(inst, 0)?;
+                let dbl_t = self.s.m.double();
+                self.s.flags |= flags::DOUBLES;
+                let a_dbl = self.s.m.cast(c, Cast::Bitcast, a, dbl_t);
+                let r = self.s.m.cast(c, Cast::FPTrunc, a_dbl, self.s.t.f32);
+                float(self, r)
+            }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let mut a = s(self, 0)?;
