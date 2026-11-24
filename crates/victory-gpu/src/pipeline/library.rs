@@ -15,7 +15,7 @@
 //! All library calls are serialised: the interface does not promise that
 //! stores, loads and serialising may overlap.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -50,7 +50,8 @@ unsafe impl Send for Library {}
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
-/// Title pipelines listed for an early start, at most.
+/// Title pipelines listed for an early start, at most: the most recently
+/// drawn with are kept.
 const EARLY_MAX: usize = 8192;
 
 fn library() -> Option<&'static Mutex<Library>> {
@@ -195,14 +196,16 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    // Through `used`: an early list not read yet is read before it is
+    // written, not replaced by an empty one.
+    let (early, listed) = used().as_ref().map(|e| (e.to_text(), e.listed())).unwrap_or_default();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), early.as_bytes()));
     match written {
         Ok(()) => tracing::info!(
             bytes = blob.len(),
-            early = used.len(),
+            early = listed,
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -221,34 +224,101 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     std::fs::rename(&tmp, path)
 }
 
-/// Title pipeline keys drawn or dispatched with (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Title pipeline keys drawn or dispatched with, each with the last run
+/// that did. The list keeps the `EARLY_MAX` most recently used, so the
+/// pipelines a run draws with for the first time replace those no run has
+/// used for longest instead of being left out once the list is full.
+#[derive(Debug)]
+struct Early {
+    /// This run's number: one past the newest listed.
+    run: u64,
+    keys: HashMap<String, u64>,
+}
+
+impl Early {
+    /// The list as saved: `<run> <key>` lines, most recent first. A bare
+    /// key (as earlier builds wrote) is older than any numbered one.
+    fn parse(text: &str) -> Early {
+        let mut keys: HashMap<String, u64> = HashMap::new();
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            let (run, key) = line
+                .split_once(' ')
+                .and_then(|(run, key)| Some((run.parse().ok()?, key)))
+                .unwrap_or((0, line));
+            let last = keys.entry(key.to_owned()).or_insert(run);
+            *last = (*last).max(run);
+        }
+        let run = keys.values().max().map_or(1, |r| r + 1);
+        let mut early = Early { run, keys };
+        if early.keys.len() > EARLY_MAX {
+            early.keys = early.newest().map(|(k, r)| (k.clone(), r)).collect();
+        }
+        early
+    }
+
+    /// The keys to keep, most recently used first (ties by key, so the list
+    /// is the same for the same uses).
+    fn newest(&self) -> impl Iterator<Item = (&String, u64)> {
+        let mut keys: Vec<(&String, u64)> = self.keys.iter().map(|(k, &r)| (k, r)).collect();
+        keys.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        keys.into_iter().take(EARLY_MAX)
+    }
+
+    fn to_text(&self) -> String {
+        self.newest().map(|(key, run)| format!("{run} {key}\n")).collect()
+    }
+
+    /// Keys the saved list holds.
+    fn listed(&self) -> usize {
+        self.keys.len().min(EARLY_MAX)
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.keys.contains_key(key)
+    }
+
+    /// Notes `key` used this run; whether the saved list changes.
+    fn note(&mut self, key: &str) -> bool {
+        match self.keys.get_mut(key) {
+            Some(run) if *run == self.run => false,
+            Some(run) => {
+                *run = self.run;
+                true
+            }
+            None => {
+                self.keys.insert(key.to_owned(), self.run);
+                true
+            }
+        }
+    }
+}
+
+static USED: Mutex<Option<Early>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+fn used() -> std::sync::MutexGuard<'static, Option<Early>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
         let listed = DIR
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
-        *used = Some(set);
+        let early = Early::parse(&listed);
+        tracing::info!(pipelines = early.keys.len(), "title pipelines to start early");
+        *used = Some(early);
     }
     used
 }
 
 /// Whether the title pipeline with `key` was drawn with in an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|s| s.contains(key))
+    used().as_ref().is_some_and(|e| e.contains(key))
 }
 
 /// The title pipeline with `key` was drawn or dispatched with.
 pub(crate) fn note_used(key: &str) {
     let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    if used.get_or_insert_with(|| Early::parse("")).note(key) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -267,6 +337,40 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    #[test]
+    fn a_full_early_list_takes_new_pipelines_in_place_of_the_oldest() {
+        // A list filled by earlier runs: run 1's keys, then run 2's.
+        let mut text = String::new();
+        for i in 0..EARLY_MAX {
+            let run = if i < EARLY_MAX / 2 { 1 } else { 2 };
+            text.push_str(&format!("{run} old{i:05}\n"));
+        }
+        let mut early = Early::parse(&text);
+        assert_eq!(early.run, 3);
+        assert!(early.contains("old00000"));
+
+        assert!(early.note("new"));
+        assert!(early.note(&format!("old{:05}", EARLY_MAX - 1)));
+        let kept = Early::parse(&early.to_text());
+        assert_eq!(kept.listed(), EARLY_MAX);
+        assert!(kept.contains("new"), "a new pipeline is listed though the list was full");
+        assert!(kept.contains(&format!("old{:05}", EARLY_MAX / 2)), "run 2 is kept");
+        // One of run 1's keys made room.
+        let run1 = (0..EARLY_MAX / 2).filter(|i| kept.contains(&format!("old{i:05}"))).count();
+        assert_eq!(run1, EARLY_MAX / 2 - 1);
+        assert_eq!(kept.run, 4);
+    }
+
+    #[test]
+    fn early_list_reads_bare_keys_as_oldest() {
+        let mut early = Early::parse("aaaa\nbbbb\n\n");
+        assert_eq!(early.run, 1);
+        assert!(early.contains("aaaa") && early.contains("bbbb"));
+        assert!(early.note("aaaa"), "a listed key used again moves to this run");
+        assert!(!early.note("aaaa"), "and is noted once per run");
+        assert_eq!(early.to_text(), "1 aaaa\n0 bbbb\n");
     }
 
     #[test]
