@@ -12,11 +12,13 @@
 //! memory address is traced through the SSA values back to those
 //! parameters, by data flow: copies, phis that agree, and additions.
 
+use std::collections::HashMap;
+
 use crate::ShaderError;
-use crate::gfx10::{Fields, NULL, Operand};
+use crate::gfx10::{Fields, NULL, Operand, Valu};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
-use crate::structure::{Bool, LaneExit, Structured};
+use crate::structure::{Atom, Bool, Bools, LaneExit, Structured};
 
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
@@ -271,10 +273,29 @@ pub fn track(
 }
 
 /// A dword after copy propagation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Term {
     Const(u32),
     Value(Value),
+}
+
+/// One normalized operand of a pure `v_cmp*` instruction.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CmpOperand {
+    abs: bool,
+    neg: bool,
+    hi: bool,
+    dwords: Vec<Term>,
+}
+
+/// Canonical identity of a pure per-lane compare, up to operand swap and
+/// (for integer compares) negation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CompareKey {
+    op: &'static str,
+    ty: &'static str,
+    lhs: CmpOperand,
+    rhs: CmpOperand,
 }
 
 /// A 32-bit sum: optional root parameter (as its first dword), constant,
@@ -307,6 +328,7 @@ type Known = Vec<(Bool, bool)>;
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+const MAX_MEET: usize = 1 << 16;
 
 impl<'a> Tracer<'a> {
     fn new(
@@ -1063,7 +1085,8 @@ impl<'a> Tracer<'a> {
     }
 
     /// [`Self::lane_term`], where every lane in `known` runs each VGPR copy
-    /// it follows.
+    /// it follows (or keeps the previous value when a masked copy writes
+    /// what every active lane already holds).
     fn lane_value(&self, mut t: Term, known: &Known) -> Result<Term, &'static str> {
         for _ in 0..MAX_JOINS * 2 {
             let Term::Value(v) = t else { break };
@@ -1073,12 +1096,297 @@ impl<'a> Tracer<'a> {
             }
             if self.varies(t)
                 && let Some(site) = self.defs[v.0 as usize]
+                && let Err(err) = self.runs(site, known)
             {
-                self.runs(site, known)?;
+                if let Some(old) = self.redundant_vmov(site, v, next, known) {
+                    t = old;
+                    continue;
+                }
+                return Err(err);
             }
             t = next;
         }
         Ok(t)
+    }
+
+    /// If `site` is a plain masked `v_mov_b32` writing `v` with `src` whose
+    /// active lanes in `known` already hold `src` in the destination VGPR,
+    /// returns that previous VGPR value.
+    fn redundant_vmov(&self, site: Site, v: Value, src: Term, known: &Known) -> Option<Term> {
+        let lanes = self.lanes?;
+        let guard = lanes
+            .guards
+            .get(site.0)
+            .and_then(|g| g.get(site.1))
+            .copied()
+            .flatten()?;
+        let inst = self.inst(site);
+        if inst.name() != "v_mov_b32" {
+            return None;
+        }
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Vector { reg, .. }) = f.dst else {
+            return None;
+        };
+        if inst.write(Reg::V(reg)) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.clamp
+            || f.omod != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        let old = Term::Value(inst.read(Reg::V(reg))?);
+        let mut active = known.clone();
+        active.extend([(lanes.reach[site.0], true), (guard, true)]);
+        self.equals_under(old, src, &mut active, 0).then_some(old)
+    }
+
+    /// Whether `cur` evaluates to `want` on every feasible lane in `known`.
+    fn equals_under(&self, cur: Term, want: Term, known: &mut Known, depth: usize) -> bool {
+        if depth > MAX_JOINS {
+            return false;
+        }
+        if !self.lanes_meet(known) {
+            return true;
+        }
+        let Ok(cur) = self.lane_value(cur, known) else {
+            return false;
+        };
+        let want = self.lane_value(want, known).unwrap_or(want);
+        if cur == want {
+            return true;
+        }
+        let Term::Value(v) = cur else {
+            return false;
+        };
+        let Some(lanes) = self.lanes else {
+            return false;
+        };
+        if let Some((block, idx)) = self.phis[v.0 as usize] {
+            let preds = &self.p.blocks[block].preds;
+            if preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
+                return false;
+            }
+            for (j, &q) in preds.iter().enumerate() {
+                let n = known.len();
+                known.push((lanes.reach[q], true));
+                if let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = lanes.exits[q]
+                    && taken != not_taken
+                {
+                    known.push((when, taken == block));
+                }
+                let ok = self.equals_under(
+                    Term::Value(self.p.blocks[block].phis[idx].args[j]),
+                    want,
+                    known,
+                    depth + 1,
+                );
+                known.truncate(n);
+                if !ok {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if let Some((mask, set_val, clear_val)) = self.lane_picked(v)
+            && let Some(site) = self.defs[v.0 as usize]
+            && self.runs(site, known).is_ok()
+            && let Some(&bit) = lanes.masks.get(&mask)
+        {
+            for (holds, arm) in [(true, set_val), (false, clear_val)] {
+                let n = known.len();
+                known.push((bit, holds));
+                let ok = self.equals_under(arm, want, known, depth + 1);
+                known.truncate(n);
+                if !ok {
+                    return false;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Like [`Bools::meet`], additionally enforcing equivalence between
+    /// repeated pure `v_cmp*` atoms whose canonical operation and SSA
+    /// operands match.
+    fn lanes_meet(&self, all: &[(Bool, bool)]) -> bool {
+        let Some(lanes) = self.lanes else {
+            return true;
+        };
+        if !lanes.bools.meet(all) {
+            return false;
+        }
+        let mut by_key: HashMap<CompareKey, Vec<(Atom, bool)>> = HashMap::new();
+        let mut seen = Vec::new();
+        for &(b, _) in all {
+            for atom in lanes.bools.support(b) {
+                if seen.contains(&atom) {
+                    continue;
+                }
+                seen.push(atom);
+                if let Atom::Lane(v) = atom
+                    && let Some((key, neg)) = self.compare_key(v)
+                {
+                    by_key.entry(key).or_default().push((atom, neg));
+                }
+            }
+        }
+        let mut equiv: HashMap<Atom, (usize, bool)> = HashMap::new();
+        let mut groups = 0usize;
+        for atoms in by_key.into_values() {
+            if atoms.len() >= 2 {
+                for (atom, neg) in atoms {
+                    equiv.insert(atom, (groups, neg));
+                }
+                groups += 1;
+            }
+        }
+        if groups == 0 {
+            return true;
+        }
+        let rank = bdd_ranks(&lanes.bools, all);
+        let mut assigned = vec![None; groups];
+        let mut budget = MAX_MEET;
+        meet_equiv(
+            &lanes.bools,
+            all.to_vec(),
+            &rank,
+            &equiv,
+            &mut assigned,
+            &mut budget,
+        )
+    }
+
+    /// Canonical key and polarity for a pure two-operand `v_cmp*` low-dword
+    /// mask result `v`.
+    fn compare_key(&self, v: Value) -> Option<(CompareKey, bool)> {
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if f.dpp.is_some()
+            || f.sdwa.is_some()
+            || f.clamp
+            || f.omod != 0
+            || f.src.len() != 2
+            || inst.writes.first().is_none_or(|w| w.1 != v)
+        {
+            return None;
+        }
+        let rest = inst
+            .name()
+            .strip_prefix("v_cmpx_")
+            .or_else(|| inst.name().strip_prefix("v_cmp_"))?;
+        let (op, ty) = rest.rsplit_once('_')?;
+        let (is_int, is_64) = match ty {
+            "u16" | "i16" | "u32" | "i32" => (true, false),
+            "u64" | "i64" => (true, true),
+            "f16" | "f32" => (false, false),
+            "f64" => (false, true),
+            _ => return None,
+        };
+        let lhs = self.cmp_operand(inst, &f.src[0], 0, f, is_64)?;
+        let rhs = self.cmp_operand(inst, &f.src[1], 1, f, is_64)?;
+        let (op, mut lhs, mut rhs, negated) = match op {
+            "lt" => ("lt", lhs, rhs, false),
+            "gt" => ("lt", rhs, lhs, false),
+            "eq" => ("eq", lhs, rhs, false),
+            "ne" if is_int => ("eq", lhs, rhs, true),
+            "le" if is_int => ("lt", rhs, lhs, true),
+            "ge" if is_int => ("lt", lhs, rhs, true),
+            "le" => ("le", lhs, rhs, false),
+            "ge" => ("le", rhs, lhs, false),
+            "lg" | "o" | "u" | "nlg" | "neq" => (op, lhs, rhs, false),
+            "nlt" => ("nlt", lhs, rhs, false),
+            "ngt" => ("nlt", rhs, lhs, false),
+            "nle" => ("nle", lhs, rhs, false),
+            "nge" => ("nle", rhs, lhs, false),
+            _ => return None,
+        };
+        if matches!(op, "eq" | "lg" | "o" | "u" | "nlg" | "neq") && rhs < lhs {
+            std::mem::swap(&mut lhs, &mut rhs);
+        }
+        Some((CompareKey { op, ty, lhs, rhs }, negated))
+    }
+
+    fn cmp_operand(
+        &self,
+        inst: &Inst,
+        op: &Operand,
+        idx: usize,
+        f: &Valu,
+        is_64: bool,
+    ) -> Option<CmpOperand> {
+        let dwords = match *op {
+            Operand::Scalar { code: NULL, dwords } => vec![Term::Const(0); usize::from(dwords)],
+            Operand::Scalar { code, dwords } => (0..dwords)
+                .map(|k| Some(self.origin(inst.read(Reg::S(code + k))?)))
+                .collect::<Option<Vec<_>>>()?,
+            Operand::Vector { reg, dwords } => (0..dwords)
+                .map(|k| Some(self.unconditional_vorigin(inst.read(Reg::V(reg + k))?)))
+                .collect::<Option<Vec<_>>>()?,
+            Operand::Const(c) if !is_64 => vec![Term::Const(inline(c)?)],
+            Operand::Const(c @ 128..=208) => {
+                let lo = inline(c)?;
+                vec![Term::Const(lo), Term::Const(((lo as i32) >> 31) as u32)]
+            }
+            Operand::Literal(x) if !is_64 => vec![Term::Const(x)],
+            _ => return None,
+        };
+        Some(CmpOperand {
+            abs: (f.abs >> idx) & 1 != 0,
+            neg: (f.neg >> idx) & 1 != 0,
+            hi: (f.opsel >> idx) & 1 != 0,
+            dwords,
+        })
+    }
+
+    /// Follows only unguarded plain `v_mov_b32` copies from `v`.
+    fn unconditional_vorigin(&self, mut v: Value) -> Term {
+        for _ in 0..MAX_JOINS * 2 {
+            let Some(site) = self.defs[v.0 as usize] else {
+                break;
+            };
+            if self
+                .lanes
+                .and_then(|l| l.guards.get(site.0).and_then(|g| g.get(site.1)))
+                .is_some_and(Option::is_some)
+            {
+                break;
+            }
+            let inst = self.inst(site);
+            let Fields::Valu(f) = &inst.fields else {
+                break;
+            };
+            if inst.name() != "v_mov_b32"
+                || f.abs != 0
+                || f.neg != 0
+                || f.clamp
+                || f.omod != 0
+                || f.sdwa.is_some()
+                || f.dpp.is_some()
+            {
+                break;
+            }
+            let Some(next) = f.src.first().and_then(|s| self.raw(inst, s)) else {
+                break;
+            };
+            match next {
+                Term::Value(u) if u != v => v = u,
+                other => return other,
+            }
+        }
+        Term::Value(v)
     }
 
     /// One copy of [`Self::vorigin`]: what the `v_mov_b32` writing `v`
@@ -1119,7 +1427,7 @@ impl<'a> Tracer<'a> {
         };
         let mut skips = known.clone();
         skips.extend([(lanes.reach[site.0], true), (guard, false)]);
-        if lanes.bools.meet(&skips) {
+        if self.lanes_meet(&skips) {
             return Err("a per-lane descriptor written where some lanes may keep the old one");
         }
         Ok(())
@@ -1382,7 +1690,7 @@ impl<'a> Tracer<'a> {
             {
                 known.push((when, taken == block));
             }
-            let arg = if lanes.bools.meet(known) {
+            let arg = if self.lanes_meet(known) {
                 let edge: Vec<Term> = words
                     .iter()
                     .map(|w| match phi_of(w) {
@@ -1725,6 +2033,91 @@ pub(crate) fn inline(code: u8) -> Option<u32> {
         248 => Some(0x3E22_F983),
         _ => None,
     }
+}
+
+/// Assigns each BDD atom reachable from `all` a rank consistent with the
+/// BDD's variable order (`rank[parent] < rank[child]` for every node edge).
+fn bdd_ranks(bools: &Bools, all: &[(Bool, bool)]) -> HashMap<Atom, usize> {
+    let mut visited = Vec::new();
+    let mut postorder = Vec::new();
+    let mut stack: Vec<(Bool, bool)> = all.iter().map(|&(b, _)| (b, false)).collect();
+    while let Some((b, done)) = stack.pop() {
+        let Some((atom, lo, hi)) = bools.node(b) else {
+            continue;
+        };
+        if done {
+            if !postorder.contains(&atom) {
+                postorder.push(atom);
+            }
+            continue;
+        }
+        if visited.contains(&b) {
+            continue;
+        }
+        visited.push(b);
+        stack.push((b, true));
+        stack.push((hi, false));
+        stack.push((lo, false));
+    }
+    postorder
+        .into_iter()
+        .rev()
+        .enumerate()
+        .map(|(i, a)| (a, i))
+        .collect()
+}
+
+/// Satisfiability of `all` under `equiv` (`atom -> (group_id, negated)`).
+/// Returns `true` conservatively if `budget` runs out.
+fn meet_equiv(
+    bools: &Bools,
+    mut all: Vec<(Bool, bool)>,
+    rank: &HashMap<Atom, usize>,
+    equiv: &HashMap<Atom, (usize, bool)>,
+    assigned: &mut [Option<bool>],
+    budget: &mut usize,
+) -> bool {
+    let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
+    if all.iter().any(fails) {
+        return false;
+    }
+    all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+    if all.is_empty() || *budget == 0 {
+        return true;
+    }
+    *budget -= 1;
+    let atom = all
+        .iter()
+        .filter_map(|&(b, _)| bools.node(b).map(|(a, _, _)| a))
+        .min_by_key(|a| rank[a])
+        .expect("not empty");
+    let step = |val: bool, assigned: &mut [Option<bool>], budget: &mut usize| {
+        let next = all
+            .iter()
+            .map(|&(b, holds)| match bools.node(b) {
+                Some((top, lo, hi)) if top == atom => (if val { hi } else { lo }, holds),
+                _ => (b, holds),
+            })
+            .collect();
+        meet_equiv(bools, next, rank, equiv, assigned, budget)
+    };
+    if let Some(&(group, neg)) = equiv.get(&atom) {
+        if let Some(gval) = assigned[group] {
+            return step(gval ^ neg, assigned, budget);
+        }
+        for gval in [false, true] {
+            assigned[group] = Some(gval);
+            let ok = step(gval ^ neg, assigned, budget);
+            assigned[group] = None;
+            if ok {
+                return true;
+            }
+        }
+        return false;
+    }
+    [false, true]
+        .into_iter()
+        .any(|val| step(val, assigned, budget))
 }
 
 #[cfg(test)]
@@ -3049,5 +3442,122 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn joined_descriptor_redundant_partial_write() {
+        // After the if/else join of WATERFALL_JOINED_WAVE32, re-writing v4
+        // with s24 under the same lane < 16 predicate leaves every lane's
+        // descriptor unchanged.
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
+        words.splice(
+            at..at,
+            [
+                0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0 (lane < 16)
+                0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
+                0x7E08_0218, // v_mov_b32 v4, s24 (same word the then arm wrote)
+                0xBEFE_0312, // s_mov_b32 exec_lo, s18
+            ],
+        );
+        let r = waterfall(&words, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource && matches!(d.source, Source::LanePhi { .. }))
+            .unwrap();
+        let offsets: Vec<u32> = image
+            .source
+            .leaves()
+            .into_iter()
+            .map(|s| table_offset(&r, s))
+            .collect();
+        assert_eq!(offsets, vec![0, 0x20]);
+    }
+
+    #[test]
+    fn joined_descriptor_redundant_partial_write_negated_compare() {
+        // Same as above, targeting the else arm (lane >= 16) via the negated
+        // integer compare `v_cmp_le_u32 16, v0` and writing s32 to v4.
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
+        words.splice(
+            at..at,
+            [
+                0x7D86_0090, // v_cmp_le_u32 vcc_lo, 16, v0 (lane >= 16)
+                0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
+                0x7E08_0220, // v_mov_b32 v4, s32 (same word the else arm wrote)
+                0xBEFE_0312, // s_mov_b32 exec_lo, s18
+            ],
+        );
+        let r = waterfall(&words, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource && matches!(d.source, Source::LanePhi { .. }))
+            .unwrap();
+        let offsets: Vec<u32> = image
+            .source
+            .leaves()
+            .into_iter()
+            .map(|s| table_offset(&r, s))
+            .collect();
+        assert_eq!(offsets, vec![0, 0x20]);
+    }
+
+    #[test]
+    fn joined_descriptor_non_redundant_partial_write_fails() {
+        // Writing the else arm's word (s32) under the then arm's mask
+        // (lane < 16) changes active lanes' v4 and must still be refused.
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
+        words.splice(
+            at..at,
+            [
+                0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0 (lane < 16)
+                0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
+                0x7E08_0220, // v_mov_b32 v4, s32 (wrong arm's word)
+                0xBEFE_0312, // s_mov_b32 exec_lo, s18
+            ],
+        );
+        let err = waterfall(&words, false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a per-lane descriptor written where some lanes may keep the old one",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn joined_descriptor_wider_mask_partial_write_fails() {
+        // Writing s24 under lane < 24 overwrites lanes 16..24 (which held s32)
+        // and must still be refused.
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
+        words.splice(
+            at..at,
+            [
+                0x7D88_0098, // v_cmp_gt_u32 vcc_lo, 24, v0 (lane < 24)
+                0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
+                0x7E08_0218, // v_mov_b32 v4, s24
+                0xBEFE_0312, // s_mov_b32 exec_lo, s18
+            ],
+        );
+        let err = waterfall(&words, false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a per-lane descriptor written where some lanes may keep the old one",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 }
