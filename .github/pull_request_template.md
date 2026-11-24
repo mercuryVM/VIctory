@@ -7,7 +7,7 @@
 ## Quality Assurance & Verification
 <!-- Describe the testing or validation performed to verify the changes. -->
 - [ ] Verified with the workspace Rust toolchain (`cargo check` or `cargo test`)
-- [ ] Formatted with `cargo fmt --edition 2024`
+- [ ] Formatted changed lines with `cargo fmt`
 
 ## Asset Policy & Safety Compliance (Mandatory)
 <!-- All pull requests must strictly comply with Rule #1 and repository safety rules. -->
