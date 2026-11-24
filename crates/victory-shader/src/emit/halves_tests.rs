@@ -214,6 +214,9 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         }],
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
     })?;
     let shader = HostShader {
         stage: HwStage::Ms,

@@ -155,6 +155,8 @@ type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks and outputs after emission, one set per worker thread.
 struct Checks<'a> {
+    /// The wave sizes to translate for.
+    target: emit::Target,
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
@@ -252,6 +254,7 @@ pub fn run(
     list: bool,
     write_cache: bool,
     jobs: Option<usize>,
+    host_lanes: Option<(u32, u32)>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
@@ -263,8 +266,21 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
+    let mut target = emit::Target::ANY;
     if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
+        target = Host::new(false).map_err(anyhow::Error::msg)?.target();
+    }
+    if let Some((lanes_min, lanes_max)) = host_lanes {
+        target = emit::Target {
+            lanes_min,
+            lanes_max,
+        };
+    }
+    if target != emit::Target::ANY {
+        println!(
+            "host waves   {}-{} lanes",
+            target.lanes_min, target.lanes_max
+        );
     }
     let cache = if write_cache {
         let cfg = victory_core::Config::load()?;
@@ -298,6 +314,7 @@ pub fn run(
                     ..Tally::default()
                 };
                 let mut checks = Checks {
+                    target,
                     keep: (!pairs.is_empty()).then(|| kept.clone()),
                     validator: validate
                         .then(|| Validator::load(dll.as_deref()).ok())
@@ -556,13 +573,13 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
+                    match emit::emit(&container, &p, &program, &s, &i, &r, checks.target) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             if Some(program_index) == cache_target
                                 && let Some(cache) = checks.cache
                             {
-                                match shader_cache::store(cache, container_bytes, &shader) {
+                                match shader_cache::store(cache, container_bytes, &shader, checks.target) {
                                     Ok(true) => t.cached += 1,
                                     Ok(false) => t.cache_hits += 1,
                                     Err(e) => t.fail(format!("cache: {e:#}"), label),
@@ -663,7 +680,13 @@ fn check(
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
                 }
             }
-            t.fail(format!("validator: {first}"), label);
+            // With what the module declares and calls: the validator's
+            // message for an operation the stage or the entry's properties
+            // do not allow names neither.
+            t.fail(
+                format!("validator: {first} [{}]", emit::last_module_summary()),
+                label,
+            );
         }
     }
 }

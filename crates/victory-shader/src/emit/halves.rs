@@ -16,7 +16,7 @@
 //!   scalar compares) need the console wave's ballot.
 //!
 //! Both are exchanged through group-shared memory between group barriers
-//! ([`super::lower`]'s `console_ballot` and `console_first_lane`), so they
+//! ([`super::lower`]'s `mesh_ballot` and `mesh_first_lane`), so they
 //! need a point that every thread of the group reaches exactly once:
 //! [`all_threads`]. Elsewhere a mask read as data stops with a reason, and
 //! a first-lane read keeps the host wave's first lane (see the shortcut in

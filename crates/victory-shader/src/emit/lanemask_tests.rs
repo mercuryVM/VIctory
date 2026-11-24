@@ -120,6 +120,9 @@ fn lower_cs_on(words: &[u32], wave64: bool) -> Result<HostShader, ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
     })?;
     let shader = HostShader {
         stage: HwStage::Cs,
