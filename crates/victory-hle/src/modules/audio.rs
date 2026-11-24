@@ -397,6 +397,8 @@ impl Context {
         self.word(word).load(Ordering::Acquire)
     }
 
+    /// (Only the tests write whole words.)
+    #[cfg(test)]
     fn set(self, word: usize, value: u32) {
         self.word(word).store(value, Ordering::Release);
     }
