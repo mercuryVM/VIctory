@@ -27,6 +27,10 @@ changes in other crates, run their relevant tests and state which checks you
 ran in the PR. Run the policy check with the files staged if you have not
 committed them yet: `cargo xtask policy --staged`.
 
+On the current main branch, `cargo fmt --all --check` also reports existing
+formatting differences. Format only the Rust files you touch so unrelated
+changes stay out of the PR.
+
 ## Write a useful report
 
 Include the VIctory commit, build profile, Windows version, CPU, GPU and driver.
