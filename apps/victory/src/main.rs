@@ -98,8 +98,9 @@ enum Command {
         #[arg(long)]
         execute: bool,
         /// The console model the title sees (device type, memory).
-        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
-        console: Console,
+        /// Default: VICTORY_CONSOLE or [run].console, else series-x.
+        #[arg(long, value_enum)]
+        console: Option<Console>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -180,6 +181,7 @@ fn show_config() -> Result<()> {
     );
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
+    println!("console     : {:?}", cfg.console);
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

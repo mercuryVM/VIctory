@@ -22,8 +22,32 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    /// The console model `run` reports when `--console` is not given.
+    pub console: Console,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
+}
+
+/// The console model a title sees. Series S makes the title pick a lower
+/// output and render size, which needs much less memory.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Console {
+    #[default]
+    SeriesX,
+    SeriesS,
+}
+
+impl std::str::FromStr for Console {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "series-x" => Ok(Console::SeriesX),
+            "series-s" => Ok(Console::SeriesS),
+            _ => anyhow::bail!("unknown console {s:?}: expected series-x or series-s"),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -31,6 +55,14 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    run: FileRun,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileRun {
+    console: Option<Console>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,15 +102,20 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        Self::resolve(parsed, source, |k| std::env::var_os(k))
     }
 
     fn resolve(
-        file: FilePaths,
+        parsed: FileConfig,
         source: Option<PathBuf>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
+        let file = parsed.paths;
         let env_path = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+        let console = match env("VICTORY_CONSOLE").filter(|v| !v.is_empty()) {
+            Some(v) => v.to_string_lossy().parse().context("VICTORY_CONSOLE")?,
+            None => parsed.run.console.unwrap_or_default(),
+        };
         let test_titles = match env("VICTORY_TEST_TITLES") {
             Some(v) => std::env::split_paths(&v)
                 .filter(|p| !p.as_os_str().is_empty())
@@ -96,6 +133,7 @@ impl Config {
             cache_dir,
             data_dir,
             test_titles,
+            console,
             source,
         })
     }
@@ -141,13 +179,67 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
+    fn paths(paths: FilePaths) -> FileConfig {
+        FileConfig {
+            paths,
+            ..Default::default()
+        }
+    }
+
+    fn parse(text: &str) -> FileConfig {
+        toml::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn console_defaults_to_series_x() {
+        let cfg = Config::resolve(FileConfig::default(), None, |_| None).unwrap();
+        assert_eq!(cfg.console, Console::SeriesX);
+    }
+
+    #[test]
+    fn console_comes_from_the_file() {
+        let file = parse(
+            "[run]
+console = 'series-s'
+",
+        );
+        let cfg = Config::resolve(file, None, |_| None).unwrap();
+        assert_eq!(cfg.console, Console::SeriesS);
+    }
+
+    #[test]
+    fn console_env_overrides_file() {
+        let file = parse(
+            "[run]
+console = 'series-s'
+",
+        );
+        let env = |k: &str| (k == "VICTORY_CONSOLE").then(|| OsString::from("Series-X"));
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(cfg.console, Console::SeriesX);
+    }
+
+    #[test]
+    fn unknown_console_is_an_error() {
+        let env = |k: &str| (k == "VICTORY_CONSOLE").then(|| OsString::from("one-x"));
+        assert!(Config::resolve(FileConfig::default(), None, env).is_err());
+        assert!(
+            toml::from_str::<FileConfig>(
+                "[run]
+console = 'one-x'
+"
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn environment_overrides_file() {
-        let file = FilePaths {
+        let file = paths(FilePaths {
             game_dir: Some("from-file".into()),
             cache_dir: Some("cache-from-file".into()),
             ..Default::default()
-        };
+        });
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
@@ -156,10 +248,10 @@ mod tests {
 
     #[test]
     fn empty_env_values_are_ignored() {
-        let file = FilePaths {
+        let file = paths(FilePaths {
             game_dir: Some("from-file".into()),
             ..Default::default()
-        };
+        });
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));

@@ -98,6 +98,10 @@ victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
 victory config
 ```
 
+Without `--console`, `run` uses `VICTORY_CONSOLE` or `[run].console` in
+`victory.toml`, else Series X. Series S renders at a lower resolution and
+needs less memory.
+
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 

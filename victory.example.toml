@@ -17,3 +17,9 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+[run]
+# The console the title sees when `run` gets no --console: 'series-x'
+# (default) or 'series-s'. Series S makes the title render at a lower
+# resolution and use less memory.   env: VICTORY_CONSOLE
+# console = 'series-s'

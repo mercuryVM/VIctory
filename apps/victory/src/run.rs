@@ -10,7 +10,7 @@ pub fn run(
     unimplemented: Unimplemented,
     strict: bool,
     execute: bool,
-    console: Console,
+    console: Option<Console>,
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -60,10 +60,7 @@ pub fn run(
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
-    victory_hle::console::set(match console {
-        Console::SeriesX => victory_hle::console::Console::SeriesX,
-        Console::SeriesS => victory_hle::console::Console::SeriesS,
-    });
+    victory_hle::console::set(console_model(console, cfg.console));
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
@@ -309,9 +306,40 @@ impl LoaderLock {
     }
 }
 
+/// `--console` if given, else the configured model.
+#[cfg(windows)]
+fn console_model(
+    flag: Option<Console>,
+    configured: victory_core::config::Console,
+) -> victory_hle::console::Console {
+    use victory_core::config::Console as Configured;
+    use victory_hle::console::Console as Model;
+    match (flag, configured) {
+        (Some(Console::SeriesX), _) | (None, Configured::SeriesX) => Model::SeriesX,
+        (Some(Console::SeriesS), _) | (None, Configured::SeriesS) => Model::SeriesS,
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn console_flag_overrides_config() {
+        use super::{Console, console_model};
+        use victory_core::config::Console as Configured;
+        use victory_hle::console::Console as Model;
+        assert_eq!(console_model(None, Configured::SeriesS), Model::SeriesS);
+        assert_eq!(console_model(None, Configured::SeriesX), Model::SeriesX);
+        assert_eq!(
+            console_model(Some(Console::SeriesX), Configured::SeriesS),
+            Model::SeriesX
+        );
+        assert_eq!(
+            console_model(Some(Console::SeriesS), Configured::SeriesX),
+            Model::SeriesS
+        );
+    }
 
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
@@ -333,6 +361,6 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Option<Console>) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }
