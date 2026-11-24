@@ -116,6 +116,12 @@ mod tests {
         data[DOS_E_LFANEW..DOS_E_LFANEW + 4].copy_from_slice(&0x40u32.to_le_bytes());
 
         let optional = 0x58;
+        let file_header = file_header_offset(&data).unwrap();
+        let size_of_optional_header_field = file_header + 16;
+        let size_of_optional_header = OPT_DATA_DIRECTORY + 2 * DATA_DIRECTORY_SIZE;
+        data[size_of_optional_header_field..size_of_optional_header_field + 2]
+            .copy_from_slice(&(size_of_optional_header as u16).to_le_bytes());
+
         let count_at = optional + OPT_NUMBER_OF_RVA_AND_SIZES;
         data[count_at..count_at + 4].copy_from_slice(&2u32.to_le_bytes());
 
