@@ -156,8 +156,10 @@ impl HostHeap {
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
+                    // The full dynamic range, as upstream #1548 proposes: fewer
+                    // title slots mirrored, more for the tables past them.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - DYNAMIC, DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
