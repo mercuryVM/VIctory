@@ -124,6 +124,10 @@ pub(crate) struct Shader {
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
+    /// Wave64 mesh: the group-shared buffer console waves exchange lanes
+    /// through, in dwords (see `emit::halves`).
+    pub xch_dwords: u32,
+    xch: Option<V>,
     main: V,
     pub entry: usize,
     /// The `dx.op` operations called (names without overload).
@@ -198,6 +202,8 @@ impl Shader {
             wave_size: None,
             lds_dwords: 0,
             lds: None,
+            xch_dwords: 0,
+            xch: None,
             main,
             entry,
             ops: std::collections::BTreeSet::new(),
@@ -213,6 +219,19 @@ impl Shader {
         let arr = self.m.array(self.lds_dwords, self.t.i32);
         let g = self.m.global("lds", arr, 3);
         self.lds = Some(g);
+        g
+    }
+
+    /// The exchange buffer of `dwords` dwords in address space 3, made on
+    /// first use.
+    pub fn xch(&mut self, dwords: u32) -> V {
+        if let Some(g) = self.xch {
+            return g;
+        }
+        let arr = self.m.array(dwords, self.t.i32);
+        let g = self.m.global("xch", arr, 3);
+        self.xch_dwords = dwords;
+        self.xch = Some(g);
         g
     }
 
@@ -932,7 +951,9 @@ impl Shader {
             inputs: &self.inputs,
             outputs: &self.outputs,
             prims: &self.prims,
-            mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            mesh: self
+                .mesh
+                .map(|m| (m, (self.lds_dwords + self.xch_dwords) * 4)),
             gs: self.gs,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
