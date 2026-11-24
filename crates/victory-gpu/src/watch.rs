@@ -72,7 +72,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
-    let guarded = if failed {
+    let guarded = if failed && in_one_view(first * PAGE, last * PAGE) {
+        // A view cannot be write-watched: asking allocation by allocation
+        // would end there, after a `VirtualQuery` that costs ~0.4 ms in a
+        // big guarded view (the world asks ~1,000 times per frame).
+        if !guarded {
+            return None;
+        }
+        count = 0;
+        guard(first * PAGE, last * PAGE)?
+    } else if failed {
         count = 0;
         let mut lost = Vec::new();
         let again = by_allocation(first * PAGE, last * PAGE, &mut j.found, &mut lost);
@@ -251,9 +260,33 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// the allocation type avoids enumerating pages with identical protection,
 /// which can span an entire large view after its blocks were guarded.
 fn mapped(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    match allocation(at) {
+        Some((true, ..)) => return true,
+        Some((false, ..)) => return false,
+        None => {}
+    }
+    // Unknown flag combinations and failed allocation queries keep the
+    // VirtualQuery type check, including for a free address.
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: the output buffer has the required layout and size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.Type == MEM_MAPPED
+}
+
+/// Whether `[start, end)` lies in one mapped view (one allocation), by the
+/// allocation query alone.
+fn in_one_view(start: usize, end: usize) -> bool {
+    matches!(allocation(start), Some((true, base, len)) if base <= start && end <= base.saturating_add(len))
+}
+
+/// The allocation holding `at`, if the system says what it is: whether it
+/// is a mapped view, its start and its length. Asks about the allocation
+/// only, which costs well under a microsecond where `VirtualQuery` walks
+/// the view's pages.
+fn allocation(at: usize) -> Option<(bool, usize, usize)> {
     use windows_sys::Win32::System::Memory::{
-        MEM_MAPPED, MEMORY_BASIC_INFORMATION, MemoryRegionInfo, QueryVirtualMemoryInformation,
-        VirtualQuery, WIN32_MEMORY_REGION_INFORMATION,
+        MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -278,19 +311,15 @@ fn mapped(at: usize) -> bool {
         const MAPPED_IMAGE: u32 = 1 << 2;
         const MAPPED_PAGE_FILE: u32 = 1 << 3;
         const MAPPED_PHYSICAL: u32 = 1 << 4;
+        let (base, len) = (region.AllocationBase as usize, region.RegionSize);
         // SAFETY: this union was filled by the successful query above.
         match unsafe { region.Anonymous.Flags } {
-            MAPPED_DATA_FILE | MAPPED_PAGE_FILE | MAPPED_PHYSICAL => return true,
-            PRIVATE | MAPPED_IMAGE => return false,
+            MAPPED_DATA_FILE | MAPPED_PAGE_FILE | MAPPED_PHYSICAL => return Some((true, base, len)),
+            PRIVATE | MAPPED_IMAGE => return Some((false, base, len)),
             _ => {}
         }
     }
-    // Unknown flag combinations and failed allocation queries keep the
-    // VirtualQuery type check, including for a free address.
-    let mut info = MEMORY_BASIC_INFORMATION::default();
-    // SAFETY: the output buffer has the required layout and size.
-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.Type == MEM_MAPPED
+    None
 }
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
@@ -838,4 +867,97 @@ mod tests {
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
     }
+
+    /// A range inside one view is asked through its guards (a view cannot
+    /// be write-watched), without the allocation walk; asked without
+    /// guards, it is not watched.
+    #[test]
+    fn a_view_is_asked_through_its_guards() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
+        };
+        const SIZE: usize = 4 * BLOCK;
+        // SAFETY: a pagefile section of four blocks, mapped read-write; the
+        // view keeps the section.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
+            windows_sys::Win32::Foundation::CloseHandle(section);
+            view
+        };
+        assert_ne!(view, 0);
+        assert!(in_one_view(view, view + SIZE));
+        assert!(in_one_view(view + BLOCK, view + 2 * BLOCK));
+        assert!(!in_one_view(view, view + SIZE + BLOCK));
+        assert!(writes(view, view + SIZE, false).is_none());
+        let pages = |r: std::ops::Range<usize>| -> Vec<usize> {
+            r.map(|b| (view + b * BLOCK) / PAGE).collect()
+        };
+        let asked = |from: usize, to: usize| {
+            let (now, found) =
+                writes(view + from * BLOCK, view + to * BLOCK, true).expect("guarded");
+            found
+                .into_iter()
+                .filter(|&(_, w)| w == now)
+                .map(|(p, _)| p)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(asked(0, 4), pages(0..4), "never guarded: all written");
+        assert_eq!(asked(0, 4), pages(0..0));
+        // SAFETY: our view; the handler opens the guarded block.
+        unsafe { ((view + 2 * BLOCK + 8) as *mut u8).write_volatile(1) };
+        assert_eq!(asked(1, 2), pages(0..0), "another block");
+        assert_eq!(asked(2, 3), pages(2..3));
+        assert_eq!(asked(0, 4), pages(0..0));
+        // Not unmapped: the journal keeps its pages, and a later test given
+        // the same addresses would find them written.
+    }
+
+    /// What asking about a big view costs once its blocks were guarded and
+    /// every other one written (protections alternating, as in the world's
+    /// mapped heaps). Run with `cargo test --release -p victory-gpu --lib --
+    /// --ignored --nocapture guarded_view_asking`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn guarded_view_asking() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        const SIZE: usize = 2816 * BLOCK; // 176 MiB
+        // SAFETY: a pagefile section mapped read-write (kept: the journal and
+        // guards remember its blocks).
+        let view = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, SIZE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(writes(view, view + SIZE, true).is_some());
+        let dirty = || {
+            for block in (0..SIZE / BLOCK).step_by(2) {
+                // SAFETY: our view; the handler opens the guarded block.
+                unsafe { ((view + block * BLOCK + 8) as *mut u8).write_volatile(1) };
+            }
+        };
+        for round in 0..3 {
+            dirty();
+            let started = std::time::Instant::now();
+            let (_, found) = writes(view, view + SIZE, true).expect("guarded");
+            let whole = started.elapsed();
+            let started = std::time::Instant::now();
+            for i in 0..256 {
+                let at = view + (i * 11 % (SIZE / BLOCK)) * BLOCK + 256;
+                let _ = writes(at, at + 4096, true);
+            }
+            let small = started.elapsed() / 256;
+            println!("round {round}: whole view {whole:?} ({} pages written), a 4 KiB range {small:?}", found.len());
+        }
+    }
+
 }
