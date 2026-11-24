@@ -51,6 +51,43 @@ impl Source<'_> {
     }
 }
 
+/// Owned offset descriptor for a [`Source`] inside a file buffer, allowing
+/// persistent worker threads to share batches across files without copying.
+pub(crate) enum SourceRef {
+    Raw { offset: usize, len: usize },
+    Packed { offset: usize },
+}
+
+impl SourceRef {
+    pub(crate) fn resolve<'a>(&self, data: &'a [u8]) -> Option<Source<'a>> {
+        match *self {
+            SourceRef::Raw { offset, len } => Some(Source::Raw {
+                offset,
+                data: data.get(offset..offset + len)?,
+            }),
+            SourceRef::Packed { offset } => Some(Source::Packed(sgd5::record_at(data, offset)?)),
+        }
+    }
+}
+
+/// Owned source offsets of SGD5 records and uncompressed DXBC containers in
+/// `data`.
+pub(crate) fn source_refs(data: &[u8]) -> Vec<SourceRef> {
+    let mut out: Vec<SourceRef> = Vec::new();
+    if sgd5::is_sgd5(data) {
+        out.extend(sgd5::records(data).map(|r| SourceRef::Packed { offset: r.offset }));
+    }
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        let container = Container::parse(&data[offset..]).ok()?;
+        Some(SourceRef::Raw {
+            offset,
+            len: container.total_size,
+        })
+    });
+    out.extend(raw);
+    out
+}
+
 /// The packed records of SGD5 data, and every container stored as is (the
 /// executable keeps some records uncompressed), found by its magic.
 pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
@@ -58,12 +95,14 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        let slice = &data[offset..];
+        let container = Container::parse(slice).ok()?;
+        Some(Source::Raw {
             offset,
-            data: &data[offset..],
-        });
+            data: &slice[..container.total_size],
+        })
+    });
     out.extend(raw);
     out
 }
