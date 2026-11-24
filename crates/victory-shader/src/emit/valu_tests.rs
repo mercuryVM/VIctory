@@ -1486,7 +1486,7 @@ fn structured_access_through_a_root_uav_reaches_index_times_stride() {
         code,
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let res = resource::track(&p, &native.layout, native.stage, None).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
     let container = crate::dxbc::build(&[]);

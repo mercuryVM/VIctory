@@ -4227,6 +4227,8 @@ impl<'a> Lower<'a> {
             self.address_views.push(view);
         }
         Ok(self.s.address_srv_handle(view.lo.index))
+    }
+
     /// Whether `src` is a descriptor built around a root SRV's or UAV's
     /// address.
     fn on_root_descriptor(&self, src: &Source) -> bool {
