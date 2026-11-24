@@ -1407,3 +1407,25 @@ fn mask_grown_inside_a_branch_counted_after_it() {
         |_| 32,
     );
 }
+
+/// The wave32 form of `loop_exit_mask_counted_after_the_loop`: a 32-lane
+/// wave whose lanes leave a loop at different iterations, its exit mask
+/// (one dword, grown from 0) counted after the loop: all 32 lanes.
+#[test]
+fn wave32_loop_exit_mask_counted_after_the_loop() {
+    let body = [
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+        0xBE8A_0380, // s_mov_b32 s10, 0
+        0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+        0x880A_0A6A, // s_or_b32 s10, vcc_lo, s10
+        0x8A7E_0A7E, // s_andn2_b32 exec_lo, exec_lo, s10
+        0xBF89_FFFB, // s_cbranch_execnz loop
+        0x887E_0A7E, // s_or_b32 exec_lo, exec_lo, s10
+        0xBE89_0F0A, // s_bcnt1_i32_b32 s9, s10
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let mut p = program(&body, 32);
+    p.wave64 = false;
+    program_case("wave32 loop exit mask counted", &p, |_| 32, true);
+}
