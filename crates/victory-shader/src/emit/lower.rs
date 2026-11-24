@@ -2398,20 +2398,54 @@ impl<'a> Lower<'a> {
         );
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        // Every primitive up to the maximum, also past the group's threads
+        // (a primitive no lane writes would hold whatever the host left).
         let flat = self.mesh_thread();
-        let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
-        let at = self.begin_guarded(guard);
         let z = self.s.m.i32(0);
-        self.s.op(
-            self.cur,
-            "emitIndices",
-            Attr::NoUnwind,
-            void,
-            169,
-            &[flat, z, z, z],
-        );
-        self.end_guarded(at, &[]);
+        for pass in 0..mesh.max_primitives.div_ceil(threads.max(1)) {
+            let index = if pass == 0 {
+                flat
+            } else {
+                let off = self.s.m.i32(pass * threads);
+                self.s.m.bin(self.cur, Bin::Add, flat, off)
+            };
+            let guard = ((pass + 1) * threads > mesh.max_primitives)
+                .then(|| self.s.m.cmp(self.cur, pred::IULT, index, p));
+            let at = self.begin_guarded(guard);
+            self.s.op(
+                self.cur,
+                "emitIndices",
+                Attr::NoUnwind,
+                void,
+                169,
+                &[index, z, z, z],
+            );
+            self.end_guarded(at, &[]);
+        }
         Ok(())
+    }
+
+    /// Mesh: `guard`, and that the lane's vertex (or primitive) is within
+    /// the declared maximum: D3D12 leaves writes past it undefined, which
+    /// can hang the host GPU, where the console drops them.
+    fn mesh_slot_guard(&mut self, guard: Option<V>, primitive: bool) -> Option<V> {
+        let mesh = self.s.mesh.expect("mesh");
+        let threads = self.s.threads.expect("mesh")[0];
+        let limit = if primitive {
+            mesh.max_primitives
+        } else {
+            mesh.max_vertices
+        };
+        if threads <= limit {
+            return guard;
+        }
+        let flat = self.mesh_thread();
+        let k = self.s.m.i32(limit);
+        let inside = self.s.m.cmp(self.cur, pred::IULT, flat, k);
+        Some(match guard {
+            Some(g) => self.s.m.bin(self.cur, Bin::And, g, inside),
+            None => inside,
+        })
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and
@@ -7895,6 +7929,7 @@ impl<'a> Lower<'a> {
         }
         // A mesh lane writes its own vertex or primitive, where it exports.
         let at = if mesh {
+            let guard = self.mesh_slot_guard(guard, primitive);
             self.begin_guarded(guard)
         } else {
             None
@@ -7960,15 +7995,25 @@ impl<'a> Lower<'a> {
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
+        let guard = self.mesh_slot_guard(guard, true);
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        // Culled (bit 31), or naming a vertex past the declared maximum,
+        // which D3D12 leaves undefined: all indices 0, no area.
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let max = self.s.m.i32(self.s.mesh.expect("mesh").max_vertices);
+        let mut indices = Vec::new();
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            let past = self.s.m.cmp(c, pred::IUGE, i, max);
+            culled = self.s.m.bin(c, Bin::Or, culled, past);
+            indices.push(i);
+        }
+        let mut args = vec![self.mesh_thread()];
+        for i in indices {
             args.push(self.s.m.select(c, culled, z, i));
         }
         let void = self.s.t.void;
