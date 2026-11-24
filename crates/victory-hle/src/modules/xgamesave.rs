@@ -301,15 +301,23 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let dir = container_dir(root, name);
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
-        let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
+        let display = match std::fs::read_to_string(old.join(".display")) {
+            Ok(display) => display,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return None,
+        };
+        let mut blobs = Vec::new();
+        for entry in std::fs::read_dir(old).ok()? {
+            let entry = entry.ok()?;
+            let Some(blob) = entry.file_name().to_str().and_then(decode) else {
+                continue;
+            };
+            let path = entry.path();
+            if !path.is_dir() {
+                // Commit only after every legacy blob could be read.
+                blobs.push((blob, std::fs::read(path).ok()?));
+            }
+        }
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
@@ -1138,6 +1146,46 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn migration_retries_without_committing_an_unreadable_blob() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let saves = tempfile::tempdir().unwrap();
+        let provider = Provider::open(saves.path(), Some("scid")).unwrap();
+        let old = provider.root.join("Slot");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("A"), b"first").unwrap();
+        let blocked = old.join("B");
+        std::fs::write(&blocked, b"second").unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&blocked)
+            .unwrap();
+        assert!(std::fs::read(&blocked).is_err());
+
+        let partial = Provider::open(saves.path(), Some("scid"))
+            .unwrap()
+            .container("Slot")
+            .dir
+            .exists();
+        drop(locked);
+        assert!(!partial, "migration committed a partial container");
+        assert_eq!(std::fs::read(old.join("A")).unwrap(), b"first");
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"second");
+
+        let retried = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(!old.exists());
+        assert_eq!(
+            read(&retried.container("Slot"), None).unwrap(),
+            [
+                ("A".into(), b"first".to_vec()),
+                ("B".into(), b"second".to_vec()),
+            ]
+        );
     }
 
     #[test]
