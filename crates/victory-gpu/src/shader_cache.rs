@@ -89,7 +89,17 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        build_fingerprint(victory_shader::SOURCE_HASH, CACHE_SCHEMA_VERSION, limit)
+        let build = build_fingerprint(victory_shader::SOURCE_HASH, CACHE_SCHEMA_VERSION, limit);
+        if !victory_shader::emit::wave64_as_32() {
+            return build;
+        }
+        tracing::warn!(
+            "VICTORY_DIAG_WAVE64_AS_32: wave64 programs no form runs here are translated as wave32 (not the console's results)"
+        );
+        let mut h = blake3::Hasher::new();
+        h.update(&build);
+        h.update(b"wave64-as-32");
+        *h.finalize().as_bytes()
     })
 }
 

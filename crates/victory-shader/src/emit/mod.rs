@@ -143,6 +143,24 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Diagnostic only (`diagnostics` feature, `VICTORY_DIAG_WAVE64_AS_32=1`):
+/// a wave64 compute program that needs its whole console wave in a group
+/// of several console waves sharing LDS or barriers, which no form runs on
+/// a host without 64-lane waves yet, is emitted for 32-lane waves as if
+/// each host wave were a console wave. Not the console's result: ballots,
+/// lane counts and whole-wave reductions cover 32 lanes instead of 64, and
+/// what the program keeps per console wave (in LDS, say) the two halves
+/// both write. It lets such passes (the title's exposure downsample) run
+/// at all while a real form is missing. Part of the translation, so the
+/// shader cache keys on it.
+pub fn wave64_as_32() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_DIAG_WAVE64_AS_32").is_ok_and(|v| v == "1")
+    })
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
