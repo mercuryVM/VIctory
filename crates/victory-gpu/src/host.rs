@@ -298,6 +298,30 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 mod tests {
     use super::*;
 
+    /// A stop deep in a long run of commands between two barriers names
+    /// the commands around the stop, not only the first ones after the
+    /// barrier.
+    #[test]
+    fn in_flight_names_the_commands_at_the_stop() {
+        let mut history = vec![D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER];
+        let mut markers = Vec::new();
+        for n in 0..100u32 {
+            markers.push((history.len() as u32, format!("dispatch {n}")));
+            history.push(D3D12_AUTO_BREADCRUMB_OP_SETMARKER);
+            history.push(D3D12_AUTO_BREADCRUMB_OP_DISPATCH);
+        }
+        history.push(D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER);
+        // Dispatch 80 is command 1 + 2 * 80 + 1.
+        let text = in_flight(&history, &markers, 162);
+        assert!(
+            text.starts_with(", commands 1..201 between its barriers:"),
+            "{text}"
+        );
+        assert!(text.contains("command 162 (op 6): dispatch 80"), "{text}");
+        assert!(text.contains("command 160 (op 6): dispatch 79"), "{text}");
+        assert!(!text.contains("dispatch 0;"), "{text}");
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -1917,7 +1941,9 @@ fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
 /// command `done`: those between the barriers around it (work between
 /// barriers overlaps on the GPU), by kind, and what the markers just
 /// before them say (`HostList::note_op`: diagnostics builds with
-/// device-removed data on).
+/// device-removed data on). Up to 40 are named, from a few before the stop
+/// on: in a long run between barriers the first commands after the barrier
+/// have usually finished.
 fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {
     let barrier = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER;
     let from = history[..done].iter().rposition(barrier).map_or(0, |b| b + 1);
@@ -1927,9 +1953,9 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         .map_or(history.len(), |b| (done + b).max(done + 1));
     let mut text = format!(", commands {from}..{to} between its barriers:");
     let mut shown = 0;
-    for i in from..to {
+    for i in from.max(done.saturating_sub(4))..to {
         let op = history[i];
-        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 12 {
+        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 40 {
             continue;
         }
         shown += 1;
