@@ -265,6 +265,15 @@ impl Module {
     pub fn int_const(&mut self, ty: Ty, v: i64) -> V {
         self.constant(ty, Const::Int(v))
     }
+    pub fn as_i32(&self, v: V) -> Option<i32> {
+        match v {
+            V::Const(i) => match self.consts.get(i as usize)? {
+                (_, Const::Int(val)) => Some(*val as i32),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     pub fn i32(&mut self, v: u32) -> V {
         let t = self.int(32);
         self.int_const(t, i64::from(v as i32))

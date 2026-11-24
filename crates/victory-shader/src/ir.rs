@@ -722,23 +722,58 @@ fn effects(
     );
     match fields {
         Fields::Sop { dst, src, .. } => {
-            if name.starts_with("s_movrel")
+            let (src_indexed, dst_indexed) = match name {
+                "s_movrels_b32" => (true, false),
+                "s_movreld_b32" => (false, true),
+                _ => (false, false),
+            };
+            if (!src_indexed && !dst_indexed && name.starts_with("s_movrel"))
                 || name.starts_with("s_subvector_loop")
                 || matches!(name, "s_call_b64" | "s_rfe_b64")
             {
                 return Err(unsupported());
             }
-            for s in src {
-                regs(s, &mut r)?;
+            const SGPRS: u8 = 106;
+            let indexed_sgpr = |op: &Operand, out: &mut Vec<Reg>| match *op {
+                Operand::Scalar { code, .. } if code < SGPRS => {
+                    out.extend((code..SGPRS).map(Reg::S));
+                    Ok(())
+                }
+                _ => Err(ShaderError::Isa {
+                    offset: inst.offset,
+                    reason: "relative SGPR base outside the SGPR range",
+                }),
+            };
+            if src_indexed {
+                let s = src.first().ok_or_else(unsupported)?;
+                indexed_sgpr(s, &mut r)?;
+                for s in &src[1..] {
+                    regs(s, &mut r)?;
+                }
+                if !r.contains(&Reg::S(M0)) {
+                    r.push(Reg::S(M0));
+                }
+            } else {
+                for s in src {
+                    regs(s, &mut r)?;
+                }
             }
             if let Some(d) = dst {
-                regs(d, &mut w)?;
-                // These change (or may keep) the destination's old value.
-                if name.starts_with("s_bitset")
-                    || name.starts_with("s_cmov")
-                    || matches!(name, "s_addk_i32" | "s_mulk_i32")
-                {
-                    regs(d, &mut r)?;
+                if dst_indexed {
+                    indexed_sgpr(d, &mut w)?;
+                    indexed_sgpr(d, &mut r)?;
+                    if !r.contains(&Reg::S(M0)) {
+                        r.push(Reg::S(M0));
+                    }
+                } else {
+                    regs(d, &mut w)?;
+                    // These change (or may keep) the destination's old value.
+                    if name.starts_with("s_bitset")
+                        || name.starts_with("s_cmov")
+                        || matches!(name, "s_addk_i32" | "s_mulk_i32")
+                    {
+                        regs(d, &mut r)?;
+                    }
                 }
             }
             if matches!(name, "s_addc_u32" | "s_subb_u32" | "s_cmovk_i32")
@@ -1248,7 +1283,7 @@ mod tests {
 
     #[test]
     fn reports_what_it_cannot_express() {
-        let code: Vec<u8> = [0xBE80_2E01_u32, S_ENDPGM] // s_movrels_b32 s0, s1
+        let code: Vec<u8> = [0xBE80_2F01_u32, S_ENDPGM] // s_movrels_b64 s0, s1
             .iter()
             .flat_map(|w| w.to_le_bytes())
             .collect();
@@ -1256,9 +1291,45 @@ mod tests {
             build(&code, false, 256),
             Err(ShaderError::Unsupported {
                 offset: 0,
-                what: "s_movrels_b32"
+                what: "s_movrels_b64"
             })
         );
+    }
+
+    #[test]
+    fn relative_sgpr_access_spans_up_to_106() {
+        let code: Vec<u8> = [
+            0xBE82_3001_u32, // s_movreld_b32 s2, s1: s[2 + m0] = s1
+            0xBE80_2E04,     // s_movrels_b32 s0, s4: s0 = s[4 + m0]
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = build(&code, false, 256).unwrap();
+        let [movreld, movrels, _] = &p.blocks[0].insts[..] else {
+            panic!()
+        };
+        let sgprs = |regs: &[(Reg, Value)]| -> Vec<u8> {
+            regs.iter()
+                .filter_map(|r| match r.0 {
+                    Reg::S(s) if s < 106 => Some(s),
+                    _ => None,
+                })
+                .collect()
+        };
+        let s2_to_105: Vec<u8> = (2..106).collect();
+        let s4_to_105: Vec<u8> = (4..106).collect();
+        assert_eq!(sgprs(&movreld.writes), s2_to_105);
+        let mut expected_reld_reads = vec![1];
+        expected_reld_reads.extend(2..106);
+        assert_eq!(sgprs(&movreld.reads), expected_reld_reads);
+        assert!(movreld.read(Reg::S(M0)).is_some());
+
+        assert_eq!(sgprs(&movrels.writes), [0]);
+        assert_eq!(sgprs(&movrels.reads), s4_to_105);
+        assert!(movrels.read(Reg::S(M0)).is_some());
+        assert_eq!(movrels.read(Reg::S(4)), movreld.write(Reg::S(4)));
     }
 
     #[test]

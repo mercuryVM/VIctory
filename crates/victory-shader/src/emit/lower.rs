@@ -2376,6 +2376,87 @@ impl<'a> Lower<'a> {
             let op = src.get(k).ok_or("a missing operand")?;
             l.operand(inst, op)
         };
+        if name == "s_movrels_b32" {
+            let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+            let Some(&Operand::Scalar { code: sreg, .. }) = src.first() else {
+                return Err("s_movrels_b32 source operand");
+            };
+            if sreg >= 106 {
+                return Err("s_movrels_b32 base out of SGPR range");
+            }
+            let lo = lo.ok_or("s_movrels_b32 destination")?;
+            let r = if let Some(m0_val) = self.s.m.as_i32(m0) {
+                if m0_val >= 0 && (m0_val as u64) <= (105 - sreg) as u64 {
+                    let target = sreg + m0_val as u8;
+                    match inst.read(Reg::S(target)).map(|v| self.i32_of(v)) {
+                        Some(Ok(x)) => x,
+                        _ => self.s.m.i32(0),
+                    }
+                } else {
+                    self.s.m.i32(0)
+                }
+            } else {
+                let mut r = self.s.m.i32(0);
+                for k in 0..=105u8.saturating_sub(sreg) {
+                    let x = match inst.read(Reg::S(sreg + k)).map(|x| self.i32_of(x)) {
+                        Some(Ok(x)) => x,
+                        _ => self.s.m.i32(0),
+                    };
+                    let kk = self.s.m.i32(u32::from(k));
+                    let is = self.s.m.cmp(c, pred::EQ, m0, kk);
+                    r = self.s.m.select(c, is, x, r);
+                }
+                r
+            };
+            self.set(Some(lo), Val::I32(r));
+            return Ok(());
+        }
+        if name == "s_movreld_b32" {
+            let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+            let dreg = dst_code.ok_or("s_movreld_b32 destination operand")?;
+            if dreg >= 106 {
+                return Err("s_movreld_b32 base out of SGPR range");
+            }
+            let value = src32(self, 0)?;
+            if let Some(m0_val) = self.s.m.as_i32(m0) {
+                let target = if m0_val >= 0 && (m0_val as u64) <= (105 - dreg) as u64 {
+                    Some(dreg + m0_val as u8)
+                } else {
+                    None
+                };
+                for k in 0..=105u8.saturating_sub(dreg) {
+                    let reg = dreg + k;
+                    let Some(_) = inst.write(Reg::S(reg)) else {
+                        break;
+                    };
+                    let x = if Some(reg) == target {
+                        value
+                    } else {
+                        match inst.read(Reg::S(reg)).map(|o| self.i32_of(o)) {
+                            Some(Ok(o)) => o,
+                            _ => self.s.m.i32(0),
+                        }
+                    };
+                    self.write_placed(inst, Reg::S(reg), x, None);
+                }
+            } else {
+                for k in 0..=105u8.saturating_sub(dreg) {
+                    let reg = dreg + k;
+                    let Some(_) = inst.write(Reg::S(reg)) else {
+                        break;
+                    };
+                    let old = match inst.read(Reg::S(reg)).map(|o| self.i32_of(o)) {
+                        Some(Ok(o)) => o,
+                        _ => self.s.m.i32(0),
+                    };
+                    let kk = self.s.m.i32(u32::from(k));
+                    let is = self.s.m.cmp(c, pred::EQ, m0, kk);
+                    let x = self.s.m.select(c, is, value, old);
+                    self.write_placed(inst, Reg::S(reg), x, None);
+                }
+            }
+            return Ok(());
+        }
         let sext16 = |l: &mut Self| l.s.m.i32(i32::from(imm.unwrap_or(0) as i16) as u32);
         // Dword `h` of 64-bit source `k` (inline constants sign-extend).
         let half = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
@@ -7321,5 +7402,68 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    #[test]
+    fn s_movrel_lowering() {
+        // 1. s_movrels_b32 with static M0
+        let static_rels = [
+            0xBE84_03FF, // s_mov_b32 s4, 42
+            42,
+            0xBE85_03FF, // s_mov_b32 s5, 99
+            99,
+            0xBEFC_0381, // s_mov_b32 m0, 1
+            0xBE80_2E04, // s_movrels_b32 s0, s4 (reads s[4 + 1] = s5)
+            0xBE86_0300, // s_mov_b32 s6, s0
+            S_ENDPGM,
+        ];
+        lowers(&static_rels).unwrap();
+
+        // 2. s_movrels_b32 with dynamic M0
+        let dynamic_rels = [
+            0xBE84_03FF, // s_mov_b32 s4, 42
+            42,
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0x80FC_8101, // s_add_u32 m0, s1, 1
+            0xBE80_2E04, // s_movrels_b32 s0, s4 (reads s[4 + m0])
+            0xBE86_0300, // s_mov_b32 s6, s0
+            S_ENDPGM,
+        ];
+        lowers(&dynamic_rels).unwrap();
+
+        // 3. s_movreld_b32 with static M0 followed by readback
+        let static_reld = [
+            0xBE81_03FF, // s_mov_b32 s1, 77
+            77,
+            0xBEFC_0382, // s_mov_b32 m0, 2
+            0xBE84_3001, // s_movreld_b32 s4, s1 (writes s[4 + 2] = s6)
+            0xBE80_0306, // s_mov_b32 s0, s6
+            S_ENDPGM,
+        ];
+        lowers(&static_reld).unwrap();
+
+        // 4. s_movreld_b32 with dynamic M0 followed by readback
+        let dynamic_reld = [
+            0xBE81_03FF, // s_mov_b32 s1, 88
+            88,
+            0xBE82_0382, // s_mov_b32 s2, 2
+            0x80FC_8002, // s_add_u32 m0, s2, 0
+            0xBE84_3001, // s_movreld_b32 s4, s1 (writes s[4 + m0])
+            0xBE80_0306, // s_mov_b32 s0, s6
+            S_ENDPGM,
+        ];
+        lowers(&dynamic_reld).unwrap();
+
+        // 5. Out-of-bounds M0 offsets (static & dynamic) clamp cleanly to 0 / no-op
+        let oob_rels = [
+            0xBE84_03FF, // s_mov_b32 s4, 42
+            42,
+            0xBEFC_03FF, // s_mov_b32 m0, 200 (out of SGPR bounds)
+            200,
+            0xBE80_2E04, // s_movrels_b32 s0, s4 (clamped to 0)
+            0xBE86_0300, // s_mov_b32 s6, s0
+            S_ENDPGM,
+        ];
+        lowers(&oob_rels).unwrap();
     }
 }
