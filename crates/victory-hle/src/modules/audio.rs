@@ -397,6 +397,7 @@ impl Context {
         self.word(word).load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     fn set(self, word: usize, value: u32) {
         self.word(word).store(value, Ordering::Release);
     }
