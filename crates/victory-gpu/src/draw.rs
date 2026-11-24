@@ -77,6 +77,9 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Fresh tables of the frame's lists this list holds a share of
+    /// ([`SHARED_TABLES`]).
+    shared: Vec<SharedTable>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
@@ -99,8 +102,85 @@ impl Drop for State {
                 _ => crate::descriptor::release_dynamic(heap, first, n),
             }
         }
+        for key in self.shared.drain(..) {
+            unshare(key);
+        }
     }
 }
+
+/// A fresh table shared by the lists of one frame: title heap, table
+/// address, what its entries hold (record words), slots, frame.
+type SharedTable = (usize, u64, u64, u32, u64);
+
+/// Fresh tables made in dynamic slots by the lists of a frame: one copy
+/// per table and contents, the first slot and the lists holding it. A
+/// table past a capped host heap (NVIDIA: the title's view heap is larger
+/// than the 1,000,000 views the host takes) needs a fresh copy for every
+/// draw that binds it; made once per list, the copies of all lists in
+/// flight ran out of dynamic slots and draws were dropped. The words name
+/// the view's entry and generation, so the same words are the same views;
+/// a copy is not shared past its frame, so host copies of title memory
+/// made since are not missed.
+static SHARED_TABLES: std::sync::Mutex<Option<std::collections::HashMap<SharedTable, (u32, u32)>>> =
+    std::sync::Mutex::new(None);
+
+/// Takes a share of the fresh table `key` if a list made it: its first slot.
+fn share(key: SharedTable) -> Option<u32> {
+    let mut tables = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    let (first, holders) = tables.as_mut()?.get_mut(&key)?;
+    *holders += 1;
+    Some(*first)
+}
+
+/// Lists the fresh table `key` this list made at `first` (holding one
+/// share); if another list made it meanwhile, its copy, and `first` is to
+/// be given back.
+fn publish(key: SharedTable, first: u32) -> Option<u32> {
+    let mut tables = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = tables
+        .get_or_insert_with(std::collections::HashMap::new)
+        .entry(key)
+        .or_insert((first, 0));
+    entry.1 += 1;
+    (entry.0 != first).then_some(entry.0)
+}
+
+/// Gives back a share of the fresh table `key`; the last gives back its
+/// slots.
+fn unshare(key: SharedTable) {
+    let freed = {
+        let mut tables = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(tables) = tables.as_mut() else {
+            return;
+        };
+        let Some((first, holders)) = tables.get_mut(&key) else {
+            return;
+        };
+        *holders -= 1;
+        if *holders > 0 {
+            return;
+        }
+        let first = *first;
+        tables.remove(&key);
+        first
+    };
+    let (heap, .., n, _) = key;
+    crate::descriptor::release_dynamic(heap, freed, n);
+}
+
+/// Dynamic slots taken for fresh tables, fresh tables shared from another
+/// list, and draws and dispatches dropped for want of dynamic slots, since
+/// the last call.
+pub(crate) fn take_fresh_tables() -> (u64, u64, u64) {
+    (
+        FRESH_SLOTS.swap(0, Ordering::Relaxed),
+        FRESH_SHARED.swap(0, Ordering::Relaxed),
+        TABLE_DROPS.swap(0, Ordering::Relaxed),
+    )
+}
+static FRESH_SLOTS: AtomicU64 = AtomicU64::new(0);
+static FRESH_SHARED: AtomicU64 = AtomicU64::new(0);
+static TABLE_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// The key of our own view heap (`crate::memory::heap`) among the title's.
 const MEMORY_HEAP: usize = crate::memory::OURS;
@@ -153,8 +233,33 @@ fn dropped(list: &HostList, pipeline: usize, kind: &str) {
         crate::pipeline::note_why(format!("{kind}: {why}"));
     }
     list.note_op(|| format!("DROPPED {kind} ({why}) {}", crate::pipeline::shaders_of(pipeline as This)));
+    // In the frames `VICTORY_CAPTURE_FRAMES` or `VICTORY_CAPTURE_WORLD`
+    // list: each draw dropped, to tell which passes lose theirs.
+    if crate::capture::listed(crate::queue::presented() + 1) {
+        tracing::debug!(
+            kind,
+            why = if why.is_empty() { "no host pipeline" } else { why },
+            shaders = %crate::pipeline::shaders_of(pipeline as This),
+            "dropped in a listed frame"
+        );
+    }
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
+    }
+}
+
+/// In the frames `VICTORY_CAPTURE_FRAMES` or `VICTORY_CAPTURE_WORLD` list:
+/// an indirect execution dropped, at debug level (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn listed_drop(what: &str, kind: u32, why: &str, pipeline: This) {
+    if crate::capture::listed(crate::queue::presented() + 1) {
+        tracing::debug!(
+            what,
+            kind,
+            why,
+            shaders = %crate::pipeline::shaders_of(pipeline),
+            "dropped in a listed frame"
+        );
     }
 }
 
@@ -577,6 +682,7 @@ impl State {
             }
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
+                TABLE_DROPS.fetch_add(1, Ordering::Relaxed);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
                     tracing::warn!(
@@ -1118,6 +1224,23 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            let heap_key = std::ptr::from_ref(heap) as usize;
+            let shared_key = (heap_key, key.0, key.1, n, crate::frame::current());
+            if let Some(first) = share(shared_key) {
+                // Made by another list of this frame: its buffers are
+                // brought up to date for this one too.
+                FRESH_SHARED.fetch_add(1, Ordering::Relaxed);
+                self.shared.push(shared_key);
+                self.fresh_tables.insert(key, first);
+                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                    let handle = table + u64::from(u.table_offset_dwords) * 4;
+                    if let Some(view) = crate::descriptor::view(handle) {
+                        readable(list, u, &view);
+                    }
+                }
+                made.push((slot, first * 32));
+                continue;
+            }
             let Some(first) = host.dynamic(n) else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
@@ -1127,9 +1250,8 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            FRESH_SLOTS.fetch_add(u64::from(n), Ordering::Relaxed);
+            self.shared.push(shared_key);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1150,6 +1272,16 @@ impl State {
                     }
                 }
             }
+            // Listed once made, so a list sharing it finds its views written;
+            // if another list listed the same copy meanwhile, that one.
+            let first = match publish(shared_key, first) {
+                Some(theirs) => {
+                    crate::descriptor::release_dynamic(heap_key, first, n);
+                    theirs
+                }
+                None => first,
+            };
+            self.fresh_tables.insert(key, first);
             made.push((slot, first * 32));
         }
         made
@@ -1511,6 +1643,7 @@ impl State {
         let pipeline = self.pipeline as This;
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| {
+            listed_drop("indirect", kind, what, pipeline);
             crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
             list.note_op(|| format!("DROPPED indirect kind {kind} max {max} ({what}) {}", crate::pipeline::shaders_of(pipeline)));
         };
@@ -1568,6 +1701,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
+                    listed_drop("indirect", kind, "no host pipeline", pipeline);
                     crate::pipeline::note_drop(self.pipeline as This);
                     list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
                 }
@@ -2442,5 +2576,43 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+}
+
+#[cfg(test)]
+mod shared_table_tests {
+    use super::*;
+
+    /// A fresh table one list made is shared by others of its frame until
+    /// the last gives it back; a copy made meanwhile by another list gives
+    /// way to the one listed first.
+    #[test]
+    fn fresh_tables_are_shared_until_the_last_list_gives_them_back() {
+        // A heap key no title heap has: giving slots back does nothing.
+        let key: SharedTable = (1, 0x1000, 0xABCD, 4, u64::MAX - 1);
+        assert_eq!(share(key), None);
+        assert_eq!(publish(key, 40), None);
+        assert_eq!(share(key), Some(40));
+        // Another list's own copy, listed later: the first one is used.
+        assert_eq!(publish(key, 80), Some(40));
+        let holders = |k| {
+            SHARED_TABLES
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|t| t.get(&k).map(|e| e.1))
+        };
+        assert_eq!(holders(key), Some(3));
+        unshare(key);
+        unshare(key);
+        assert_eq!(holders(key), Some(1));
+        unshare(key);
+        assert_eq!(holders(key), None);
+        assert_eq!(share(key), None);
+        // Another frame's copy of the same table is another one.
+        let next = (1, 0x1000, 0xABCD, 4, u64::MAX);
+        assert_eq!(publish(next, 8), None);
+        assert_eq!(share(key), None);
+        unshare(next);
     }
 }
