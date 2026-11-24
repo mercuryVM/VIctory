@@ -2590,6 +2590,13 @@ impl Meter {
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
+        let (fresh, shared, table_drops) = crate::draw::take_fresh_tables();
+        let (fresh, shared, table_drops) = (
+            fresh as f64 / frames,
+            shared as f64 / frames,
+            table_drops as f64 / frames,
+        );
+        let (dynamic_peak, dynamic_total) = crate::descriptor::host::take_dynamic_peak();
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -2600,7 +2607,7 @@ impl Meter {
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
+                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame; fresh tables                  {fresh:.0} slots/frame ({shared:.0} shared), dynamic slots peak {dynamic_peak}                  of {dynamic_total}, {table_drops:.1} dropped/frame for want of them",
                 making = crate::pipeline::making()
             );
             if let Some(host) = host() {
