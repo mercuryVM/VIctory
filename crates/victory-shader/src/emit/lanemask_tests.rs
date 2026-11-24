@@ -72,7 +72,7 @@ const MASK: u32 = 0x5555 | 0xFF00_0000;
 
 /// Lowers a wave32 compute program of 32 threads with a table holding one
 /// raw UAV at s0.
-fn lower_cs(words: &[u32]) -> Result<HostShader, ShaderError> {
+pub(super) fn lower_cs(words: &[u32]) -> Result<HostShader, ShaderError> {
     lower_cs_on(words, false)
 }
 
