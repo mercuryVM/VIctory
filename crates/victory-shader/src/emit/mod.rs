@@ -95,6 +95,8 @@ pub mod host;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 mod lower;
+#[cfg(test)]
+mod mtbuf_tests;
 mod sampler;
 mod shader;
 #[cfg(all(test, windows))]
