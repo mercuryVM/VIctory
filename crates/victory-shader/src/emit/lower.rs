@@ -725,10 +725,12 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            // Swizzles and DPP read lanes of the same 32 (rows of 16, groups
-            // of 8, 32 or 4): the rest may read the other half of a wave64.
+            // Swizzles, DPP and v_permlane(x)16 read lanes of the same 32
+            // (rows of 16, groups of 8, 32 or 4): the rest may read the other
+            // half of a wave64.
             let in_half = |i: &Inst| {
                 i.name().starts_with("ds_swizzle")
+                    || i.name().starts_with("v_permlane")
                     || i.name() == "ds_bpermute_b32"
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
@@ -2594,6 +2596,13 @@ impl<'a> Lower<'a> {
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
+                // Dwords an `s_mov` of a constant wrote are that number.
+                let hi_k = self.pair_high(v).map(|h| self.constant_mask(h));
+                if let (Some(lo), None | Some(Some(_))) = (self.constant_mask(v), hi_k) {
+                    let lo = self.s.m.i32(lo);
+                    let hi = hi_k.flatten().map(|k| self.s.m.i32(k));
+                    return Ok(self.lane_bit(at, lo, hi));
+                }
                 // The number may itself be known only as this mask's dword
                 // (a mask copied dword by dword): no number to test then.
                 if !self.opaque_open.insert(v) {
@@ -2601,7 +2610,10 @@ impl<'a> Lower<'a> {
                 }
                 let words = (|| {
                     let hi = match self.pair_high(v) {
-                        Some(h) => Some(self.get(h)?),
+                        Some(h) => Some(match self.entry_exec(h) {
+                            Some(x) => Val::I32(x),
+                            None => self.get(h)?,
+                        }),
                         None => None,
                     };
                     Ok((self.get(v)?, hi))
@@ -2679,6 +2691,31 @@ impl<'a> Lower<'a> {
 
     /// The value of the high dword of the wave64 register pair whose low
     /// dword holds `lo` (none in wave32).
+    /// A dword of EXEC as the program starts with it, as a number: the
+    /// ballot of the lanes that start, in the entry block. (Not a mask
+    /// read through its own bits: a constant EXEC half beside it would make
+    /// the pair's bits ask for this dword again.)
+    fn entry_exec(&mut self, v: Value) -> Option<V> {
+        let &(reg, _) = self.x.p.inputs.iter().find(|i| i.1 == v)?;
+        let high = match reg {
+            Reg::S(EXEC) => false,
+            Reg::S(c) if c == EXEC + 1 => true,
+            _ => return None,
+        };
+        if self.split || self.console_cf {
+            return None;
+        }
+        let e = self.s.entry;
+        let on = self.s.m.bool(true);
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(e, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+        self.s.flags |= flags::WAVE_OPS;
+        Some(self.s.m.extract(e, r, u32::from(high)))
+    }
+
     fn pair_high(&self, lo: Value) -> Option<Value> {
         if !self.x.native.wave64 {
             return None;
