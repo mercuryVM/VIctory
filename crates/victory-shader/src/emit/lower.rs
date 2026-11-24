@@ -243,6 +243,8 @@ struct Lower<'a> {
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
     cur_ir: usize,
+    /// The instruction of `cur_ir` being lowered.
+    cur_inst: usize,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
@@ -792,6 +794,7 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
+            cur_inst: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
@@ -1550,13 +1553,31 @@ impl<'a> Lower<'a> {
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
+        // A mask an `s_mov` of a constant wrote holds that number, whatever
+        // the lanes do with it.
+        if let Some(k) = self.constant_mask(v) {
+            return Ok(self.s.m.i32(k));
+        }
         let (lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
         if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
+            // The mask may hold lanes that do not run where it is written (a
+            // loop's lanes that already left it, say), so a ballot there
+            // misses them. Where every lane that may hold a bit is in EXEC
+            // at this instruction, all of them run here, and each lane's bit
+            // is its formula's: a ballot here, at the use, is the mask. Not
+            // kept: it belongs to this block.
+            let here = self
+                .exec_at(self.cur_ir, self.cur_inst)
+                .is_some_and(|e| !self.x.st.bools.meet(&[(m, true), (e, false)]));
+            if !here {
+                return Err("a lane mask holding lanes elsewhere read as data");
+            }
+            let (x, y) = self.ballot(lo, m, self.cur)?;
+            return Ok(if high { y } else { x });
         }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
@@ -1567,24 +1588,103 @@ impl<'a> Lower<'a> {
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
-                if !self.balloting.insert(lo) {
-                    return Err("a lane mask whose lanes depend on its own value");
-                }
-                let bit = self.boolean(m, at);
-                self.balloting.remove(&lo);
-                let bit = bit?;
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let xy = self.ballot(lo, m, at)?;
                 self.ballots.insert(lo, xy);
                 xy
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// The dword `v` holds when an `s_mov_b32` of an inline constant or a
+    /// literal, or an `s_mov_b64` of an integer inline constant (sign
+    /// extended), wrote it.
+    fn constant_mask(&self, v: Value) -> Option<u32> {
+        let &b = self.def_block.get(&v)?;
+        let inst = self.x.p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let (reg, _) = *inst.writes.iter().find(|w| w.1 == v)?;
+        match (inst.name(), src.first()?) {
+            ("s_mov_b32", &Operand::Const(c)) => crate::resource::inline(c),
+            ("s_mov_b32", &Operand::Literal(x)) => Some(x),
+            ("s_mov_b64", &Operand::Const(c @ 128..=208)) => {
+                let k = crate::resource::inline(c)?;
+                // The register pair's first dword is the low one.
+                let low = inst.writes.iter().map(|w| w.0).min()?;
+                Some(if reg == low {
+                    k
+                } else if (k as i32) < 0 {
+                    u32::MAX
+                } else {
+                    0
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The ballot of mask `lo`'s lane bits (`m`) in DXIL block `at`: its low
+    /// and high dwords.
+    fn ballot(&mut self, lo: Value, m: Bool, at: usize) -> Result<(V, V), Why> {
+        if !self.balloting.insert(lo) {
+            return Err("a lane mask whose lanes depend on its own value");
+        }
+        let bit = self.boolean(m, at);
+        self.balloting.remove(&lo);
+        let bit = bit?;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        Ok((self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1)))
+    }
+
+    /// The lanes in EXEC at instruction `i` of IR block `b`, as a lane
+    /// formula, where known: the last EXEC the block writes or reads before
+    /// it, else the one an instruction from `i` on reads before any write,
+    /// else the block's EXEC phi (or EXEC on entry).
+    fn exec_at(&self, b: usize, i: usize) -> Option<Bool> {
+        let block = &self.x.p.blocks[b];
+        let exec = Reg::S(EXEC);
+        let mut v = None;
+        for inst in block.insts[..i].iter().rev() {
+            if let Some(w) = inst.write(exec).or_else(|| inst.read(exec)) {
+                v = Some(w);
+                break;
+            }
+        }
+        if v.is_none() {
+            for inst in &block.insts[i..] {
+                if let Some(r) = inst.read(exec) {
+                    v = Some(r);
+                    break;
+                }
+                if inst.write(exec).is_some() {
+                    break;
+                }
+            }
+        }
+        let v = v
+            .or_else(|| {
+                block
+                    .phis
+                    .iter()
+                    .find(|ph| ph.reg == exec)
+                    .map(|ph| ph.value)
+            })
+            .or_else(|| {
+                (b == 0)
+                    .then(|| self.x.p.inputs.iter().find(|x| x.0 == exec).map(|x| x.1))
+                    .flatten()
+            })?;
+        self.x.st.masks.get(&v).copied()
     }
 
     // ---- operands ----
@@ -2735,6 +2835,7 @@ impl<'a> Lower<'a> {
     // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
+        self.cur_inst = i;
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
