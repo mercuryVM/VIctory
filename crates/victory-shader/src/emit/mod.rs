@@ -451,6 +451,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             stride_table: false,
+            root_uavs: Vec::new(),
         };
         assert_eq!(shader.directly_indexed_heaps(), (false, false));
         for (features, expected) in [
@@ -1131,6 +1132,7 @@ mod tests {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             stride_table: l.stride_table,
+            root_uavs: l.root_uavs,
         }
     }
 
