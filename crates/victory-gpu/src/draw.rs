@@ -946,6 +946,19 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // A shader emitted as one console wave per host group runs that
+        // many host groups per console group, along x.
+        let waves = group_waves(p);
+        let Some(x) = x.checked_mul(waves).filter(|&x| x <= 65535 || waves == 1) else {
+            once!(
+                pipeline = format_args!("{:#x}", self.pipeline),
+                "a dispatch of more host groups than D3D12 runs in a dimension dropped"
+            );
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            return;
+        };
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1681,7 +1694,10 @@ impl State {
             }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
+                // shortcut: a shader emitted as one console wave per host
+                // group needs the records' x multiplied on the GPU; until
+                // the clamp does that, its indirect dispatches are dropped.
+                Some(p) if p.compute && group_waves(p) == 1 => self.bind(list, p, true),
                 _ => false,
             },
             _ => false,
@@ -1798,6 +1814,14 @@ fn fold_signature(root: &ID3D12RootSignature, param: u32) -> Option<ID3D12Comman
     let signature = signature?;
     made.push((root.clone(), param, signature.clone()));
     Some(signature)
+}
+
+/// Host thread groups per console thread group of a compute pipeline
+/// (`HostShader::group_waves`).
+fn group_waves(p: &HostPipeline) -> u32 {
+    p.stages
+        .first()
+        .map_or(1, |s| s.translated().host.group_waves.max(1))
 }
 
 /// The host command signature for one argument of `kind` with records

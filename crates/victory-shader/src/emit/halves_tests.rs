@@ -232,6 +232,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        group_waves: lowered.group_waves,
     };
     if let Ok(mut val) = validator::Validator::load(validator::Validator::default_path().as_deref())
     {
