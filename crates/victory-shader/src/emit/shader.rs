@@ -20,6 +20,7 @@ pub(crate) mod flags {
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const BARYCENTRICS: u64 = 1 << 22;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
     pub const FEATURE_RESOURCE_HEAP: u64 = 0x0200_0000;
@@ -565,6 +566,9 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x20000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= flags::FEATURE_RESOURCE_HEAP;

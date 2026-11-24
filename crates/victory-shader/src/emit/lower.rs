@@ -58,10 +58,29 @@ enum Stop {
     Fail(ShaderError),
 }
 
+const DIRECT_CENTER: Why = "a direct perspective-center barycentric input";
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let mut direct_center = false;
     loop {
-        match Lower::new(parts, &bad).run() {
+        let mut lower = Lower::new(parts, &bad);
+        if direct_center {
+            lower.s.flags |= flags::BARYCENTRICS;
+            lower.s.inputs.push(SigElement {
+                name: "SV_Barycentrics".into(),
+                index: 0,
+                kind: 28,
+                comp: 9,
+                interp: 2,
+                row: None,
+                col: 0,
+                cols: 3,
+                usage: 0,
+                half: false,
+            });
+        }
+        match lower.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -70,6 +89,15 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
                         what: "a phi that does not settle",
                     });
                 }
+            }
+            // Native interpolation uses the same input registers. Only require
+            // the optional system value if a direct read reaches a live effect.
+            Err(Stop::Fail(ShaderError::Unsupported {
+                what: DIRECT_CENTER,
+                ..
+            })) if !direct_center => {
+                direct_center = true;
+                bad.clear();
             }
             Err(Stop::Fail(e)) => return Err(e),
         }
@@ -1066,6 +1094,22 @@ impl<'a> Lower<'a> {
                     Some((id, col)) => self.load_input(id, col),
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
+            }
+            Input::Barycentric {
+                kind: Barycentric::PerspectiveCenter,
+                index: index @ 0..=1,
+            } if cfg!(feature = "experimental-barycentrics") => {
+                let Some(id) = self
+                    .s
+                    .inputs
+                    .iter()
+                    .position(|e| e.kind == 28 && e.interp == 2)
+                else {
+                    return Val::Missing(DIRECT_CENTER);
+                };
+                // Choose D3D's vertex order for P0 + I*(P1-P0) + J*(P2-P0).
+                // The raw native I/J registers can have a rotated vertex order.
+                return self.load_any_input(id, index + 1);
             }
             Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
@@ -7239,7 +7283,7 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, lower};
+    use super::{Lowered, Numeric, Parts, SigElement, buffer_format, lower};
     use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
     use crate::{io, ir, resource, structure};
 
@@ -7265,22 +7309,96 @@ mod tests {
             }),
             code,
         };
-        let p = ir::build(&native.code, false, 256).unwrap();
+        lower_program(&native, vec![]).map(|_| ())
+    }
+
+    fn lower_program(
+        native: &NativeProgram,
+        outputs: Vec<SigElement>,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
         let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
+        let io = io::raise(&p, native).unwrap();
         let st = structure::structure(&p).unwrap();
         lower(&Parts {
-            native: &native,
+            native,
             p: &p,
             st: &st,
             io: &io,
             res: &res,
             inputs: vec![],
-            outputs: vec![],
+            outputs,
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+    }
+
+    #[test]
+    fn direct_pixel_barycentrics_require_a_live_perspective_center_read() {
+        use crate::{Container, FourCC, ShaderError, dxbc};
+        let rgba = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let shader = |input_addr, export| {
+            let words = [
+                0x7E04_0300, // v_mov_b32 v2, v0 (I)
+                0x7E06_0301, // v_mov_b32 v3, v1 (J)
+                0x7E08_0280, // v_mov_b32 v4, 0
+                0x7E0A_02F2, // v_mov_b32 v5, 1.0
+                0xF800_180F, // exp mrt0, done vm
+                export,
+                S_ENDPGM,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 6,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            lower_program(&native, vec![rgba.clone()]).map(|l| l.dxil)
+        };
+        let direct = 0x0504_0302; // v2, v3, v4, v5
+        let constants = 0x0504_0504; // v4, v5, v4, v5
+        let center = 1 << 1;
+        let needs_barycentrics = |bytes: &[u8]| {
+            let c = Container::parse(bytes).unwrap();
+            dxbc::u64_at(c.part(FourCC::SFI0).unwrap().data, 0).unwrap() & 0x20000 != 0
+        };
+        assert!(!needs_barycentrics(&shader(center, constants).unwrap()));
+        let refused = Err(ShaderError::Unsupported {
+            offset: 16,
+            what: "barycentrics read directly",
+        });
+        assert_eq!(shader(1 << 5, direct), refused); // linear center
+        if cfg!(feature = "experimental-barycentrics") {
+            let bytes = shader(center, direct).unwrap();
+            assert!(needs_barycentrics(&bytes));
+            let c = Container::parse(&bytes).unwrap();
+            let sig = c.part(FourCC::ISG1).unwrap().data;
+            assert_eq!(dxbc::u32_at(sig, 0).unwrap(), 1);
+            assert_eq!(dxbc::u32_at(sig, 20).unwrap(), 23); // D3D_NAME_BARYCENTRICS
+            assert_eq!(dxbc::u32_at(sig, 28).unwrap(), u32::MAX); // unpacked
+            assert_eq!(&sig[32..34], &[0b111, 0b110]); // xyz, reads yz
+        } else {
+            assert_eq!(shader(center, direct), refused);
+        }
     }
 
     /// Lowers a compute program of constants that allocates 512 bytes of LDS
