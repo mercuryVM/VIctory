@@ -555,12 +555,12 @@ impl State {
             for u in &t.host.user_data {
                 let v = self.user_value(compute, u.slot, u.root, u.dword);
                 let table = u.root == RootType::Table;
-                let (kind, index) = if table {
+                let (root, index) = if table {
                     ("table", v / 32)
                 } else {
                     ("const", v)
                 };
-                let _ = write!(text, " u{}={v:#x} {kind}", u.index);
+                let _ = write!(text, " u{}={v:#x} {root}", u.index);
                 if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
                     let at = if table { "heap" } else { "as heap index" };
                     let _ = write!(text, " [{at} {index}: {slot}]");
