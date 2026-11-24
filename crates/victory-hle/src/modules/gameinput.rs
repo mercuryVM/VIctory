@@ -646,6 +646,11 @@ fn relative(
         return fail(out, E_INVALIDARG);
     }
     let state = hub.state();
+    // As for the current reading: a device filter for a device that is gone
+    // fails, so a title polling it stops instead of waiting for readings.
+    if !device.is_null() && !state.slots[index].connected {
+        return fail(out, DEVICE_DISCONNECTED);
+    }
     let history = &state.slots[index].history;
     if history
         .front()
@@ -1400,6 +1405,26 @@ mod tests {
 
     fn release(reading: *const Reading) {
         slot::<extern "system" fn(*const Reading) -> u32, _>(reading, 0x10)(reading);
+    }
+
+    /// With the device as filter, walking from its readings fails once it is
+    /// disconnected (`GAMEINPUT_E_READING_NOT_FOUND` would have the title
+    /// keep polling it).
+    #[test]
+    fn walks_filtered_by_a_disconnected_pad_fail() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[1] = Some(PadState::default());
+        hub.poll();
+        let first = current(hub, GAMEPAD_KIND, 1).unwrap();
+        host.lock().unwrap().pads[1].as_mut().unwrap().buttons = A;
+        hub.poll();
+        let second = current(hub, GAMEPAD_KIND, 1).unwrap();
+        host.lock().unwrap().pads[1] = None;
+        hub.poll();
+        assert_eq!(walk(hub, 0x28, second), Err(DEVICE_DISCONNECTED));
+        assert_eq!(walk(hub, 0x30, second), Err(DEVICE_DISCONNECTED));
+        release(first);
+        release(second);
     }
 
     #[test]
