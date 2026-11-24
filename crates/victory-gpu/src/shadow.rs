@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -42,7 +42,44 @@ pub(crate) struct Shadow {
     pending: Mutex<Vec<(usize, usize)>>,
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
+    /// Kept after the submission as a mirror of the copy (see
+    /// [`mirror_bytes`]) when `mirrored`.
     before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// Whether `before` outlives submissions: every CPU write to the copy
+    /// inside it then also goes into it, and copy-back leaves it equal to
+    /// the copy, so it always holds the copy's bytes when no submission
+    /// runs, and the next submission declaring those ranges needs no
+    /// snapshot. Counted in [`MIRRORED`].
+    mirrored: AtomicBool,
+}
+
+/// Snapshot memory kept as mirrors between submissions, at most: in the
+/// world, shaders write the GPU heap's copy (~180 MB) in most submissions,
+/// and snapshotting it each time cost ~15 ms per submission, ~300 ms per
+/// frame. `VICTORY_MIRROR_MB` sets it (0: a snapshot per submission).
+fn mirror_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_MIRROR_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(512 << 20, |mb| mb << 20)
+    })
+}
+
+/// Snapshot memory kept as mirrors now.
+static MIRRORED: AtomicUsize = AtomicUsize::new(0);
+
+impl Drop for Shadow {
+    fn drop(&mut self) {
+        let before = self.before.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, bytes)) = before.take() {
+            if *self.mirrored.get_mut() {
+                MIRRORED.fetch_sub(bytes.capacity(), Ordering::Relaxed);
+            }
+            give_back(bytes);
+        }
+    }
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -130,6 +167,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            mirrored: AtomicBool::new(false),
         }
     }
 
@@ -181,9 +219,11 @@ impl Shadow {
         // Parts newly covered from the copy, the rest as it was taken.
         // The old buffer is grown in place: allocating a second one while it
         // still holds the world's 174 MB heap doubles the peak on every growth.
+        #[cfg(feature = "diagnostics")]
+        let had = before.as_ref().map_or(0, |(_, b)| b.len());
         let grown = match before.take() {
             Some((at, mut bytes)) => {
-                let old_end = at + bytes.len();
+                let (old_end, capacity) = (at + bytes.len(), bytes.capacity());
                 // Exactly the growth: the amortized doubling of a Vec this
                 // big would double its capacity, and a copying realloc its peak.
                 bytes.reserve_exact(end - start - bytes.len());
@@ -193,6 +233,9 @@ impl Shadow {
                 if end > old_end {
                     bytes.extend_from_slice(host(old_end.max(at), end));
                 }
+                if self.mirrored.load(Ordering::Relaxed) {
+                    MIRRORED.fetch_add(bytes.capacity() - capacity, Ordering::Relaxed);
+                }
                 bytes
             }
             None => {
@@ -201,6 +244,11 @@ impl Shadow {
                 grown
             }
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::SnapshotBytes,
+            (grown.len() - had) as u64,
+        );
         *before = Some((start, grown));
     }
 
@@ -216,12 +264,19 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
+        let covered = snapshot
+            .as_ref()
+            .is_some_and(|(taken, before)| *taken <= from && to <= taken + before.len());
+        if !covered && from < to {
+            // Never so (each declared range grows the snapshot), but then a
+            // mirror would no longer match the copy.
+            self.forget_mirror(&mut snapshot);
+        }
+        if let Some((taken, before)) = &mut *snapshot
+            && covered
             && from < to
         {
-            let before = &before[from - taken..to - taken];
+            let before = &mut before[from - *taken..to - *taken];
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
@@ -233,25 +288,21 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = &mut before[at - from..at - from + n];
                 let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
+                if host != old {
+                    if crate::host::read_into((start + at) as *const u8, title) {
+                        if merge(host, old, title) {
+                            crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                            written += n;
                         }
-                        *h = *t;
+                        synced.push((start + at) / PAGE);
+                    } else {
+                        // Unmapped title memory: the GPU's bytes stay in the
+                        // copy, as they did; the mirror follows the copy.
+                        old.copy_from_slice(host);
                     }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
@@ -276,11 +327,31 @@ impl Shadow {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
+            && let Some((_, bytes)) = &*snapshot
+            && !self.mirrored.load(Ordering::Relaxed)
         {
-            give_back(bytes);
+            // Kept as the copy's mirror while they all fit.
+            let n = bytes.capacity();
+            let kept = MIRRORED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+                (m + n <= mirror_bytes()).then_some(m + n)
+            });
+            if kept.is_ok() {
+                self.mirrored.store(true, Ordering::Relaxed);
+            } else if let Some((_, bytes)) = snapshot.take() {
+                give_back(bytes);
+            }
         }
         written
+    }
+
+    /// Drops the snapshot, mirror or not.
+    fn forget_mirror(&self, snapshot: &mut Option<(usize, Vec<u8>)>) {
+        if let Some((_, bytes)) = snapshot.take() {
+            if self.mirrored.swap(false, Ordering::Relaxed) {
+                MIRRORED.fetch_sub(bytes.capacity(), Ordering::Relaxed);
+            }
+            give_back(bytes);
+        }
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -385,8 +456,39 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        // The snapshot (a mirror, or this submission's) follows the copy
+        // outside the ranges shaders write (refreshes leave those alone):
+        // a range declared later in the submission inside it is then
+        // compared with what the copy holds, not with older bytes.
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((taken, bytes)) = &mut *before {
+            let (a, b) = ((from - start).max(*taken), (to - start).min(*taken + bytes.len()));
+            if a < b {
+                // SAFETY: inside the mapping, just written.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+                bytes[a - *taken..b - *taken].copy_from_slice(host);
+            }
+        }
         to - from
     }
+}
+
+/// One piece of copy-back: `host` is the copy after the submission, `old`
+/// its bytes before, `title` title memory now. The bytes the GPU wrote (the
+/// copy's that differ from before) go into `title`, unless the title holds
+/// them already; then the copy and `old` take title memory's bytes. True if
+/// `title` changed (it is to be written back).
+fn merge(host: &mut [u8], old: &mut [u8], title: &mut [u8]) -> bool {
+    let mut changed = false;
+    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old.iter_mut()) {
+        if *h != *o && *t != *h {
+            *t = *h;
+            changed = true;
+        }
+        *h = *t;
+        *o = *t;
+    }
+    changed
 }
 
 struct Entry {
@@ -595,6 +697,153 @@ mod tests {
         map
     }
 
+    /// A copy of fresh write-watched title memory (`pages` 64 KiB pages),
+    /// or none without a host GPU. Not freed: the journal keeps its pages.
+    fn title_copy(pages: usize) -> Option<(usize, Arc<Shadow>)> {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let len = pages * PAGE;
+        // SAFETY: a fresh allocation of ours.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(title, 0);
+        let (buffer, data) = host()?.shared_buffer(len as u64)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some((title, Arc::new(Shadow::new(buffer, data, gpu, title as u64, len as u64))))
+    }
+
+    fn poke(at: usize, value: u8) {
+        // SAFETY: committed title memory of a test.
+        unsafe { (at as *mut u8).write_volatile(value) }
+    }
+
+    fn peek(at: usize) -> u8 {
+        // SAFETY: committed memory of a test.
+        unsafe { (at as *const u8).read_volatile() }
+    }
+
+    impl Shadow {
+        /// What a shader does: writes the copy.
+        fn gpu_poke(&self, offset: usize, value: u8) {
+            // SAFETY: inside the mapping.
+            unsafe { self.data.add(offset).write_volatile(value) }
+        }
+
+        fn host_byte(&self, offset: usize) -> u8 {
+            peek(self.data as usize + offset)
+        }
+
+        /// One submission whose shaders write `ranges` (offsets), refreshed
+        /// and declared as the batch does, `gpu` run in between, copied back.
+        fn submit(&self, ranges: &[(usize, usize)], gpu: impl FnOnce()) {
+            let start = self.start as usize;
+            for &(a, b) in ranges {
+                self.update(start + a, b - a);
+                self.writing(start + a, b - a);
+            }
+            gpu();
+            for &(a, b) in ranges {
+                self.copy_back(start + a, b - a);
+            }
+        }
+    }
+
+    /// What shaders wrote reaches title memory, and the title's own writes
+    /// while the GPU ran are kept, also next to the GPU's in a piece; the
+    /// snapshot stays as the copy's mirror and serves the next submission.
+    #[test]
+    fn gpu_writes_reach_the_title_and_title_writes_stay() {
+        let Some((title, copy)) = title_copy(4) else { return };
+        poke(title + 5, 7);
+        copy.submit(&[(0, 4 * PAGE)], || {
+            copy.gpu_poke(10, 0xaa);
+            poke(title + 11, 0x55); // the title, while the GPU runs
+            poke(title + 3 * PAGE, 0x66);
+        });
+        assert_eq!((peek(title + 5), peek(title + 10), peek(title + 11)), (7, 0xaa, 0x55));
+        assert_eq!(peek(title + 3 * PAGE), 0x66);
+        assert_eq!((copy.host_byte(10), copy.host_byte(11)), (0xaa, 0x55));
+        assert!(copy.mirrored.load(Ordering::Relaxed), "kept as the mirror");
+        copy.submit(&[(0, 4 * PAGE)], || copy.gpu_poke(2 * PAGE, 0xbb));
+        assert_eq!(
+            (peek(title + 2 * PAGE), peek(title + 10), peek(title + 11)),
+            (0xbb, 0xaa, 0x55)
+        );
+        assert_eq!(copy.host_byte(3 * PAGE), 0x66, "refreshed");
+    }
+
+    /// The title writes a byte, a refresh copies it, the title writes it
+    /// again while the GPU runs (which does not write it): its last write
+    /// stays. A mirror missing the refresh would take the copy's byte for
+    /// the GPU's and put it back over the title's.
+    #[test]
+    fn a_mirror_follows_refreshes() {
+        let Some((title, copy)) = title_copy(2) else { return };
+        copy.submit(&[(0, 2 * PAGE)], || {});
+        assert!(copy.mirrored.load(Ordering::Relaxed));
+        poke(title + 200, 0x11);
+        copy.submit(&[(0, 2 * PAGE)], || {
+            assert_eq!(copy.host_byte(200), 0x11, "refreshed");
+            poke(title + 200, 0x33);
+        });
+        assert_eq!(peek(title + 200), 0x33, "the title's write was lost");
+        copy.update(title, 2 * PAGE);
+        assert_eq!(copy.host_byte(200), 0x33, "taken at the next refresh");
+    }
+
+    /// In one submission: ranges declared at either end, then the range
+    /// between them refreshed (after a title write) and declared. The
+    /// snapshot already spans it and must hold what the refresh copied.
+    #[test]
+    fn a_range_declared_inside_the_snapshot_is_compared_with_its_refresh() {
+        let Some((title, copy)) = title_copy(3) else { return };
+        copy.update(title, 3 * PAGE);
+        copy.writing(title, PAGE);
+        copy.writing(title + 2 * PAGE, PAGE);
+        poke(title + PAGE + 40, 0x21);
+        copy.update(title + PAGE, PAGE);
+        assert_eq!(copy.host_byte(PAGE + 40), 0x21);
+        copy.writing(title + PAGE, PAGE);
+        poke(title + PAGE + 40, 0x42); // the title, while the GPU runs
+        for at in [title, title + 2 * PAGE, title + PAGE] {
+            copy.copy_back(at, PAGE);
+        }
+        assert_eq!(peek(title + PAGE + 40), 0x42, "the title's write was lost");
+    }
+
+    /// A mirror is counted while its copy lives.
+    #[test]
+    fn mirrors_are_counted_while_their_copy_lives() {
+        let Some((_, copy)) = title_copy(2) else { return };
+        copy.submit(&[(0, 2 * PAGE)], || {});
+        assert!(copy.mirrored.load(Ordering::Relaxed));
+        let n = copy.before.lock().unwrap().as_ref().unwrap().1.capacity();
+        assert!(n >= 2 * PAGE);
+        assert!(MIRRORED.load(Ordering::Relaxed) >= n);
+        drop(copy);
+    }
+
+    #[test]
+    fn merge_takes_only_what_the_gpu_wrote() {
+        // The GPU wrote byte 1, the title byte 2.
+        let (mut host, mut old, mut title) = ([1, 9, 3, 4], [1, 2, 3, 4], [1, 2, 8, 4]);
+        assert!(merge(&mut host, &mut old, &mut title));
+        assert_eq!((host, old, title), ([1, 9, 8, 4], [1, 9, 8, 4], [1, 9, 8, 4]));
+        // The title holds what the GPU wrote already: nothing to write.
+        let (mut host, mut old, mut title) = ([5, 6], [0, 6], [5, 7]);
+        assert!(!merge(&mut host, &mut old, &mut title));
+        assert_eq!((host, old), ([5, 7], [5, 7]));
+    }
+
     #[test]
     fn a_parent_is_found_past_many_children() {
         let base = 0x10_0000_0000;
@@ -675,13 +924,27 @@ mod tests {
         assert!(loose(0, 16).is_none());
         assert!(loose(0x1000, 0x1010).is_none());
         assert!(loose(LOWEST_MAPPED - 1, LOWEST_MAPPED + 1).is_none());
-        // Reserved, not committed.
-        // SAFETY: a fresh reservation, released below.
-        let p = unsafe { VirtualAlloc(std::ptr::null(), WINDOW as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
-        assert_ne!(p, 0);
+        // Reserved, not committed. Not where an earlier test's window was
+        // (windows are never freed; other tests' memory is).
+        let mut kept = Vec::new();
+        let p = loop {
+            // SAFETY: a fresh reservation, released below.
+            let p = unsafe { VirtualAlloc(std::ptr::null(), WINDOW as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
+            assert_ne!(p, 0);
+            let windows = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            let span = LOOSE_SPAN.load(Ordering::Relaxed);
+            if enclosing_window(&windows, span, p + 64, p + 128).is_none() {
+                break p;
+            }
+            kept.push(p);
+        };
         assert!(loose(p + 64, p + 128).is_none());
-        // SAFETY: our reservation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // SAFETY: our reservations.
+        unsafe {
+            for p in kept.into_iter().chain([p]) {
+                VirtualFree(p as *mut _, 0, MEM_RELEASE);
+            }
+        }
         // Too close to the top to round up to a window.
         assert!(loose(u64::MAX - 8, u64::MAX).is_none());
     }
