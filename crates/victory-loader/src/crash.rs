@@ -410,9 +410,79 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
     Some(len)
 }
 
+/// Debugging aid: `VICTORY_TITLE_ASSERTS=<n>` continues past up to `n`
+/// `int3` asserts in title code, where the first one ends the process.
+/// Each skip is logged with its address and the title's last debug output.
+///
+/// A title asserts where a check it believes it cannot recover from
+/// failed, so a run that gets past one is not a run to trust. It is how the
+/// next thing that needs work is found, though: the check is taken as
+/// passed, its caller keeps the value it computed, and the title goes on to
+/// the next failure instead of the same one.
+fn asserts_left() -> &'static std::sync::atomic::AtomicUsize {
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicUsize;
+    static LEFT: OnceLock<AtomicUsize> = OnceLock::new();
+    LEFT.get_or_init(|| {
+        let n = std::env::var("VICTORY_TITLE_ASSERTS")
+            .ok()
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0);
+        AtomicUsize::new(n)
+    })
+}
+
+/// Skips `0xcc`, the byte a compiler emits for `__debugbreak`, at `at`: the
+/// `int3` is taken as a no-op the title asked for rather than a fault. A
+/// debugger's breakpoint is not that: it patches the code, and the byte
+/// there is the instruction it replaced, so it is left alone.
+fn skip_assert_at(at: usize, code: i32, left: &std::sync::atomic::AtomicUsize) -> bool {
+    use std::sync::atomic::Ordering;
+    if code != EXCEPTION_BREAKPOINT || left.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    // SAFETY: the CPU fetched the instruction at `at`, so its byte is
+    // readable.
+    if unsafe { (at as *const u8).read() } != 0xcc {
+        return false;
+    }
+    left.fetch_sub(1, Ordering::Relaxed);
+    true
+}
+
+/// [`skip_assert_at`] on the exception being dispatched, moving `rip` past
+/// the skipped `int3`. Returns whether it was skipped.
+unsafe fn past_assert(info: *mut EXCEPTION_POINTERS) -> bool {
+    // SAFETY: the system passes valid exception pointers.
+    unsafe {
+        let record = &*(*info).ExceptionRecord;
+        let context = &mut *(*info).ContextRecord;
+        let at = record.ExceptionAddress as usize;
+        if !skip_assert_at(at, record.ExceptionCode, asserts_left()) {
+            return false;
+        }
+        // The next instruction: read before the exception, so an `int3`
+        // that is the first byte of a debugger's patch is not skipped.
+        context.Rip = at as u64 + 1;
+        // The title's last debug output with it: asserts in a bring-up
+        // build usually say what they were checking on the lines before.
+        eprint!(
+            "VIctory: past a title assert at {} ({} left)\n{}",
+            locate(at),
+            asserts_left().load(std::sync::atomic::Ordering::Relaxed),
+            title_output()
+        );
+    }
+    true
+}
+
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // SAFETY: as above.
+    if unsafe { past_assert(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
@@ -763,6 +833,35 @@ mod tests {
             .collect();
         let system: Vec<_> = walked[1..].iter().map(|&f| f as usize).collect();
         assert_eq!(ours, system);
+    }
+
+    /// The byte decides, and the budget is spent only where it is: a
+    /// compiler's `int3` is skipped while the budget lasts, a debugger's
+    /// patched code is not, and neither is any other exception.
+    #[test]
+    fn a_title_int3_is_skipped_while_the_budget_lasts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CODE: [u8; 4] = [0xcc, 0x90, 0xcc, 0xcc];
+        let at = CODE.as_ptr() as usize;
+        let left = AtomicUsize::new(2);
+        assert!(skip_assert_at(at, EXCEPTION_BREAKPOINT, &left));
+        assert_eq!(left.load(Ordering::Relaxed), 1);
+        // A debugger's breakpoint: the byte is the instruction it replaced.
+        assert!(!skip_assert_at(at + 1, EXCEPTION_BREAKPOINT, &left));
+        assert_eq!(left.load(Ordering::Relaxed), 1, "not spent");
+        // Another kind of exception is not ours to skip.
+        assert!(!skip_assert_at(
+            at + 2,
+            EXCEPTION_ILLEGAL_INSTRUCTION,
+            &left
+        ));
+        assert_eq!(left.load(Ordering::Relaxed), 1, "not spent");
+        assert!(skip_assert_at(at + 2, EXCEPTION_BREAKPOINT, &left));
+        assert_eq!(left.load(Ordering::Relaxed), 0);
+        assert!(
+            !skip_assert_at(at + 3, EXCEPTION_BREAKPOINT, &left),
+            "the budget is spent, so the next assert ends the process"
+        );
     }
 
     #[test]
