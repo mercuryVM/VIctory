@@ -547,6 +547,52 @@ impl Host {
         // SAFETY: the stream points at live data and outlives the call.
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
+
+    /// The adapter the device runs on, as DXGI names it, for test messages:
+    /// on a laptop the default adapter is often the integrated GPU, not the
+    /// one its owner has in mind.
+    pub fn adapter(&self) -> String {
+        match self.adapter_desc() {
+            Ok(d) => adapter_name(&d),
+            Err(e) => format!("unknown adapter: {e}"),
+        }
+    }
+
+    /// What the device runs on, for test messages: `hardware` or `warp`,
+    /// read from its adapter rather than from what [`Host::new`] was asked
+    /// for (with `VICTORY_WARP=1`, `Host::new(false)` is WARP too), and the
+    /// adapter's name, as in `warp (Microsoft Basic Render Driver)`. `asked`
+    /// stands in for the first part when the adapter can't be read.
+    pub fn backend(&self, asked: &str) -> String {
+        match self.adapter_desc() {
+            Ok(d) => {
+                // WARP is the Microsoft Basic Render Driver: flagged as
+                // software, or known by its ids where it isn't flagged.
+                let software = DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32;
+                let warp = (d.Flags & software) != 0 || (d.VendorId, d.DeviceId) == (0x1414, 0x8c);
+                let backend = if warp { "warp" } else { "hardware" };
+                format!("{backend} ({})", adapter_name(&d))
+            }
+            Err(e) => format!("{asked} (unknown adapter: {e})"),
+        }
+    }
+
+    fn adapter_desc(&self) -> Result<DXGI_ADAPTER_DESC1, String> {
+        // SAFETY: plain DXGI queries.
+        unsafe {
+            let luid = self.device.GetAdapterLuid();
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+                .and_then(|a| a.GetDesc1())
+        }
+        .map_err(err)
+    }
+}
+
+fn adapter_name(d: &DXGI_ADAPTER_DESC1) -> String {
+    let name = &d.Description;
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    String::from_utf16_lossy(&name[..len])
 }
 
 /// A vertex shader that feeds `ps`'s inputs (zeros) and a position.

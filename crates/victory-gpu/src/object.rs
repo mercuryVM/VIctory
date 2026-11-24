@@ -68,7 +68,14 @@ unsafe impl<const N: usize> Sync for Table<N> {}
 
 pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
-    unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
+    let refs = &unsafe { &*this }.refs;
+    // COM's AddRef never returns 0, so saturate rather than wrap: a count
+    // that wrapped would make the object look unreferenced and freeable.
+    let current =
+        match refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
+            Ok(n) | Err(n) => n,
+        };
+    current.saturating_add(1)
 }
 
 pub(crate) extern "system" fn release(this: This) -> u32 {
@@ -371,7 +378,70 @@ pub(crate) fn slot<F: Copy>(object: This, offset: usize) -> F {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::mem::offset_of;
+    use std::rc::Rc;
+    use std::sync::atomic::Ordering;
+
     use super::*;
+
+    const TEST_IID: Iid = guid(
+        0x0102_0304,
+        0x0506,
+        0x0708,
+        [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+    );
+    const OTHER_IID: Iid = guid(
+        0x090a_0b0c,
+        0x0d0e,
+        0x0f10,
+        [0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27],
+    );
+
+    /// A boxed object that counts its own destruction, so that tests can
+    /// tell a dropped object from a leaked one.
+    #[repr(C)]
+    struct Tracked {
+        object: Object,
+        dropped: Rc<Cell<u32>>,
+    }
+
+    impl Tracked {
+        /// The header pointer a COM slot receives.
+        fn header(&self) -> This {
+            &raw const self.object
+        }
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.dropped.set(self.dropped.get() + 1);
+        }
+    }
+
+    /// Only the header and the release slot matter to these tests.
+    static TEST_TABLE: Table<8> = {
+        let mut f = missing_table::<DEVICE, 8>();
+        f[2] = release_boxed::<Tracked> as *const ();
+        Table(f)
+    };
+
+    static UNREFERENCED: Object = Object::new(&TEST_TABLE);
+    static SATURATED: Object = Object::new(&TEST_TABLE);
+
+    fn tracked() -> (Box<Tracked>, Rc<Cell<u32>>) {
+        let dropped = Rc::new(Cell::new(0));
+        let object = Box::new(Tracked {
+            object: Object::new(&TEST_TABLE),
+            dropped: Rc::clone(&dropped),
+        });
+        (object, dropped)
+    }
+
+    fn refs(this: This) -> u32 {
+        // SAFETY: `this` is one of our test objects.
+        unsafe { (*this).refs.load(Ordering::Relaxed) }
+    }
 
     #[test]
     fn guids_round_trip_through_text() {
@@ -383,6 +453,311 @@ mod tests {
         );
         assert_eq!(g[..4], [0xf1, 0x19, 0x98, 0x18]);
         assert_eq!(guid_text(&g), "189819f1-1db6-4b57-be54-1821339b85f7");
+        assert_eq!(guid_text(&[0; 16]), "00000000-0000-0000-0000-000000000000");
+    }
+
+    #[test]
+    fn is_matches_whole_interface_ids_only() {
+        assert!(is(&TEST_IID, &[OTHER_IID, TEST_IID]));
+        assert!(!is(&OTHER_IID, &[TEST_IID]));
+        assert!(!is(std::ptr::null(), &[TEST_IID]));
+        assert!(!is(&TEST_IID, &[]));
+        let mut altered = TEST_IID;
+        altered[15] ^= 1;
+        assert!(!is(&altered, &[TEST_IID]));
+    }
+
+    #[test]
+    fn the_object_header_starts_with_table_bits_and_count() {
+        assert_eq!(offset_of!(Object, functions), 0);
+        assert_eq!(offset_of!(Object, bits), 8);
+        assert_eq!(offset_of!(Object, refs), 12);
+        assert_eq!(std::mem::size_of::<Object>(), 16);
+    }
+
+    #[test]
+    fn answer_reports_no_interface_and_clears_the_result() {
+        let (object, dropped) = tracked();
+        let header = object.header();
+        let mut out = header;
+        assert_eq!(answer(DEVICE, &TEST_IID, None, &mut out), E_NOINTERFACE);
+        assert!(out.is_null(), "the result is cleared on failure");
+        assert_eq!(refs(header), 0, "no reference was added");
+        // A null id is tolerated (the log just has no text for it).
+        assert_eq!(
+            answer(DEVICE, std::ptr::null(), None, &mut out),
+            E_NOINTERFACE
+        );
+        drop(object);
+        assert_eq!(dropped.get(), 1);
+    }
+
+    #[test]
+    fn answer_demands_room_for_the_result() {
+        let (object, _dropped) = tracked();
+        let header = object.header();
+        assert_eq!(
+            answer(DEVICE, &TEST_IID, Some(header), std::ptr::null_mut()),
+            E_POINTER
+        );
+        assert_eq!(refs(header), 0, "no reference for a dropped result");
+    }
+
+    #[test]
+    fn answer_hands_out_a_new_reference() {
+        let (object, dropped) = tracked();
+        let header = object.header();
+        let this: This = Box::into_raw(object).cast::<Object>();
+        assert_eq!(header, this);
+        let mut out = std::ptr::null();
+        assert_eq!(answer(DEVICE, &TEST_IID, Some(this), &mut out), S_OK);
+        assert_eq!(out, this);
+        assert_eq!(refs(out), 1);
+        assert_eq!(release_boxed::<Tracked>(out), 0);
+        assert_eq!(dropped.get(), 1);
+    }
+
+    #[test]
+    fn hand_out_rejects_unknown_interfaces_and_frees_the_object() {
+        let (object, dropped) = tracked();
+        let mut out: This = std::ptr::null();
+        assert_eq!(
+            hand_out(DEVICE, object, &OTHER_IID, &[TEST_IID], &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+        assert_eq!(dropped.get(), 1, "the rejected object is dropped");
+
+        let (object, dropped) = tracked();
+        let mut out: This = std::ptr::null();
+        assert_eq!(
+            hand_out(DEVICE, object, std::ptr::null(), &[TEST_IID], &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+        assert_eq!(dropped.get(), 1);
+    }
+
+    #[test]
+    fn hand_out_without_a_result_only_asks() {
+        let (object, dropped) = tracked();
+        assert_eq!(
+            hand_out(DEVICE, object, &TEST_IID, &[TEST_IID], std::ptr::null_mut()),
+            S_FALSE
+        );
+        assert_eq!(dropped.get(), 1, "the dropped object is freed");
+    }
+
+    #[test]
+    fn the_table_hands_out_one_reference_and_releases_it() {
+        let (object, dropped) = tracked();
+        let header = object.header();
+        let mut out = std::ptr::null();
+        assert_eq!(
+            hand_out(DEVICE, object, &TEST_IID, &[TEST_IID], &mut out),
+            S_OK
+        );
+        assert_eq!(out, header);
+        assert_eq!(refs(out), 1, "a handed-out object starts with one");
+
+        let add: extern "system" fn(This) -> u32 = slot(out, 0x08);
+        let release: extern "system" fn(This) -> u32 = slot(out, 0x10);
+        assert_eq!(add(out), 2);
+        assert_eq!(release(out), 1);
+        assert_eq!(release(out), 0, "the last release frees it");
+        assert_eq!(dropped.get(), 1);
+    }
+
+    #[test]
+    fn release_never_takes_a_count_below_zero() {
+        let this: This = &UNREFERENCED;
+        assert_eq!(refs(this), 0);
+        assert_eq!(release(this), 0, "an unreferenced object stays at zero");
+        assert_eq!(refs(this), 0);
+        assert_eq!(add_ref(this), 1);
+        assert_eq!(release(this), 0);
+        assert_eq!(refs(this), 0);
+    }
+
+    #[test]
+    fn add_ref_saturates_instead_of_wrapping() {
+        let this: This = &SATURATED;
+        // SAFETY: a static of ours; the count is atomic.
+        unsafe { (*this).refs.store(u32::MAX, Ordering::Relaxed) };
+        assert_eq!(add_ref(this), u32::MAX, "AddRef never returns 0");
+        assert_eq!(refs(this), u32::MAX);
+        assert_eq!(release(this), u32::MAX - 1);
+    }
+
+    #[test]
+    fn tables_begin_with_iunknown_and_fill_unknown_slots() {
+        let f = missing_table::<DEVICE, 24>();
+        assert_eq!(f[0], missing::<DEVICE, 0> as *const ());
+        assert_eq!(f[1], add_ref as *const ());
+        assert_eq!(f[2], release as *const ());
+        assert_eq!(f[23], missing::<DEVICE, 23> as *const ());
+    }
+
+    #[test]
+    fn d3d12_object_wires_its_methods_at_the_pc_offsets() {
+        let f = d3d12_object(missing_table::<DEVICE, 8>());
+        assert_eq!(f[3], get_private_data as *const (), "0x18");
+        assert_eq!(f[4], set_private_data as *const (), "0x20");
+        assert_eq!(f[5], missing::<DEVICE, 5> as *const (), "0x28");
+        assert_eq!(f[6], set_name as *const (), "0x30");
+    }
+
+    #[test]
+    fn private_data_round_trips_and_reports_a_short_buffer() {
+        let (object, dropped) = tracked();
+        let mut out = std::ptr::null();
+        assert_eq!(
+            hand_out(DEVICE, object, &TEST_IID, &[TEST_IID], &mut out),
+            S_OK
+        );
+        let id = guid(0xabc, 1, 2, [3; 8]);
+        let value = [0xdeu8, 0xad, 0xbe, 0xef];
+        assert_eq!(
+            set_private_data(out, &id, value.len() as u32, value.as_ptr()),
+            S_OK
+        );
+
+        // A null buffer only asks for the size.
+        let mut size = 0;
+        assert_eq!(
+            get_private_data(out, &id, &mut size, std::ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(size, value.len() as u32);
+
+        // An exact buffer is filled.
+        let mut buffer = [0; 4];
+        let mut size = buffer.len() as u32;
+        assert_eq!(
+            get_private_data(out, &id, &mut size, buffer.as_mut_ptr()),
+            S_OK
+        );
+        assert_eq!(buffer, value);
+        assert_eq!(size, value.len() as u32);
+
+        // A short buffer is reported along with the size it needs.
+        let mut short = [0; 2];
+        let mut size = short.len() as u32;
+        assert_eq!(
+            get_private_data(out, &id, &mut size, short.as_mut_ptr()),
+            MORE_DATA
+        );
+        assert_eq!(size, value.len() as u32);
+        assert_eq!(short, [0, 0], "nothing is written on a short buffer");
+
+        // An unknown id is not found.
+        let missing_id = guid(0xdef, 4, 5, [6; 8]);
+        let mut size = 7;
+        assert_eq!(
+            get_private_data(out, &missing_id, &mut size, std::ptr::null_mut()),
+            NOT_FOUND
+        );
+        assert_eq!(size, 0);
+
+        // Null data removes the entry.
+        assert_eq!(set_private_data(out, &id, 0, std::ptr::null()), S_OK);
+        let mut size = 0;
+        assert_eq!(
+            get_private_data(out, &id, &mut size, std::ptr::null_mut()),
+            NOT_FOUND
+        );
+
+        assert_eq!(release_boxed::<Tracked>(out), 0);
+        assert_eq!(dropped.get(), 1);
+    }
+
+    #[test]
+    fn private_data_requires_its_arguments() {
+        let (object, dropped) = tracked();
+        let mut out = std::ptr::null();
+        assert_eq!(
+            hand_out(DEVICE, object, &TEST_IID, &[TEST_IID], &mut out),
+            S_OK
+        );
+        let id = guid(0x123, 7, 8, [9; 8]);
+        let mut size = 0;
+        assert_eq!(
+            get_private_data(out, std::ptr::null(), &mut size, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            get_private_data(out, &id, std::ptr::null_mut(), std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            set_private_data(out, std::ptr::null(), 0, std::ptr::null()),
+            E_INVALIDARG
+        );
+        assert_eq!(release_boxed::<Tracked>(out), 0);
+        assert_eq!(dropped.get(), 1);
+    }
+
+    #[test]
+    fn private_data_goes_away_with_its_object() {
+        let (object, dropped) = tracked();
+        let mut out = std::ptr::null();
+        assert_eq!(
+            hand_out(DEVICE, object, &TEST_IID, &[TEST_IID], &mut out),
+            S_OK
+        );
+        let id = guid(0x456, 10, 11, [12; 8]);
+        let value = [7u8; 3];
+        assert_eq!(
+            set_private_data(out, &id, value.len() as u32, value.as_ptr()),
+            S_OK
+        );
+        let key = (out as usize, id);
+        assert!(private_data().contains_key(&key));
+        assert_eq!(release_boxed::<Tracked>(out), 0);
+        assert!(!private_data().contains_key(&key), "the data is dropped");
+        assert_eq!(dropped.get(), 1);
+    }
+
+    #[test]
+    fn set_name_accepts_absent_and_present_names() {
+        assert_eq!(set_name(std::ptr::null(), std::ptr::null()), S_OK);
+        let empty = [0u16];
+        assert_eq!(set_name(std::ptr::null(), empty.as_ptr()), S_OK);
+        let name = [u16::from(b'x'), 0];
+        assert_eq!(set_name(std::ptr::null(), name.as_ptr()), S_OK);
+        // An unpaired surrogate is replaced, not a panic.
+        let broken = [0xd800u16, 0];
+        assert_eq!(set_name(std::ptr::null(), broken.as_ptr()), S_OK);
+    }
+
+    #[test]
+    fn parent_device_answers_only_the_device_ids() {
+        let mut out = std::ptr::null();
+        assert_eq!(
+            parent_device(std::ptr::null(), &crate::device::IID, &mut out),
+            S_OK
+        );
+        assert_eq!(out, crate::device::device());
+        release(out);
+
+        let mut out = crate::device::device();
+        assert_eq!(
+            parent_device(std::ptr::null(), &OTHER_IID, &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+
+        assert_eq!(
+            parent_device(std::ptr::null(), &crate::device::IID, std::ptr::null_mut()),
+            E_POINTER
+        );
+
+        let mut out = crate::device::device();
+        assert_eq!(
+            parent_device(std::ptr::null(), std::ptr::null(), &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
     }
 
     /// Every COM object answers for `IUnknown`, and with one pointer

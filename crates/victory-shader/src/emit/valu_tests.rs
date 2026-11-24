@@ -171,7 +171,8 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
-/// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
+/// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`,
+/// `backend` naming what ran, read from the device (`hardware (<adapter>)`).
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
@@ -184,6 +185,10 @@ fn run_cases(
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        // Failures name what ran, read from the device: the default adapter
+        // is not always the GPU the tester expects (on a laptop, often the
+        // integrated one), and with VICTORY_WARP=1 the hardware run is WARP.
+        let label: &str = &host.backend(label);
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -573,6 +578,31 @@ fn v_fma_legacy_f32_follows_the_d3d9_zero_rule() {
 }
 
 #[test]
+fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
+    // v_cvt_off_f32_i4 v0, v1 (VOP1 opcode 0x00e)
+    let shader = build_valu_cs(&[vop1(0x00e, 0, vgpr(1))]);
+    let nibble = |n: u32| (((n as i32) << 28) >> 28) as f32 / 16.0;
+
+    let mut cases: Vec<u32> = (0..16).collect();
+    // Bits above the low nibble are ignored.
+    cases.extend([0xABCD_EF05, 0xFFFF_FFF8, 0x1234_5670, 0x8000_000F, 0x0000_00F7]);
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&x| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = nibble(cases[i]).to_bits();
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_off_f32_i4({:#010x}) = {got:#010x} ({:?}), want {want:#010x}",
+            inp[0],
+            f32::from_bits(got),
+        );
+    });
+    // Spot-check the reference itself: 0x5 -> 0.3125, 0x8 -> -0.5, 0xF -> -0.0625.
+    assert_eq!(nibble(0xABCD_EF05), 0.3125);
+    assert_eq!(nibble(8), -0.5);
+    assert_eq!(nibble(0xF), -0.0625);
+}
+
+#[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)
     let shader = build_valu_cs(&[vop1(0x020, 0, vgpr(1))]);
@@ -853,6 +883,49 @@ fn v_cvt_u16_and_i16_f16_saturate() {
                 u32::from(want),
                 "{backend}: {what}({:#06x}) = {got:#010x}, want {want:#06x}",
                 cases[i].0,
+            );
+        });
+    }
+}
+
+#[test]
+fn v_align_bfi_bfm_and_bcnt_match_rdna2() {
+    // v0 = op(v1, v2, v3) in VOP3. alignbit/alignbyte give the low dword of
+    // {v1, v2} >> shift; bfi merges by the mask in v1; bfm builds a field mask;
+    // bcnt adds the set bits of v1 to v2.
+    type Pick = fn(u32, u32, u32) -> u32;
+    let ops: [(&str, u16, Pick); 5] = [
+        ("v_alignbit_b32", 0x14E, |a, b, c| {
+            (((u64::from(a) << 32) | u64::from(b)) >> (c & 31)) as u32
+        }),
+        ("v_alignbyte_b32", 0x14F, |a, b, c| {
+            (((u64::from(a) << 32) | u64::from(b)) >> ((c & 3) * 8)) as u32
+        }),
+        ("v_bfi_b32", 0x14A, |m, a, b| (m & a) | (!m & b)),
+        ("v_bfm_b32", 0x363, |a, b, _| {
+            (1u32 << (a & 31)).wrapping_sub(1) << (b & 31)
+        }),
+        ("v_bcnt_u32_b32", 0x364, |a, b, _| {
+            a.count_ones().wrapping_add(b)
+        }),
+    ];
+    let values = [0u32, 1, 5, 31, 0x8000_0001, 0xFFFF_FFFF];
+    let mut cases = Vec::new();
+    for a in values {
+        for b in values {
+            for c in values {
+                cases.push([a, b, c, 0]);
+            }
+        }
+    }
+    for (name, op, pick) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = pick(inp[0], inp[1], inp[2]);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1], inp[2],
             );
         });
     }
