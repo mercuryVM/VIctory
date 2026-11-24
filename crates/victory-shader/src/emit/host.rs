@@ -1062,6 +1062,28 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_as(root, pso, d, false)
+    }
+
+    /// [`Host::dispatch`] for a mesh pipeline: `d.groups[0]` mesh groups
+    /// (`DispatchMesh`), no render target bound, root arguments as the
+    /// graphics root's. The UAVs are what the mesh program writes.
+    pub fn dispatch_mesh(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_as(root, pso, d, true)
+    }
+
+    fn dispatch_as(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        mesh: bool,
+    ) -> Result<Vec<Vec<u32>>, String> {
         let _guard = self.lock_warp();
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -1460,15 +1482,28 @@ impl Host {
                 dev.CreateSampler(s, at);
             }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
-            list.SetComputeRootSignature(root);
+            if mesh {
+                list.SetGraphicsRootSignature(root);
+            } else {
+                list.SetComputeRootSignature(root);
+            }
             for (param, arg) in &d.roots {
                 match arg {
+                    Root::Constants(data) if mesh => list.SetGraphicsRoot32BitConstants(
+                        *param,
+                        data.len() as u32,
+                        data.as_ptr().cast(),
+                        0,
+                    ),
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
                         *param,
                         data.len() as u32,
                         data.as_ptr().cast(),
                         0,
                     ),
+                    Root::Table { .. } | Root::View { .. } if mesh => {
+                        return Err("mesh dispatch: root constants only".into());
+                    }
                     Root::Table { sampler, index } => {
                         let (h, size) = if *sampler {
                             (&samplers, sampler_size)
@@ -1492,7 +1527,12 @@ impl Host {
                 }
             }
             let [x, y, z] = d.groups;
-            list.Dispatch(x, y, z);
+            if mesh {
+                let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
+                list6.DispatchMesh(x, y, z);
+            } else {
+                list.Dispatch(x, y, z);
+            }
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
