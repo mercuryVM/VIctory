@@ -95,8 +95,9 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
 /// hardware GPU and on WARP (each skipped without a device) and returns,
-/// per one that ran, the UAV's 32 dwords.
-fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
+/// per one that ran, what ran (read from the device, with the adapter's
+/// name) and the UAV's 32 dwords.
+fn run(shader: &HostShader, views: &[View]) -> Vec<(String, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -118,6 +119,8 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        // Failures name what ran, as in the VALU tests.
+        let label = host.backend(label);
         let (root, pso) = match host.compute_pipeline(shader) {
             Ok(p) => p,
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
@@ -147,7 +150,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
 
 /// The red channel each lane sampled from two 1x1 textures, red 1.0 at
 /// heap index 0 and 2.0 at 1.
-fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
+fn sampled(shader: &HostShader) -> Vec<(String, Vec<f32>)> {
     let first = [[1.0f32, 0.0, 0.0, 1.0]];
     let second = [[2.0f32, 0.0, 0.0, 1.0]];
     let views = [
