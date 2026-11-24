@@ -537,6 +537,13 @@ fn buffer_srv(
         );
         return None;
     }
+    // A view of no elements is an invalid call on the host (it removes the
+    // device); the title makes such views for buffers it has not sized yet.
+    // The caller makes a null view instead.
+    if buffer.NumElements == 0 {
+        once!("a buffer view of no elements is left null");
+        return None;
+    }
     buffer.FirstElement += offset / element;
     if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement) {
         let first = buffer.FirstElement;
@@ -582,6 +589,11 @@ fn buffer_uav(
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
         once!(offset, element, "unordered buffer view not on an element of its host copy");
+        return None;
+    }
+    // As in `buffer_srv`.
+    if buffer.NumElements == 0 {
+        once!("an unordered buffer view of no elements is left null");
         return None;
     }
     buffer.FirstElement += offset / element;
@@ -1007,6 +1019,43 @@ mod tests {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Buffer views of no elements (the title makes them for buffers it has
+    /// not sized yet) are left null: the host removes the device for one.
+    #[test]
+    fn buffer_views_of_no_elements_are_left_null() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let memory = vec![0u32; 1024];
+        let address = memory.as_ptr() as u64;
+        let resource = 0x7e57_0000usize;
+        crate::shadow::register(resource, address, 4096);
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV::default(),
+            },
+        };
+        assert!(buffer_uav(address, 4096, uav, heap.cpu(0)).is_none());
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV::default(),
+            },
+        };
+        assert!(buffer_srv(address, 4096, srv, heap.cpu(1)).is_none());
+        crate::shadow::unregister(resource, address);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
