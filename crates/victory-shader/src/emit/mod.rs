@@ -156,7 +156,10 @@
 //! announced.
 //! * **Signatures** as the console container has them (same semantics,
 //!   registers and masks), so the input layout and stage linking are the
-//!   title's; pixel outputs are plain 32-bit values.
+//!   title's; pixel outputs are plain 32-bit values. A pixel shader that
+//!   reads its barycentrics as data (not only to interpolate) declares
+//!   `SV_Barycentrics` (SM 6.1) for them: the host device must support
+//!   barycentrics.
 //! * **Mesh shaders** ([`HwStage::Ms`], `ms_6_6`): user data and
 //!   descriptors as above (the root constants visible to the mesh stage);
 //!   the pipeline is a mesh pipeline (pipeline-state stream, no input
@@ -179,6 +182,8 @@
 //!   triangles in, triangle strips out, one stream, the record's maximum
 //!   vertex count. User data and descriptors as above.
 
+#[cfg(test)]
+mod barycentric_tests;
 mod bitcode;
 #[cfg(all(test, windows))]
 mod bvh_tests;
@@ -638,6 +643,9 @@ fn emit_linked(
     };
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
+    // Lowering declares the SV_Barycentrics the program reads, with the
+    // modes of the pairs it reads (a signature has no modes).
+    inputs.retain(|e| e.kind != 28);
     let mut outputs = sig(FourCC::OSG1)?;
     let mut linked_cols = None;
     if let Some(reads) = link {
@@ -826,6 +834,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             68 => 18,
             69 => 20,
             70 => 15,
+            23 => 28, // barycentrics
             25 => 30, // cull primitive
             _ => {
                 return Err(ShaderError::Unsupported {

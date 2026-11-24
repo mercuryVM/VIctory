@@ -561,6 +561,20 @@ fn packed_half(elements: &[SigElement], a: u8, h: u8) -> Option<(u8, u8)> {
     }
 }
 
+/// The DXIL interpolation mode of a barycentric pair; none for the pull
+/// model (i/w, j/w, 1/w), which DXIL has no input for.
+fn interp_mode(b: Barycentric) -> Option<u8> {
+    Some(match b {
+        Barycentric::PerspectiveCenter => 2,
+        Barycentric::PerspectiveCentroid => 3,
+        Barycentric::PerspectiveSample => 6,
+        Barycentric::LinearCenter => 4,
+        Barycentric::LinearCentroid => 5,
+        Barycentric::LinearSample => 7,
+        Barycentric::PerspectivePullModel => return None,
+    })
+}
+
 /// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]),
 /// by row: whether two per dword.
 fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
@@ -1867,6 +1881,7 @@ impl<'a> Lower<'a> {
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
+                    Some(Input::Barycentric { .. }) => continue, // loaded on first use
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
                     // refuses reads of undef).
@@ -1889,7 +1904,7 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            Input::Barycentric { kind, index } => return self.barycentric(kind, index),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -2003,6 +2018,65 @@ impl<'a> Lower<'a> {
         Val::I32(self.s.m.select(e, folded, x, g))
     }
 
+    /// Barycentric `index` (0 i, 1 j) of a pair read as data, not by
+    /// `v_interp_*`: a channel of `SV_Barycentrics` with the pair's mode.
+    /// The hardware's i and j weight vertices 1 and 2 (the attribute is
+    /// P0 + i P10 + j P20). D3D gives the provoking vertex's weight in x
+    /// and the others' in y and z, in winding order, so i is y and j is z
+    /// when P0 is that vertex.
+    // shortcut: the hardware may rotate a primitive's vertices (cyclically)
+    // and tells a program by how much in an SGPR not modelled here; the
+    // host's weights are the unrotated ones. On lines D3D's z is 0, so j
+    // reads 0 and i the line's whole weight, which the hardware may split.
+    fn barycentric(&mut self, kind: Barycentric, index: u8) -> Val {
+        let Some(mode) = interp_mode(kind) else {
+            return Val::Missing("pull-model barycentrics read directly");
+        };
+        // One perspective-correct and one linear SV_Barycentrics at most.
+        let linear = |m: u8| matches!(m, 4 | 5 | 7);
+        let id = match self
+            .s
+            .inputs
+            .iter()
+            .position(|e| e.kind == 28 && linear(e.interp) == linear(mode))
+        {
+            Some(id) if self.s.inputs[id].interp == mode => id,
+            Some(_) => return Val::Missing("barycentrics of two sample positions read directly"),
+            None => {
+                let n = self.s.inputs.iter().filter(|e| e.kind == 28).count();
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index: n as u32,
+                    kind: 28,
+                    comp: 9,
+                    interp: mode,
+                    // Not packed: no register.
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.flags |= flags::BARYCENTRICS;
+                self.s.inputs.len() - 1
+            }
+        };
+        self.load_any_input(id, index + 1)
+    }
+
+    /// Loads `v` if it is an input loaded on first use: barycentrics, which
+    /// most programs read only through interpolation (no value read).
+    fn load_lazy(&mut self, v: Value) -> bool {
+        let Some(&(_, input @ Input::Barycentric { .. })) =
+            self.x.io.inputs.iter().find(|i| i.0 == v)
+        else {
+            return false;
+        };
+        let val = self.input(input);
+        self.vals.insert(v, val);
+        true
+    }
+
     /// A component of a compute thread or group id, read in the entry block.
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
         let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
@@ -2099,6 +2173,9 @@ impl<'a> Lower<'a> {
             let val = self.user(param, dword);
             self.vals.insert(v, val);
             return Ok(val);
+        }
+        if self.load_lazy(v) {
+            return self.get(v);
         }
         Err("a value defined after its use")
     }
@@ -8290,15 +8367,7 @@ impl<'a> Lower<'a> {
                 ..
             } => (
                 attribute,
-                match barycentric {
-                    Barycentric::PerspectiveCenter => 2,
-                    Barycentric::PerspectiveCentroid => 3,
-                    Barycentric::PerspectiveSample => 6,
-                    Barycentric::LinearCenter => 4,
-                    Barycentric::LinearCentroid => 5,
-                    Barycentric::LinearSample => 7,
-                    Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
-                },
+                interp_mode(*barycentric).ok_or("pull-model interpolation")?,
             ),
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {
@@ -11190,6 +11259,9 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let read = live.contains(&(phi.value, n));
+                if read && !self.vals.contains_key(&arg) {
+                    self.load_lazy(arg);
+                }
                 let mut val = self.vals.get(&arg).copied();
                 // A register the compiler reuses, a lane mask on this edge and
                 // data on another: with console lanes, the mask's number.
