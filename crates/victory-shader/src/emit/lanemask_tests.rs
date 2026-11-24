@@ -77,7 +77,7 @@ pub(super) fn lower_cs(words: &[u32]) -> Result<HostShader, ShaderError> {
 }
 
 /// [`lower_cs`] in wave64 (`wave64`, 64 threads) or wave32 (32 threads).
-fn lower_cs_on(words: &[u32], wave64: bool) -> Result<HostShader, ShaderError> {
+pub(super) fn lower_cs_on(words: &[u32], wave64: bool) -> Result<HostShader, ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64,

@@ -644,7 +644,30 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts()
+            // Not a whole-wave section's steps: what leaves one is lowered
+            // as the HLSL wave operation the compiler expanded, over the
+            // host's wave, whatever its size; a step there the simulation
+            // does not follow leaves its values unknown, refused where used.
+            let sections: Vec<_> = (0..p.blocks.len())
+                .map(|b| super::wave::sections(p, b))
+                .collect();
+            let in_section = |b: usize, i: usize| {
+                sections[b]
+                    .iter()
+                    .any(|(&start, sec)| start < i && i < sec.end)
+            };
+            let outside = || {
+                p.blocks.iter().enumerate().flat_map(move |(b, block)| {
+                    block
+                        .insts
+                        .iter()
+                        .enumerate()
+                        .filter(move |&(i, _)| !in_section(b, i))
+                        .map(move |(i, inst)| (b, i, inst))
+                })
+            };
+            console_lanes = outside()
+                .map(|(_, _, i)| i)
                 .filter(|i| !i.writes.iter().any(|w| mask_spills.contains(&w.1)))
                 .any(|i| {
                     let n = i.name();
@@ -663,14 +686,10 @@ impl<'a> Lower<'a> {
                         LaneExit::Branch { when, .. } => Some(when),
                         _ => None,
                     });
-                    let mut all: Vec<Bool> =
-                        x.st.guards
-                            .iter()
-                            .flatten()
-                            .flatten()
-                            .copied()
-                            .chain(whens)
-                            .collect();
+                    let mut all: Vec<Bool> = outside()
+                        .filter_map(|(b, i, _)| x.st.guards[b][i])
+                        .chain(whens)
+                        .collect();
                     all.sort_unstable();
                     all.dedup();
                     all.into_iter().any(|g| {
