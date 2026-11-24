@@ -279,7 +279,11 @@ impl HostHeap {
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
-            *slot = resource;
+            // A running submission may still read the old resource through
+            // this slot.
+            if let Some(old) = std::mem::replace(slot, resource) {
+                crate::host::retire(old);
+            }
         }
     }
 
