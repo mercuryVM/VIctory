@@ -1361,3 +1361,49 @@ fn nested_exec_masks_keep_shared_visibility_results_across_halves() {
         }
     }
 }
+
+/// The exit mask of a loop its lanes leave at different iterations, counted
+/// after the loop: all 64 lanes are in it. Per lane, each lane counted what
+/// its own path saw (1 on a host with 64-lane waves). Fixture from the
+/// scalar-state patch posted on upstream PR #439, after PR #269's.
+#[test]
+fn loop_exit_mask_counted_after_the_loop() {
+    let body = [
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+        0xBE8A_0480, // s_mov_b64 s[10:11], 0
+        0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1 (v1 - 1)
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+        0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+        0xBF89_FFFB, // s_cbranch_execnz loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xBE89_100A, // s_bcnt1_i32_b64 s9, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("loop_exit_mask_counted_after_the_loop", &body, 64, |_| 64);
+}
+
+/// A mask grown inside a branch only lanes 32-63 take and counted after it:
+/// lanes 0-15 and 32-47. Per lane the program stopped (`a lane mask holding
+/// lanes elsewhere read as data`). Same source as the test above.
+#[test]
+fn mask_grown_inside_a_branch_counted_after_it() {
+    let body = [
+        0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0      (lanes 0-15)
+        0xBE8A_046A, // s_mov_b64 s[10:11], vcc
+        0x7D86_00A0, // v_cmp_le_u32 vcc, 32, v0      (lanes 32-63)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002, // s_cbranch_execz -> join
+        0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0      (of those: 32-47)
+        0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+        0x88FE_0C7E, // join: s_or_b64 exec, exec, s[12:13]
+        0xBE89_100A, // s_bcnt1_i32_b64 s9, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case(
+        "mask_grown_inside_a_branch_counted_after_it",
+        &body,
+        64,
+        |_| 32,
+    );
+}
