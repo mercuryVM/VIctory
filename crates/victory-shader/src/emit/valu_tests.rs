@@ -887,6 +887,49 @@ fn v_cvt_u16_and_i16_f16_saturate() {
 }
 
 #[test]
+fn v_align_bfi_bfm_and_bcnt_match_rdna2() {
+    // v0 = op(v1, v2, v3) in VOP3. alignbit/alignbyte give the low dword of
+    // {v1, v2} >> shift; bfi merges by the mask in v1; bfm builds a field mask;
+    // bcnt adds the set bits of v1 to v2.
+    type Pick = fn(u32, u32, u32) -> u32;
+    let ops: [(&str, u16, Pick); 5] = [
+        ("v_alignbit_b32", 0x14E, |a, b, c| {
+            (((u64::from(a) << 32) | u64::from(b)) >> (c & 31)) as u32
+        }),
+        ("v_alignbyte_b32", 0x14F, |a, b, c| {
+            (((u64::from(a) << 32) | u64::from(b)) >> ((c & 3) * 8)) as u32
+        }),
+        ("v_bfi_b32", 0x14A, |m, a, b| (m & a) | (!m & b)),
+        ("v_bfm_b32", 0x363, |a, b, _| {
+            (1u32 << (a & 31)).wrapping_sub(1) << (b & 31)
+        }),
+        ("v_bcnt_u32_b32", 0x364, |a, b, _| {
+            a.count_ones().wrapping_add(b)
+        }),
+    ];
+    let values = [0u32, 1, 5, 31, 0x8000_0001, 0xFFFF_FFFF];
+    let mut cases = Vec::new();
+    for a in values {
+        for b in values {
+            for c in values {
+                cases.push([a, b, c, 0]);
+            }
+        }
+    }
+    for (name, op, pick) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = pick(inp[0], inp[1], inp[2]);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1], inp[2],
+            );
+        });
+    }
+}
+
+#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
