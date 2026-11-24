@@ -72,7 +72,7 @@ the files in its cache.
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
+cargo test --workspace -- --test-threads=1 # serializes D3D12 tests; no game data
 cargo run -p victory -- config           # check your paths
 ```
 
