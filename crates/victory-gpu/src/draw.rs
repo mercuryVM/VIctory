@@ -328,6 +328,16 @@ impl State {
         }
     }
 
+    /// Table `slot` starts at a title slot the host heap does not have.
+    fn past_host_heap(&self, compute: bool, slot: u8) -> bool {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return false;
+        };
+        self.heap_of(table)
+            .and_then(|heap| Some((heap.host()?, heap.index(table)?)))
+            .is_some_and(|(host, index)| index >= host.count())
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -356,7 +366,9 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
-        self.bind(list, p, false);
+        if !self.bind(list, p, false) {
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -415,7 +427,7 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -467,6 +479,19 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
+                        // The title's slots past a capped host heap have no
+                        // host slot: a shader given that offset reads past
+                        // the heap's end (garbage descriptors on NVIDIA; the
+                        // device hangs, #71).
+                        None if u.root == RootType::Table
+                            && self.past_host_heap(compute, u.slot) =>
+                        {
+                            once!(
+                                slot = u.slot,
+                                "a draw or dispatch dropped: its table lies past the host heap"
+                            );
+                            return false;
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -501,6 +526,7 @@ impl State {
                 }
             }
         }
+        true
     }
 
     /// Runs a dispatch on the host.
@@ -525,7 +551,9 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        self.bind(list, p, true);
+        if !self.bind(list, p, true) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -1023,10 +1051,7 @@ impl State {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => {
-                    self.bind(list, p, true);
-                    true
-                }
+                Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
             _ => false,
