@@ -194,9 +194,6 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let Some(&number) = committed.last() else {
         return Ok(None);
     };
-    for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
-    }
     let version = dir.join(format!("v{number}"));
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
     // The version directory exists, so a missing or unreadable manifest is a
@@ -206,6 +203,9 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut names = parse_manifest(&manifest).ok_or_else(bad)?;
     let blobs = names.split_off(2);
     let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
+    for old in &committed[..committed.len() - 1] {
+        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+    }
     Ok(Some(Version {
         dir: version,
         number,
@@ -1025,6 +1025,28 @@ mod tests {
         let blobs = read(&c, None).unwrap();
         let text = |(n, d): (String, Vec<u8>)| (n, String::from_utf8(d).unwrap());
         Some((display, blobs.into_iter().map(text).collect()))
+    }
+
+    #[test]
+    fn unreadable_latest_manifest_preserves_previous_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("v1");
+        let latest = dir.path().join("v2");
+        std::fs::create_dir(&older).unwrap();
+        std::fs::create_dir(&latest).unwrap();
+        std::fs::write(older.join(MANIFEST), manifest("Slot", "Previous", &[])).unwrap();
+
+        assert!(current(dir.path()).is_err());
+        assert!(older.join(MANIFEST).is_file());
+
+        std::fs::write(latest.join(MANIFEST), []).unwrap();
+        assert!(current(dir.path()).is_err());
+        assert!(older.join(MANIFEST).is_file());
+
+        std::fs::write(latest.join(MANIFEST), manifest("Slot", "Latest", &[])).unwrap();
+        let loaded = current(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.number, 2);
+        assert!(!older.exists());
     }
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {
