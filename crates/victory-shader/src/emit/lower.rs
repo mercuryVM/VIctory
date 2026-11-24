@@ -678,6 +678,8 @@ impl<'a> Lower<'a> {
                             .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                     })
                 };
+            // So does an address read from the first lane.
+            console_lanes |= x.res.scalar.iter().any(|(_, a)| a.first_lane.is_some());
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
@@ -889,10 +891,11 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
         };
+        // (First: a first-lane term may end the block.)
+        let term = self.address_term(&a)?;
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        if let Some(d) = term {
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
         let h = if a.param == CODE {
@@ -3806,10 +3809,11 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar load from the code"),
         };
+        // (First: a first-lane term may end the block.)
+        let term = self.address_term(&a)?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        if let Some(d) = term {
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
         for k in 0..count {
@@ -3969,15 +3973,71 @@ impl<'a> Lower<'a> {
         Ok(out)
     }
 
+    /// The computed term of `a`'s offset: each lane's own, or for a
+    /// first-lane address ([`Address::first_lane`]) the first active lane's
+    /// at its `v_readfirstlane_b32`, in every lane.
+    fn address_term(&mut self, a: &Address) -> Result<Option<V>, Why> {
+        let Some(d) = a.dynamic else {
+            return Ok(None);
+        };
+        let d = self.i32_of(d)?;
+        let Some(read) = a.first_lane else {
+            return Ok(Some(d));
+        };
+        let (b, i) = self
+            .x
+            .p
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(b, block)| {
+                let i = block
+                    .insts
+                    .iter()
+                    .position(|i| i.writes.iter().any(|w| w.1 == read))?;
+                Some((b, i))
+            })
+            .ok_or("a first-lane address")?;
+        let guard = self.guard(b, i)?;
+        self.s.flags |= flags::WAVE_OPS;
+        // Guarded code runs in every lane; the first lane the guard holds in
+        // reads the term, and the others take it from there (the largest of
+        // that one and zeros).
+        let at = self.begin_guarded(guard);
+        let i32t = self.s.t.i32;
+        let first = self.s.op(
+            self.cur,
+            "waveReadLaneFirst.i32",
+            Attr::NoUnwind,
+            i32t,
+            118,
+            &[d],
+        );
+        if at.is_none() {
+            return Ok(Some(first));
+        }
+        let zero = self.s.m.i32(0);
+        let r = self.end_guarded(at, &[(first, zero)])[0];
+        let (k, u) = (self.s.m.i8(3), self.s.m.i8(1));
+        Ok(Some(self.s.op(
+            self.cur,
+            "waveActiveOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            119,
+            &[r, k, u],
+        )))
+    }
+
     /// The byte offset a buffer descriptor built around a root descriptor adds
     /// (constant and computed parts); none for other descriptors.
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
         match src {
             Source::Built { address, .. } => {
-                let x = match address.dynamic {
-                    Some(v) => Some(self.i32_of(v)?),
-                    None => None,
-                };
+                if address.first_lane.is_some() {
+                    return Err("a descriptor built around a first-lane address");
+                }
+                let x = self.address_term(address)?;
                 Ok((address.offset, x))
             }
             _ => Ok((0, None)),
