@@ -48,6 +48,25 @@ fn program(after: bool) -> Vec<u32> {
     w
 }
 
+/// [`program`]'s mask read as data by a lane-local step inside a whole-wave
+/// section (`s_or_saveexec_b32 s20, -1` ... `s_mov_b32 exec_lo, s20`)
+/// within the `if`: EXEC there is every lane, but only lanes 0 to 15 run
+/// the section on the host, so lanes 24 to 31's bits are not seen.
+fn in_section() -> Vec<u32> {
+    let mut w = program(false);
+    // Replace the read inside the `if` by a section around it.
+    let read = w.iter().position(|&x| x == 0x7E04_0203).expect("the read");
+    w.splice(
+        read..=read,
+        [
+            0xBE94_3DC1, // s_or_saveexec_b32 s20, -1
+            0x4A04_0003, // v_add_nc_u32 v2, s3, v0 (lane-local)
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+        ],
+    );
+    w
+}
+
 /// The mask the program builds.
 const MASK: u32 = 0x5555 | 0xFF00_0000;
 
@@ -220,5 +239,18 @@ fn a_constant_exec_half_reads_as_its_constant() {
             .map(|l| if l < 16 { 0 } else { 0xFFFF_0000 + l })
             .collect();
         assert_eq!(words[0], want, "{label}");
+    }
+}
+
+/// Inside a whole-wave section only the lanes active on entry run on the
+/// host, whatever EXEC says: the mask is still refused there.
+#[test]
+fn a_mask_holding_lanes_elsewhere_is_refused_inside_a_whole_wave_section() {
+    match lower_cs(&in_section()) {
+        Ok(_) => panic!("lowered a mask read inside a section where some of its lanes do not run"),
+        Err(e) => assert!(
+            format!("{e:?}").contains("a lane mask holding lanes elsewhere read as data"),
+            "{e:?}"
+        ),
     }
 }

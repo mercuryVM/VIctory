@@ -1650,7 +1650,17 @@ impl<'a> Lower<'a> {
     /// formula, where known: the last EXEC the block writes or reads before
     /// it, else the one an instruction from `i` on reads before any write,
     /// else the block's EXEC phi (or EXEC on entry).
+    ///
+    /// None strictly inside a whole-wave section: its EXEC is every lane,
+    /// but only the lanes active on entry run its block on the host.
     fn exec_at(&self, b: usize, i: usize) -> Option<Bool> {
+        let inside = self
+            .sections
+            .get(&b)
+            .is_some_and(|s| s.iter().any(|(&start, sec)| start < i && i < sec.end));
+        if inside {
+            return None;
+        }
         let block = &self.x.p.blocks[b];
         let exec = Reg::S(EXEC);
         let mut v = None;
