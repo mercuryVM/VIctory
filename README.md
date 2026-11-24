@@ -147,6 +147,27 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
 
+### Reporting a GPU failure
+
+A host device removal, a hang, or a frame that comes out wrong is much easier
+to place with these next to it:
+
+* the adapter and the driver, as the title's own window sees them (GPU model,
+  the Adrenalin or GeForce version, and the Windows build number - a driver
+  update between two reports changes what is worth comparing);
+* whether `VICTORY_D3D12_WARP=1` reproduces it: a failure that survives the
+  software adapter is ours, one that does not points at the driver;
+* the last lines of `crashes.log`, which name the faulting code and the
+  commands in flight when `VICTORY_D3D12_DRED=1` was set;
+* the variables from the table above that were set for the run, and the build
+  profile (`diag` or release);
+* how long it took, and whether the display reset (a TDR) or the process
+  stopped.
+
+Nothing from the title's data belongs in the report: no shader dumps, no
+frames, no memory, per [docs/asset-policy.md](docs/asset-policy.md). Names of
+our own functions, error codes and timings are enough to start.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
