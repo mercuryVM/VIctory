@@ -1621,7 +1621,15 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        let (threads, hash) = crate::pipeline::group_of(self.pipeline as This);
+        let tag = crate::indirect::tag(&hash);
+        if !crate::indirect::bound(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            (kind, stride, max),
+            (threads, tag),
+        ) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }

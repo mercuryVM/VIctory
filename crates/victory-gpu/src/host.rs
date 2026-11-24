@@ -1921,7 +1921,8 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                // The budget, then the log of reduced records (`crate::indirect`).
+                let (b, d) = host()?.shared_buffer(1024)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -1929,10 +1930,15 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+            // SAFETY: the list's own mapped words, read (what its last run
+            // logged) and zeroed before it runs.
+            deferred.copies.push(Step::Host(Box::new(move || unsafe {
+                let words = std::slice::from_raw_parts(at as *const u32, 256);
+                let read: Vec<u32> = words.iter().map(|w| std::ptr::read_volatile(w)).collect();
+                crate::indirect::take_log(&read);
+                (at as *mut u32).write_volatile(0);
+                (at as *mut u32).add(1).write_volatile(0);
+            })));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
