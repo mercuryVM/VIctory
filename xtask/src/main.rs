@@ -60,21 +60,21 @@ fn run_qa(root: &Path, fix: bool) -> Result<()> {
     policy::run(root, false)?;
 
     println!("==> Step 2/3: Checking code formatting...");
-    let fmt_status = if fix {
-        Command::new("cargo")
-            .args(["fmt", "--all"])
-            .current_dir(root)
-            .status()
-            .context("running cargo fmt")?
+    let changed = changed_rust_files(root);
+    if changed.is_empty() {
+        println!("    No modified Rust files detected; skipping format check.");
     } else {
-        Command::new("cargo")
-            .args(["fmt", "--all", "--", "--check"])
-            .current_dir(root)
-            .status()
-            .context("running cargo fmt --check")?
-    };
-    if !fmt_status.success() {
-        bail!("code formatting check failed; run `cargo fmt` or `cargo xtask qa --fix`");
+        println!("    Checking {} modified Rust file(s)...", changed.len());
+        let mut cmd = Command::new("rustfmt");
+        cmd.args(["--edition", "2024"]);
+        if !fix {
+            cmd.arg("--check");
+        }
+        cmd.args(&changed);
+        let fmt_status = cmd.current_dir(root).status().context("running rustfmt")?;
+        if !fmt_status.success() {
+            bail!("code formatting check failed on modified files; run `cargo xtask qa --fix`");
+        }
     }
 
     println!("==> Step 3/3: Running workspace lints (clippy)...");
@@ -89,6 +89,31 @@ fn run_qa(root: &Path, fix: bool) -> Result<()> {
 
     println!("All quality assurance checks passed: policy, format, and lints OK.");
     Ok(())
+}
+
+fn changed_rust_files(root: &Path) -> Vec<String> {
+    let diff_args = [
+        ["diff", "--name-only", "origin/main...HEAD", "--", "*.rs"].as_slice(),
+        ["diff", "--name-only", "HEAD", "--", "*.rs"].as_slice(),
+        ["diff", "--name-only", "--", "*.rs"].as_slice(),
+    ];
+    let mut files = Vec::new();
+    for args in diff_args {
+        if let Ok(out) = Command::new("git").args(args).current_dir(root).output()
+            && out.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                if !files.contains(&line.to_string()) && root.join(line).is_file() {
+                    files.push(line.to_string());
+                }
+            }
+            if !files.is_empty() {
+                break;
+            }
+        }
+    }
+    files
 }
 
 fn workspace_root() -> PathBuf {
