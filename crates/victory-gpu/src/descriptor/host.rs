@@ -131,6 +131,7 @@ impl HostHeap {
         let started = std::time::Instant::now();
         if let Err(e) = h.fill_null(kind, count + extra) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
+            return None;
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         Some(h)
@@ -139,14 +140,18 @@ impl HostHeap {
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
     /// doubled by copies to a block, the block copied over the heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
-        const BLOCK: u32 = 1 << 16;
         let Some(host) = host() else { return Ok(()) };
+        let block_count = total.min(if self.sampler {
+            D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE
+        } else {
+            1 << 16
+        });
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
             let block: ID3D12DescriptorHeap =
                 host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
-                    NumDescriptors: BLOCK,
+                    NumDescriptors: block_count,
                     ..Default::default()
                 })?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
@@ -159,14 +164,14 @@ impl HostHeap {
                 null_view(start);
             }
             let mut filled = 1;
-            while filled < BLOCK {
-                let n = filled.min(BLOCK - filled);
+            while filled < block_count {
+                let n = filled.min(block_count - filled);
                 host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
                 filled += n;
             }
             let mut done = 0;
             while done < total {
-                let n = BLOCK.min(total - done);
+                let n = block_count.min(total - done);
                 host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                 done += n;
             }
@@ -881,6 +886,24 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CPU-side block used to initialize null samplers must fit the
+    /// same portable sampler limit as the shader-visible heap.
+    #[test]
+    fn portable_sampler_null_fill_fits_the_host_limit() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let heap = HostHeap::new(true, D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE)
+            .expect("portable sampler heap must initialize");
+        assert!(
+            heap.fill_null(
+                D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE,
+            )
+            .is_ok()
+        );
+    }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
