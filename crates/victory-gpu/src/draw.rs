@@ -1065,6 +1065,19 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        // A call with no host pipeline cannot run, and that is the common
+        // case while the world builds its pipelines: #400 measures 1 400-1 750
+        // indirect calls a frame dropped this way. Drop it here, before the
+        // argument refresh and the clamp dispatch, which would otherwise copy
+        // the arguments and dispatch a compute shader for records nothing
+        // reads. Same order as the `is_skipped` check above, for the same
+        // reason.
+        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            why("no host pipeline");
+            return false;
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
