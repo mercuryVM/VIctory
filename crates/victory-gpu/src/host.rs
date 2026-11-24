@@ -48,6 +48,9 @@ pub(crate) struct Host {
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
     next_dsv: AtomicU32,
+    /// The DXGI adapter the device is on, for the video memory report; `None`
+    /// if it could not be found (only the report is lost).
+    adapter: Option<IDXGIAdapter3>,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
@@ -236,6 +239,7 @@ fn create() -> anyhow::Result<Host> {
             device = Some(chosen);
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let adapter = host_adapter(&device);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -271,6 +275,7 @@ fn create() -> anyhow::Result<Host> {
             dsvs,
             dsv_size,
             next_dsv: AtomicU32::new(0),
+            adapter,
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
@@ -297,6 +302,72 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
             ));
         }
         Ok(adapter)
+    }
+}
+
+/// The DXGI adapter `device` is on, logged once; `None` if any step fails.
+fn host_adapter(device: &ID3D12Device) -> Option<IDXGIAdapter3> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(device.GetAdapterLuid()).ok()?;
+        let desc = adapter.GetDesc1().ok()?;
+        let len = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
+        tracing::info!(
+            name = %String::from_utf16_lossy(&desc.Description[..len]),
+            dedicated_mb = mib(desc.DedicatedVideoMemory as u64),
+            "host adapter"
+        );
+        Some(adapter)
+    }
+}
+
+/// Bytes as whole MiB, the unit of the video memory log lines.
+fn mib(bytes: u64) -> u64 {
+    bytes >> 20
+}
+
+/// Whether the process uses more local video memory than Windows budgets for
+/// it. A budget of zero means none was reported.
+fn over_budget(usage: u64, budget: u64) -> bool {
+    budget > 0 && usage > budget
+}
+
+impl Host {
+    /// Logs the adapter's video memory use against its budget; the first time
+    /// the use is over the budget, warns once. Silent if a query fails.
+    fn log_video_memory(&self) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let Some(adapter) = &self.adapter else { return };
+        let query = |group| {
+            let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            // SAFETY: `info` is a valid out-parameter for the call.
+            unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.map(|()| info)
+        };
+        let (Ok(local), Ok(non_local)) = (
+            query(DXGI_MEMORY_SEGMENT_GROUP_LOCAL),
+            query(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL),
+        ) else {
+            return;
+        };
+        let (used, budget) = (mib(local.CurrentUsage), mib(local.Budget));
+        tracing::info!(
+            "video memory: {used} MB of a {budget} MB budget on the adapter, {} MB in system \
+             memory",
+            mib(non_local.CurrentUsage)
+        );
+        if over_budget(local.CurrentUsage, local.Budget) && !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                used_mb = used,
+                budget_mb = budget,
+                "over the host's video-memory budget: Windows moves what does not fit to \
+                 system memory, which slows every frame"
+            );
+        }
     }
 }
 
@@ -361,6 +432,15 @@ mod tests {
         assert!(text.contains("command 162 (op 6): dispatch 80"), "{text}");
         assert!(text.contains("command 160 (op 6): dispatch 79"), "{text}");
         assert!(!text.contains("dispatch 0;"), "{text}");
+    }
+
+    #[test]
+    fn video_memory_units_and_budget() {
+        assert_eq!(mib(0), 0);
+        assert_eq!(mib((6 << 30) + 12345), 6144);
+        assert!(!over_budget(5 << 30, 5 << 30));
+        assert!(over_budget((5 << 30) + 1, 5 << 30));
+        assert!(!over_budget(1 << 30, 0));
     }
 
     #[test]
@@ -2016,6 +2096,9 @@ impl Meter {
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
+            if let Some(host) = host() {
+                host.log_video_memory();
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
