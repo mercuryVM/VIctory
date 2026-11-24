@@ -74,7 +74,7 @@ fn load_shader(format: u8) -> HostShader {
     let io = io::raise(&p, &native).unwrap();
     let bytes = crate::dxbc::build(&[]);
     let container = Container::parse(&bytes).unwrap();
-    emit(&container, &native, &p, &st, &io, &res).unwrap()
+    emit(&container, &native, &p, &st, &io, &res, super::Target::ANY).unwrap()
 }
 
 #[test]
