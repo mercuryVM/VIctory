@@ -157,6 +157,22 @@ pub struct HostShader {
 }
 
 impl HostShader {
+    /// Whether the DXIL requires direct indexing of the resource and sampler
+    /// heaps, in that order. Static samplers need no indexed sampler heap.
+    pub fn directly_indexed_heaps(&self) -> (bool, bool) {
+        let features = Container::parse(&self.dxil)
+            .ok()
+            .and_then(|c| {
+                let part = c.part(FourCC::SFI0)?;
+                crate::dxbc::u64_at(part.data, 0).ok()
+            })
+            .unwrap_or(0);
+        (
+            features & shader::flags::FEATURE_RESOURCE_HEAP != 0,
+            features & shader::flags::FEATURE_SAMPLER_HEAP != 0,
+        )
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {
@@ -392,6 +408,29 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_heap_requirements_are_independent() {
+        let mut shader = super::HostShader {
+            stage: crate::HwStage::Cs,
+            dxil: super::container::build(&[]),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        };
+        assert_eq!(shader.directly_indexed_heaps(), (false, false));
+        for (features, expected) in [
+            (0u64, (false, false)),
+            (0x0200_0000, (true, false)),
+            (0x0400_0000, (false, true)),
+            (0x0600_0000, (true, true)),
+        ] {
+            shader.dxil = super::container::build(&[(b"SFI0", &features.to_le_bytes())]);
+            assert_eq!(shader.directly_indexed_heaps(), expected);
+        }
+    }
+
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;

@@ -332,8 +332,20 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        let mut flags = if compute.is_some() {
+            D3D12_ROOT_SIGNATURE_FLAG_NONE
+        } else {
+            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+        };
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
+            let (resource_heap, sampler_heap) = t.directly_indexed_heaps();
+            if resource_heap {
+                flags |= D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+            }
+            if sampler_heap {
+                flags |= D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+            }
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
@@ -401,7 +413,7 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, flags) {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
@@ -623,13 +635,8 @@ fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
-    compute: bool,
+    flags: D3D12_ROOT_SIGNATURE_FLAGS,
 ) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
-    let input = if compute {
-        D3D12_ROOT_SIGNATURE_FLAG_NONE
-    } else {
-        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
-    };
     let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
@@ -638,9 +645,7 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: flags,
             },
         },
     };
@@ -663,5 +668,50 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod tests {
+    use super::*;
+    use windows::core::Interface;
+
+    #[test]
+    fn resource_heap_root_can_bind_without_sampler_heap() {
+        let Some(host) = crate::host::host() else { return };
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+            host.device
+                .cast::<ID3D12InfoQueue>()
+                .expect("D3D12 debug queue");
+        }
+        let (root, _) = root_signature(
+            &host.device,
+            &[],
+            &[],
+            D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
+        )
+        .unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: the descriptor and returned heap are valid. No shader
+        // executes, so no descriptor needs initialization.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap()
+        };
+        // SAFETY: both bindings live through submission.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None);
     }
 }

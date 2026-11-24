@@ -22,6 +22,8 @@ pub(crate) mod flags {
     pub const INT64: u64 = 1 << 20;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    pub const FEATURE_RESOURCE_HEAP: u64 = 0x0200_0000;
+    pub const FEATURE_SAMPLER_HEAP: u64 = 0x0400_0000;
 }
 
 pub(crate) struct Types {
@@ -563,10 +565,10 @@ impl Shader {
             features |= 0x8000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
-            features |= 0x200_0000;
+            features |= flags::FEATURE_RESOURCE_HEAP;
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
-            features |= 0x400_0000;
+            features |= flags::FEATURE_SAMPLER_HEAP;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);
