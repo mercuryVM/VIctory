@@ -987,6 +987,10 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32F texture SRV with mip levels (width, height, levels,
+    /// texels of level 0, then of level 1, ...: each level half the size,
+    /// at least 1).
+    Levels(u32, u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
@@ -1163,49 +1167,56 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
-                        let (w, h, texels, faces) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1),
-                            View::Cube(n, t) => (n, n, t, 6),
+                    View::Texture(..) | View::Cube(..) | View::Levels(..) => {
+                        let (w, h, texels, faces, levels) = match *v {
+                            View::Texture(w, h, t) => (w, h, t, 1, 1),
+                            View::Cube(n, t) => (n, n, t, 6, 1),
+                            View::Levels(w, h, l, t) => (w, h, t, 1, l),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
+                        desc.MipLevels = levels as u16;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        let pitch = (w as usize * 16).next_multiple_of(256);
+                        // Faces, each with its levels, in subresource order.
+                        let mut texels = texels;
                         for face in 0..faces as usize {
-                            let upload = make(
-                                D3D12_HEAP_TYPE_UPLOAD,
-                                &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
-                                D3D12_RESOURCE_STATE_GENERIC_READ,
-                            )?;
-                            let mut p = std::ptr::null_mut();
-                            upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let texels = &texels[face * (w * h) as usize..];
-                            for y in 0..h as usize {
-                                let row = &texels[y * w as usize..(y + 1) * w as usize];
-                                std::ptr::copy_nonoverlapping(
-                                    row.as_ptr().cast::<u8>(),
-                                    p.cast::<u8>().add(y * pitch),
-                                    row.len() * 16,
+                            for level in 0..levels {
+                                let (lw, lh) = ((w >> level).max(1), (h >> level).max(1));
+                                let pitch = (lw as usize * 16).next_multiple_of(256);
+                                let upload = make(
+                                    D3D12_HEAP_TYPE_UPLOAD,
+                                    &buffer((pitch * lh as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                                )?;
+                                let mut p = std::ptr::null_mut();
+                                upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                                for y in 0..lh as usize {
+                                    let row = &texels[y * lw as usize..(y + 1) * lw as usize];
+                                    std::ptr::copy_nonoverlapping(
+                                        row.as_ptr().cast::<u8>(),
+                                        p.cast::<u8>().add(y * pitch),
+                                        row.len() * 16,
+                                    );
+                                }
+                                texels = &texels[(lw * lh) as usize..];
+                                upload.Unmap(0, None);
+                                let mut dst = subresource(&tex);
+                                dst.Anonymous.SubresourceIndex = face as u32 * levels + level;
+                                list.CopyTextureRegion(
+                                    &dst,
+                                    0,
+                                    0,
+                                    0,
+                                    &footprint(&upload, lw, lh),
+                                    None,
                                 );
+                                keep.push(upload);
                             }
-                            upload.Unmap(0, None);
-                            let mut at_face = subresource(&tex);
-                            at_face.Anonymous.SubresourceIndex = face as u32;
-                            list.CopyTextureRegion(
-                                &at_face,
-                                0,
-                                0,
-                                0,
-                                &footprint(&upload, w, h),
-                                None,
-                            );
-                            keep.push(upload);
                         }
                         list.ResourceBarrier(&[transition(
                             &tex,
