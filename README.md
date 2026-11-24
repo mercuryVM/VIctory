@@ -73,6 +73,13 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
+Host pipelines are compiled on their first draw and kept in the cache
+folder, so later runs load them instead. To compile every pipeline the
+title creates, drawn or not, run once with `VICTORY_PREBUILD=all` and let
+it load: they are built in the background, behind the draws, and kept for
+the runs after it. That run uses more CPU, and the pipeline cache grows to
+several GB.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 

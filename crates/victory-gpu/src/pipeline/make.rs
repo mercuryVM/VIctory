@@ -15,7 +15,16 @@
 //! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
+//!
+//! Built ahead (`VICTORY_PREBUILD=all`): every pipeline the title creates
+//! is also queued at creation, behind all first uses, and its host
+//! pipeline is made only to be stored in the pipeline library, then let go
+//! (the title creates some 60,000; holding them all would hold their
+//! driver memory). A later first use loads it from the library instead of
+//! compiling it. One run through loading fills the library for the runs
+//! after it.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -28,6 +37,8 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
+    /// Queued to be built ahead (`VICTORY_PREBUILD=all`).
+    ahead: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
@@ -48,11 +59,18 @@ impl Pending {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        key.update(
+            graphics
+                .as_ref()
+                .map(|g| g.describe())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         Pending {
             shaders,
             graphics,
             queued: AtomicBool::new(false),
+            ahead: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -66,7 +84,33 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+
+    /// Makes the host pipeline for the library only, unless a first use
+    /// has made or queued it meanwhile.
+    fn build_ahead(&self) {
+        if self.made.get().is_none() && !self.queued.load(Ordering::Relaxed) {
+            drop(HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+            BUILT_AHEAD.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
+
+/// Whether every pipeline the title creates is built ahead
+/// (`VICTORY_PREBUILD=all`).
+fn prebuild_all() -> bool {
+    static ALL: OnceLock<bool> = OnceLock::new();
+    *ALL.get_or_init(|| {
+        let all = std::env::var("VICTORY_PREBUILD").is_ok_and(|v| v.trim() == "all");
+        if all {
+            tracing::info!("every pipeline the title creates is built ahead");
+        }
+        all
+    })
+}
+
+/// Pipelines built ahead, and those queued to be and not built yet.
+pub(crate) static BUILT_AHEAD: AtomicU64 = AtomicU64::new(0);
+static AHEAD_WAITING: AtomicU64 = AtomicU64::new(0);
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
 /// not translate, else "refused" or "being made"; `None` if it has one.
@@ -122,17 +166,27 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Queues `p` for the workers, once.
 fn start(p: &Arc<Pending>) {
     if !p.queued.swap(true, Ordering::Relaxed) {
-        PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        PEAK.fetch_max(
+            WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+            Ordering::Relaxed,
+        );
         queue(p.clone());
     }
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// run drew with it (during loading, so the world's first frames find it),
+/// else queues it to be built ahead if every pipeline is.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.shaders.is_empty() {
+        return;
+    }
+    if super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p);
+    } else if prebuild_all() && !p.ahead.swap(true, Ordering::Relaxed) {
+        AHEAD_WAITING.fetch_add(1, Ordering::Relaxed);
+        work().push(Job::Ahead(p.clone()));
     }
 }
 
@@ -152,24 +206,71 @@ fn wait(p: &Pending, frame: u64) {
         if rest.is_zero() {
             break;
         }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
-fn queue(p: Arc<Pending>) {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
-    let sender = SENDER.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let receiver = Arc::new(Mutex::new(receiver));
+/// What the workers do: make a pipeline for its first use, or build one
+/// ahead for the library.
+enum Job {
+    First(Arc<Pending>),
+    Ahead(Arc<Pending>),
+}
+
+/// The workers' queues: first uses before pipelines built ahead.
+struct Queues<T> {
+    first: VecDeque<T>,
+    ahead: VecDeque<T>,
+}
+
+impl<T> Queues<T> {
+    const fn new() -> Self {
+        Queues {
+            first: VecDeque::new(),
+            ahead: VecDeque::new(),
+        }
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.first.pop_front().or_else(|| self.ahead.pop_front())
+    }
+}
+
+/// The workers' queues and the signal that work came in.
+struct Work {
+    queues: Mutex<Queues<Job>>,
+    ready: Condvar,
+}
+
+impl Work {
+    fn push(&self, job: Job) {
+        let mut q = self.queues.lock().unwrap_or_else(|e| e.into_inner());
+        match job {
+            Job::First(_) => q.first.push_back(job),
+            Job::Ahead(_) => q.ahead.push_back(job),
+        }
+        self.ready.notify_one();
+    }
+}
+
+/// The work queues, with the workers (half the logical processors, 2 to
+/// 8) started on first use.
+fn work() -> &'static Work {
+    static WORK: Work = Work {
+        queues: Mutex::new(Queues::new()),
+        ready: Condvar::new(),
+    };
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
-            let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
+                .spawn(|| {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -177,27 +278,55 @@ fn queue(p: Arc<Pending>) {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(p) = next else { return };
-                        p.make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
+                        let job = {
+                            let mut q = WORK.queues.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if let Some(job) = q.pop() {
+                                    break job;
+                                }
+                                q = WORK.ready.wait(q).unwrap_or_else(|e| e.into_inner());
+                            }
+                        };
+                        run(job);
                     }
                 });
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
             }
         }
-        sender
     });
-    if let Err(e) = sender.send(p) {
-        // No worker: made here instead.
-        e.0.make();
-        WAITING.fetch_sub(1, Ordering::Relaxed);
+    &WORK
+}
+
+/// Runs one job on a worker.
+fn run(job: Job) {
+    match job {
+        Job::First(p) => {
+            p.make();
+            if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                drained();
+            } else {
+                super::library::save(false);
+            }
+        }
+        Job::Ahead(p) => {
+            p.build_ahead();
+            if AHEAD_WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                tracing::info!(
+                    built_ahead = BUILT_AHEAD.load(Ordering::Relaxed),
+                    "pipelines built ahead: every queued one is done"
+                );
+                super::library::save(true);
+            } else {
+                super::library::save(false);
+            }
+        }
     }
+}
+
+/// Hands `p` to the workers for its first use.
+fn queue(p: Arc<Pending>) {
+    work().push(Job::First(p));
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -221,6 +350,35 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Workers take every first use before any pipeline built ahead, each
+    /// queue in order.
+    #[test]
+    fn first_uses_go_before_pipelines_built_ahead() {
+        let mut q = Queues::new();
+        q.ahead.push_back("ahead 1");
+        q.ahead.push_back("ahead 2");
+        q.first.push_back("first 1");
+        assert_eq!(q.pop(), Some("first 1"));
+        q.first.push_back("first 2");
+        assert_eq!(q.pop(), Some("first 2"));
+        assert_eq!(q.pop(), Some("ahead 1"));
+        assert_eq!(q.pop(), Some("ahead 2"));
+        assert_eq!(q.pop(), None);
+    }
+
+    /// A pipeline built ahead is not kept: its first use still makes (or
+    /// loads) it; one already queued for a first use is not built ahead.
+    #[test]
+    fn building_ahead_keeps_nothing() {
+        let p = Pending::new(Vec::new(), None);
+        p.build_ahead();
+        assert!(p.made.get().is_none());
+        let before = BUILT_AHEAD.load(Ordering::Relaxed);
+        p.queued.store(true, Ordering::Relaxed);
+        p.build_ahead();
+        assert_eq!(BUILT_AHEAD.load(Ordering::Relaxed), before);
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
