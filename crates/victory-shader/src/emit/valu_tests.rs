@@ -832,3 +832,31 @@ fn tbuffer_store_format_refuses_what_it_does_not_convert() {
         }
     }
 }
+
+#[test]
+fn tbuffer_store_adds_scalar_and_vector_byte_offsets() {
+    // v1 = payload, v2 = vector byte offset, s2 = scalar byte offset,
+    // v4 = sentinel. Fill the window first so stray writes are observable.
+    let mut body = Vec::new();
+    for offset in (16..44).step_by(4) {
+        body.extend(buffer_store_dword(4, 8, offset));
+    }
+    body.push(vop1(0x001, 5, vgpr(2))); // v_mov_b32 v5, v2
+    let [opcode, operands] = mtbuf_store(4, 20, 1); // 32_UINT, immediate byte offset 16
+    body.extend([opcode | (1 << 12), (operands & 0x00ff_ffff) | (2 << 24)]); // offen, soffset = s2
+    let shader = build_valu_cs(&body);
+
+    let payload = 0x1357_9bdf;
+    let sentinel = 0xa5a5_a5a5;
+    for (vector, scalar) in [(0, 0), (4, 0), (0, 8), (4, 8), (12, 8)] {
+        let mut expected = [sentinel; 7];
+        expected[((vector + scalar) / 4) as usize] = payload;
+        for (backend, words) in run_dwords(&shader, [payload, vector, scalar, sentinel], 11) {
+            assert_eq!(
+                &words[4..],
+                &expected,
+                "{backend}: vector={vector} scalar={scalar}"
+            );
+        }
+    }
+}
