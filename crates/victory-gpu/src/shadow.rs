@@ -65,14 +65,26 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool (at most 8 kept, the largest).
+/// Bytes of idle snapshot memory kept besides the largest buffer.
+const POOL_BYTES: usize = 256 << 20;
+
+/// Returns a snapshot buffer to the pool: the largest is always kept (it is
+/// the one whose reuse saves millions of page faults), the others while
+/// they add up to `POOL_BYTES` (and at most 8 in all).
 fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
-    if pool.len() > 8 {
-        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        pool.truncate(8);
-    }
+    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let mut kept = 0usize;
+    let mut n = 0usize;
+    pool.retain(|v| {
+        n += 1;
+        if n == 1 {
+            return true;
+        }
+        kept += v.capacity();
+        n <= 8 && kept <= POOL_BYTES
+    });
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -167,16 +179,28 @@ impl Shadow {
             return;
         }
         // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
+        // The old buffer is grown in place: allocating a second one while it
+        // still holds the world's 174 MB heap doubles the peak on every growth.
+        let grown = match before.take() {
+            Some((at, mut bytes)) => {
+                let old_end = at + bytes.len();
+                // Exactly the growth: the amortized doubling of a Vec this
+                // big would double its capacity, and a copying realloc its peak.
+                bytes.reserve_exact(end - start - bytes.len());
+                if start < at {
+                    bytes.splice(0..0, host(start, at).iter().copied());
+                }
+                if end > old_end {
+                    bytes.extend_from_slice(host(old_end.max(at), end));
+                }
+                bytes
             }
-            None => grown.extend_from_slice(host(start, end)),
-        }
+            None => {
+                let mut grown = pooled(end - start);
+                grown.extend_from_slice(host(start, end));
+                grown
+            }
+        };
         *before = Some((start, grown));
     }
 

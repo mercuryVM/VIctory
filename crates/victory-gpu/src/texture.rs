@@ -48,14 +48,17 @@ pub(crate) struct Staging {
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
-    read: Vec<u8>,
 }
+
+/// Room to read a watched texture's memory into, shared by all textures (a
+/// buffer each would hold the sum of their sizes for good). Kept, already
+/// touched, so refreshing does not fault its pages in again.
+static SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -194,9 +197,10 @@ impl Staging {
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            let mut read = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+            read.resize(size, 0);
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            self.detile(&read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;

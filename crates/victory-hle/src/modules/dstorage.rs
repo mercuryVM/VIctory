@@ -618,11 +618,14 @@ impl Lane {
 /// destination, memory sources need none (as on the console).
 fn staging_bytes(request: &Request) -> u64 {
     let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
+    let source = if buffered && request.options & MEMORY_SOURCE == 0 {
         u64::from(request.source_size)
     } else {
         0
-    }
+    };
+    // zlib then BCPack inflates into a buffer of its own (`execute`)
+    let both = request.options & ZLIB != 0 && request.options & BCPACK != 0;
+    source + if both { u64::from(request.intermediate_size) } else { 0 }
 }
 
 /// Ends a queue: what was enqueued but not submitted is dropped, and this
