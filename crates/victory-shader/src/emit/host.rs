@@ -773,6 +773,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         stride_table: false,
         root_uavs: Vec::new(),
+        group_waves: 1,
     }
 }
 

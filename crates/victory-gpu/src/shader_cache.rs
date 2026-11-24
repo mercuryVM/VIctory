@@ -272,6 +272,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         out.extend(slots);
     }
     word(&mut out, u32::from(s.stride_table));
+    word(&mut out, s.group_waves);
     out
 }
 
@@ -330,6 +331,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let stride_table = r.word()? != 0;
+    let group_waves = r.word()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -340,6 +342,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         stride_table,
         root_uavs,
+        group_waves,
     })
 }
 
@@ -368,6 +371,7 @@ mod tests {
             root_srvs: vec![0, 3],
             stride_table: true,
             root_uavs: vec![1],
+            group_waves: 4,
         }
     }
 
