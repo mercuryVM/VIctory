@@ -83,6 +83,9 @@ mod diff_tests;
 mod gather_tests;
 #[cfg(all(test, windows))]
 mod first_lane_tests;
+mod halves;
+#[cfg(all(test, windows))]
+mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
