@@ -112,7 +112,7 @@ extern "system" fn release(this: This) -> u32 {
 
 /// Runs the lists' host lists and waits for them (decision 0007).
 extern "system" fn execute(_: This, count: u32, lists: *const This) {
-    if lists.is_null() {
+    if count == 0 || lists.is_null() {
         return;
     }
     #[cfg(windows)]

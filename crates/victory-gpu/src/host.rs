@@ -444,6 +444,27 @@ mod tests {
     }
 
     #[test]
+    fn only_nonempty_submissions_advance_the_host_fence() {
+        let Ok(host) = create() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        list.close();
+        host.execute(&[]);
+        // SAFETY: the test owns the host and its fence.
+        let after_empty = unsafe { host.fence.GetCompletedValue() };
+        host.execute(&[&list]);
+        // SAFETY: execution has returned and no one else uses this host.
+        let after_list = unsafe {
+            let completed = host.fence.GetCompletedValue();
+            windows::Win32::Foundation::CloseHandle(host.event).unwrap();
+            completed
+        };
+        assert_eq!(after_empty, 0);
+        assert_eq!(after_list, 1);
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -842,6 +863,9 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        if runs.is_empty() {
+            return;
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
