@@ -577,21 +577,7 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
-        // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
-                }
-            }
-        }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
+        for (shadow, address, len) in batch.gpu_writes {
             let written = shadow.copy_back(address, len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
@@ -1209,9 +1195,7 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
-                    shadow.writing(*address, *len);
+                    batch.gpu_write(shadow, *address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -1238,11 +1222,34 @@ impl HostList {
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    declared_writes: std::collections::HashSet<(usize, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 impl Batch {
+    fn new_gpu_write<T>(&mut self, shadow: &std::sync::Arc<T>, address: usize, len: usize) -> bool {
+        self.declared_writes
+            .insert((std::sync::Arc::as_ptr(shadow) as usize, address, len))
+    }
+
+    fn gpu_write(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        if self.new_gpu_write(shadow, address, len) {
+            // The first declaration needs the refreshed bytes for its snapshot.
+            // Another declaration of this exact range is already pending until
+            // the GPU submission finishes, so it needs no refresh boundary.
+            self.flush();
+            shadow.writing(address, len);
+            self.gpu_writes.push((shadow.clone(), address, len));
+        }
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         match self
@@ -1974,6 +1981,21 @@ fn pump() {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    #[test]
+    fn exact_gpu_writes_are_declared_once_per_submission() {
+        let mut batch = Batch::default();
+        let (a, b) = (Arc::new(0), Arc::new(0));
+        assert!(batch.new_gpu_write(&a, 4096, 16));
+        assert!(!batch.new_gpu_write(&a.clone(), 4096, 16));
+        assert!(batch.new_gpu_write(&a, 4096, 32));
+        assert!(batch.new_gpu_write(&a, 4104, 16));
+        assert!(batch.new_gpu_write(&b, 4096, 16));
+        // CPU copies can flush refreshes, but these GPU writes stay pending.
+        batch.title_written();
+        assert!(!batch.new_gpu_write(&a, 4096, 16));
+        assert!(Batch::default().new_gpu_write(&a, 4096, 16));
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
