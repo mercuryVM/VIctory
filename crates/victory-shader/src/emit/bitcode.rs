@@ -488,6 +488,180 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
+    /// Reachable blocks from entry (`0`) in reverse postorder, and a mask of
+    /// reachable block indices.
+    fn reachable_rpo(&self) -> (Vec<usize>, Vec<bool>) {
+        let mut seen = vec![false; self.blocks.len()];
+        if self.blocks.is_empty() {
+            return (Vec::new(), seen);
+        }
+        let mut post = Vec::with_capacity(self.blocks.len());
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            let (succs, len) = succs_of(self.blocks[b].term);
+            if k < len {
+                let s = succs[k];
+                if !seen[s] {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+            } else {
+                post.push(b);
+                stack.pop();
+            }
+        }
+        post.reverse();
+        (post, seen)
+    }
+
+    /// Whether `inst` has an observable side effect of its own even when
+    /// nothing reads its result.
+    fn is_root(&self, inst: &Inst) -> bool {
+        match &inst.op {
+            Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => true,
+            Op::Call(f, _) => {
+                let func = &self.funcs[*f as usize];
+                self.is_void(inst.ty)
+                    || match func.attr {
+                        None | Some(Attr::NoDuplicate) => true,
+                        Some(Attr::ReadNone | Attr::ReadOnly) => false,
+                        Some(Attr::NoUnwind) => func.name.starts_with("dx.op.atomic"),
+                    }
+            }
+            Op::Bin(..)
+            | Op::Cast(..)
+            | Op::Cmp(..)
+            | Op::Select(..)
+            | Op::Extract(..)
+            | Op::Phi(..)
+            | Op::Gep(..)
+            | Op::Load(..) => false,
+        }
+    }
+
+    /// Backward liveness over `self.insts`: seeds side-effecting instructions
+    /// and branch conditions in reachable blocks (`rpo`), then walks operand
+    /// chains once via a worklist.
+    #[cfg(test)]
+    pub(crate) fn live(&self) -> Vec<bool> {
+        let (rpo, seen) = self.reachable_rpo();
+        self.live_in(&rpo, &seen)
+    }
+
+    fn live_in(&self, rpo: &[usize], seen: &[bool]) -> Vec<bool> {
+        let mut live = vec![false; self.insts.len()];
+        let mut work = Vec::new();
+        let mark = |live: &mut [bool], work: &mut Vec<usize>, v: V| {
+            if let V::Inst(i) = v
+                && !live[i as usize]
+            {
+                live[i as usize] = true;
+                work.push(i as usize);
+            }
+        };
+        for &b in rpo {
+            let blk = &self.blocks[b];
+            for &i in &blk.body {
+                if self.is_root(&self.insts[i as usize]) {
+                    mark(&mut live, &mut work, V::Inst(i));
+                }
+            }
+            if let Some(Term::CondBr(c, ..)) = blk.term {
+                mark(&mut live, &mut work, c);
+            }
+        }
+        for m in &self.mds {
+            if let MdDef::Value(_, v) = m {
+                mark(&mut live, &mut work, *v);
+            }
+        }
+        while let Some(i) = work.pop() {
+            match &self.insts[i].op {
+                Op::Phi(inc) => {
+                    for &(v, pred) in inc {
+                        if seen[pred] {
+                            mark(&mut live, &mut work, v);
+                        }
+                    }
+                }
+                op => for_each_operand(op, |v| mark(&mut live, &mut work, v)),
+            }
+        }
+        live
+    }
+
+    /// Prunes instruction-driven `ShaderFlags` bits (`TYPED_UAV_LOADS`,
+    /// `WAVE_OPS`, `INT64`, `RESOURCE_HEAP`, `SAMPLER_HEAP`) to those used by
+    /// instructions that survive dead-code elimination, so declared flags
+    /// always match what `dxil.dll` observes in `main`.
+    pub(crate) fn active_flags(&self, declared: u64) -> u64 {
+        use super::shader::flags;
+        const INSTRUCTION_FLAGS: u64 = flags::TYPED_UAV_LOADS
+            | flags::WAVE_OPS
+            | flags::INT64
+            | flags::RESOURCE_HEAP
+            | flags::SAMPLER_HEAP;
+        if declared & INSTRUCTION_FLAGS == 0 {
+            return declared;
+        }
+        let (rpo, seen) = self.reachable_rpo();
+        let live = self.live_in(&rpo, &seen);
+        let mut actual = declared & !INSTRUCTION_FLAGS;
+        let is_i64 = |v_ty: Ty| self.types[v_ty.0 as usize] == TypeDef::Int(64);
+        for &b in &rpo {
+            let blk = &self.blocks[b];
+            for &idx in blk.phis.iter().chain(&blk.body) {
+                let i = idx as usize;
+                if !live[i] {
+                    continue;
+                }
+                let inst = &self.insts[i];
+                if declared & flags::INT64 != 0 && is_i64(inst.ty) {
+                    actual |= flags::INT64;
+                }
+                if declared & flags::INT64 != 0 && actual & flags::INT64 == 0 {
+                    for_each_operand(&inst.op, |v| {
+                        if is_i64(self.type_of(v)) {
+                            actual |= flags::INT64;
+                        }
+                    });
+                }
+                if let Op::Call(f, args) = &inst.op {
+                    let name = self.funcs[*f as usize].name.as_str();
+                    if name.starts_with("dx.op.wave") || name.starts_with("dx.op.quad") {
+                        actual |= flags::WAVE_OPS;
+                    } else if name == "dx.op.createHandleFromHeap" {
+                        let sampler = matches!(
+                            args.get(2),
+                            Some(&V::Const(c)) if self.consts[c as usize].1 != Const::Int(0)
+                        );
+                        actual |= if sampler {
+                            flags::SAMPLER_HEAP
+                        } else {
+                            flags::RESOURCE_HEAP
+                        };
+                    } else if declared & flags::TYPED_UAV_LOADS != 0
+                        && (name.starts_with("dx.op.bufferLoad.")
+                            || name.starts_with("dx.op.textureLoad."))
+                        && let Some(&V::Inst(hi)) = args.get(1)
+                        && let Op::Call(_, hargs) = &self.insts[hi as usize].op
+                        && let Some(&V::Const(agg)) = hargs.get(2)
+                        && let Const::Aggregate(fields) = &self.consts[agg as usize].1
+                        && let Some(&p0) = fields.first()
+                        && let Const::Int(v0) = self.consts[p0 as usize].1
+                        && (v0 as u32) & 0x1000 != 0
+                    {
+                        actual |= flags::TYPED_UAV_LOADS;
+                    }
+                }
+            }
+        }
+        actual & declared
+    }
+
     /// The module as bitcode.
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
@@ -553,7 +727,42 @@ impl Module {
                 "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
             ),
         );
-        let first_const = (self.globals.len() + self.funcs.len()) as u64;
+
+        // Blocks are laid out in reverse postorder, so every block follows
+        // its forward predecessors (drivers take a branch to an earlier
+        // block for a loop's back edge). Backward dead-code elimination
+        // drops phis, pure instructions, and unused `dx.op` declarations.
+        let (post, seen) = self.reachable_rpo();
+        let live = self.live_in(&post, &seen);
+
+        let mut used_func = vec![false; self.funcs.len()];
+        for (i, f) in self.funcs.iter().enumerate() {
+            if f.body {
+                used_func[i] = true;
+            }
+        }
+        for m in &self.mds {
+            if let MdDef::Value(_, V::Func(i)) = m {
+                used_func[*i as usize] = true;
+            }
+        }
+        for &b in &post {
+            for &i in &self.blocks[b].body {
+                if live[i as usize]
+                    && let Op::Call(f, _) = &self.insts[i as usize].op
+                {
+                    used_func[*f as usize] = true;
+                }
+            }
+        }
+        let mut func_remap = vec![u32::MAX; self.funcs.len()];
+        let mut kept_funcs = Vec::with_capacity(self.funcs.len());
+        for (i, _) in self.funcs.iter().enumerate().filter(|&(i, _)| used_func[i]) {
+            func_remap[i] = kept_funcs.len() as u32;
+            kept_funcs.push(i);
+        }
+
+        let first_const = (self.globals.len() + kept_funcs.len()) as u64;
         for g in &self.globals {
             // [type, address space << 2 | explicit type | constant, init id
             // + 1, linkage (external 0, internal 3), log2 alignment + 1,
@@ -574,7 +783,8 @@ impl Module {
                 ],
             );
         }
-        for f in &self.funcs {
+        for &fi in &kept_funcs {
+            let f = &self.funcs[fi];
             // [type, cc, isproto, linkage, paramattr, align, section,
             // visibility, gc, unnamed_addr, prologue, dllstorage, comdat, prefix]
             let attr = f.attr.map_or(0, |a| a as u64);
@@ -601,7 +811,7 @@ impl Module {
 
         // Value ids: globals, functions, constants, instructions.
         let globals = self.globals.len() as u32;
-        let funcs = globals + self.funcs.len() as u32;
+        let funcs = globals + kept_funcs.len() as u32;
         let const_id = |i: u32| u64::from(funcs + i);
         w.enter(CONSTANTS_BLOCK, 4);
         let mut current = None;
@@ -622,77 +832,6 @@ impl Module {
         }
         w.exit();
 
-        // Phis nothing reads are left out (one register per phi makes many).
-        let mut live = vec![false; self.insts.len()];
-        let mark = |live: &mut Vec<bool>, v: V| {
-            if let V::Inst(i) = v
-                && !live[i as usize]
-            {
-                live[i as usize] = true;
-                return true;
-            }
-            false
-        };
-        let operands = |op: &Op| -> Vec<V> {
-            match op {
-                Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
-                    vec![*a, *b]
-                }
-                Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => vec![*v],
-                Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => vec![*a, *b, *c],
-                Op::Call(_, args) => args.clone(),
-                Op::Phi(inc) => inc.iter().map(|x| x.0).collect(),
-                Op::Gep(_, p, idx) => std::iter::once(*p).chain(idx.iter().copied()).collect(),
-            }
-        };
-        for b in &self.blocks {
-            for &i in &b.body {
-                live[i as usize] = true;
-            }
-            if let Some(Term::CondBr(c, ..)) = b.term {
-                mark(&mut live, c);
-            }
-        }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for (i, inst) in self.insts.iter().enumerate() {
-                if live[i] {
-                    for v in operands(&inst.op) {
-                        changed |= mark(&mut live, v);
-                    }
-                }
-            }
-        }
-
-        // Blocks are laid out in reverse postorder, so every block follows
-        // its forward predecessors (drivers take a branch to an earlier
-        // block for a loop's back edge).
-        let succs = |b: usize| match self.blocks[b].term {
-            Some(Term::Br(t)) => vec![t],
-            Some(Term::CondBr(_, t, f)) => vec![t, f],
-            _ => vec![],
-        };
-        let mut seen = vec![false; self.blocks.len()];
-        let mut post = Vec::new();
-        let mut stack = vec![(0usize, 0usize)];
-        seen[0] = true;
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            top.1 += 1;
-            match succs(b).get(k) {
-                Some(&s) if !seen[s] => {
-                    seen[s] = true;
-                    stack.push((s, 0));
-                }
-                Some(_) => {}
-                None => {
-                    post.push(b);
-                    stack.pop();
-                }
-            }
-        }
-        post.reverse();
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in post.iter().enumerate() {
             pos[b] = n as u64;
@@ -702,21 +841,25 @@ impl Module {
         // DXC's loops; the AMD driver hangs on divergent loops otherwise.
         let mut preds = vec![Vec::new(); self.blocks.len()];
         for &b in &post {
-            for s in succs(b) {
+            let (succs, len) = succs_of(self.blocks[b].term);
+            for &s in &succs[..len] {
                 preds[s].push(b);
             }
         }
         let mut fold = vec![None; self.blocks.len()];
         for &b in &post {
             let blk = &self.blocks[b];
-            if let (Some(Term::Br(h)), true, [p]) = (
-                blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
-                &preds[b][..],
-            ) && pos[h] < pos[b]
-                && !succs(*p).contains(&h)
+            let empty = blk.phis.iter().chain(&blk.body).all(|&i| !live[i as usize]);
+            if let (Some(Term::Br(h)), true, [p]) = (blk.term, empty, &preds[b][..])
+                && pos[h] < pos[b]
+                && pos[*p] < pos[b]
+                && fold[*p].is_none()
+                && fold[h].is_none()
             {
-                fold[b] = Some((*p, h));
+                let (ps, plen) = succs_of(self.blocks[*p].term);
+                if !ps[..plen].contains(&h) {
+                    fold[b] = Some((*p, h));
+                }
             }
         }
         let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
@@ -733,7 +876,7 @@ impl Module {
         let mut ids = vec![u32::MAX; self.insts.len()];
         let mut next = base;
         for b in layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
+            for &i in b.phis.iter().chain(&b.body).filter(|&&i| live[i as usize]) {
                 if !self.is_void(self.insts[i as usize].ty) {
                     ids[i as usize] = next;
                     next += 1;
@@ -743,11 +886,15 @@ impl Module {
         let abs = |v: V| -> u32 {
             match v {
                 V::Global(i) => i,
-                V::Func(i) => globals + i,
+                V::Func(i) => {
+                    let mapped = func_remap[i as usize];
+                    assert_ne!(mapped, u32::MAX, "use of an unreferenced function");
+                    globals + mapped
+                }
                 V::Const(i) => funcs + i,
                 V::Inst(i) => {
                     let id = ids[i as usize];
-                    assert_ne!(id, u32::MAX, "use of a void value");
+                    assert_ne!(id, u32::MAX, "use of a void or dead value");
                     id
                 }
             }
@@ -801,8 +948,12 @@ impl Module {
         w.exit();
 
         w.enter(VALUE_SYMTAB_BLOCK, 4);
-        let names = self.globals.iter().map(|g| &g.name);
-        for (i, name) in names.chain(self.funcs.iter().map(|f| &f.name)).enumerate() {
+        let names = self
+            .globals
+            .iter()
+            .map(|g| &g.name)
+            .chain(kept_funcs.iter().map(|&fi| &self.funcs[fi].name));
+        for (i, name) in names.enumerate() {
             let mut r = vec![i as u64];
             r.extend(chars(name));
             w.record(1, &r);
@@ -812,8 +963,9 @@ impl Module {
         w.enter(FUNCTION_BLOCK, 4);
         w.record(1, &[layout.len() as u64]);
         let mut inst_id = base;
+        let mut rec = Vec::with_capacity(16);
         for b in layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
+            for &i in b.phis.iter().chain(&b.body).filter(|&&i| live[i as usize]) {
                 let inst = &self.insts[i as usize];
                 let rel = |v: V| {
                     let a = abs(v);
@@ -827,23 +979,32 @@ impl Module {
                     Op::Select(c, t, f) => w.record(29, &[rel(*t), rel(*f), rel(*c)]),
                     Op::Extract(a, idx) => w.record(26, &[rel(*a), u64::from(*idx)]),
                     Op::Call(f, args) => {
-                        let mut r = vec![0, 1 << 15, u64::from(self.funcs[*f as usize].ty.0)];
-                        r.push(rel(V::Func(*f)));
-                        r.extend(args.iter().map(|&a| rel(a)));
-                        w.record(34, &r);
+                        rec.clear();
+                        rec.extend([
+                            0,
+                            1 << 15,
+                            u64::from(self.funcs[*f as usize].ty.0),
+                            rel(V::Func(*f)),
+                        ]);
+                        rec.extend(args.iter().map(|&a| rel(a)));
+                        w.record(34, &rec);
                     }
                     Op::Phi(incoming) => {
-                        let mut r = vec![u64::from(inst.ty.0)];
-                        for &(v, b) in incoming {
-                            r.push(signed(i64::from(inst_id) - i64::from(abs(v))));
-                            r.push(from(b));
+                        rec.clear();
+                        rec.push(u64::from(inst.ty.0));
+                        for &(v, pred) in incoming {
+                            if seen[pred] {
+                                rec.push(signed(i64::from(inst_id) - i64::from(abs(v))));
+                                rec.push(from(pred));
+                            }
                         }
-                        w.record(16, &r);
+                        w.record(16, &rec);
                     }
                     Op::Gep(ty, p, idx) => {
-                        let mut r = vec![0, u64::from(ty.0), rel(*p)];
-                        r.extend(idx.iter().map(|&i| rel(i)));
-                        w.record(43, &r);
+                        rec.clear();
+                        rec.extend([0, u64::from(ty.0), rel(*p)]);
+                        rec.extend(idx.iter().map(|&i| rel(i)));
+                        w.record(43, &rec);
                     }
                     // Alignment 4 (log2 + 1), not volatile.
                     Op::Load(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 0]),
@@ -873,6 +1034,35 @@ impl Module {
         w.exit();
         w.exit();
         w.finish()
+    }
+}
+
+fn succs_of(term: Option<Term>) -> ([usize; 2], usize) {
+    match term {
+        Some(Term::Br(t)) => ([t, 0], 1),
+        Some(Term::CondBr(_, t, f)) => ([t, f], 2),
+        _ => ([0, 0], 0),
+    }
+}
+
+fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
+    match op {
+        Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
+            f(*a);
+            f(*b);
+        }
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => f(*v),
+        Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
+            f(*a);
+            f(*b);
+            f(*c);
+        }
+        Op::Call(_, args) => args.iter().copied().for_each(f),
+        Op::Phi(inc) => inc.iter().for_each(|&(v, _)| f(v)),
+        Op::Gep(_, p, idx) => {
+            f(*p);
+            idx.iter().copied().for_each(f);
+        }
     }
 }
 
@@ -999,5 +1189,247 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(2), 4);
+    }
+
+    #[test]
+    fn dead_instructions_and_unused_declarations_are_eliminated() {
+        let mut m = Module::default();
+        let void = m.void();
+        let i32t = m.int(32);
+        let arr_ty = m.array(4, i32t);
+        let main_ty = m.func_ty(void, vec![]);
+        m.ptr(main_ty);
+        let _ = m.function("main", main_ty, None, true);
+        let lds = m.global("lds", arr_ty, 3);
+
+        let pure_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        m.ptr(pure_ty);
+        let dead_op = m.function("dx.op.unary.i32", pure_ty, Some(Attr::ReadNone), false);
+        let dead_wave = m.function(
+            "dx.op.waveGetLaneIndex",
+            pure_ty,
+            Some(Attr::NoUnwind),
+            false,
+        );
+        let live_op = m.function("dx.op.unaryBits.i32", pure_ty, Some(Attr::ReadNone), false);
+
+        let entry = m.new_block();
+        let loop_hdr = m.new_block();
+        let latch = m.new_block();
+        let exit = m.new_block();
+        let unreachable_blk = m.new_block();
+
+        let (k0, k1, k2, k7) = (m.i32(0), m.i32(1), m.i32(2), m.i32(7));
+        // Dead ALU, dead load, dead pure & wave dx.op calls.
+        let dead_add = m.bin(entry, Bin::Add, k1, k2);
+        let dead_ptr = m.element(entry, lds, dead_add);
+        let dead_ld = m.load(entry, dead_ptr);
+        let dead_call = m.call(entry, dead_op, vec![k0, dead_ld]);
+        let dead_w = m.call(entry, dead_wave, vec![k0, dead_call]);
+        let _ = m.cmp(entry, pred::NE, dead_w, k0);
+
+        // Live operand chain feeding a branch condition and a store.
+        let live_call = m.call(entry, live_op, vec![k1, k7]);
+        m.terminate(entry, Term::Br(loop_hdr));
+
+        // Cyclic dead phis vs a live phi.
+        let cyc_a = m.phi(loop_hdr, i32t);
+        let cyc_b = m.phi(loop_hdr, i32t);
+        let live_phi = m.phi(loop_hdr, i32t);
+        let next_val = m.bin(loop_hdr, Bin::Add, live_phi, k1);
+        let cond = m.cmp(loop_hdr, pred::IULT, next_val, k7);
+        m.terminate(loop_hdr, Term::CondBr(cond, latch, exit));
+
+        // Latch has only a dead instruction -> becomes empty after DCE and folds!
+        let _dead_in_latch = m.bin(latch, Bin::Xor, next_val, k2);
+        m.terminate(latch, Term::Br(loop_hdr));
+
+        m.set_phi(cyc_a, vec![(k1, entry), (cyc_b, latch)]);
+        m.set_phi(cyc_b, vec![(k2, entry), (cyc_a, latch)]);
+        m.set_phi(live_phi, vec![(live_call, entry), (next_val, latch)]);
+
+        let out_ptr = m.element(exit, lds, k0);
+        m.store(exit, out_ptr, next_val);
+        m.terminate(exit, Term::Ret);
+
+        // Unreachable block with a store must not keep `dead_add` alive.
+        let unreach_ptr = m.element(unreachable_blk, lds, dead_add);
+        m.store(unreachable_blk, unreach_ptr, dead_add);
+        m.terminate(unreachable_blk, Term::Ret);
+
+        let idx = |v: V| match v {
+            V::Inst(i) => i as usize,
+            _ => unreachable!(),
+        };
+        let live = m.live();
+        assert!(!live[idx(dead_add)]);
+        assert!(!live[idx(dead_ptr)]);
+        assert!(!live[idx(dead_ld)]);
+        assert!(!live[idx(dead_call)]);
+        assert!(!live[idx(dead_w)]);
+        assert!(!live[idx(cyc_a)] && !live[idx(cyc_b)]);
+        assert!(
+            live[idx(live_call)] && live[idx(live_phi)] && live[idx(next_val)] && live[idx(cond)]
+        );
+
+        let bytes = m.write();
+
+        // Build the minimal equivalent module (no dead instructions, no unused
+        // declarations, latch already folded, no unreachable block): the
+        // written bitcode must match byte-for-byte.
+        let mut clean = Module::default();
+        let void = clean.void();
+        let i32t = clean.int(32);
+        let arr_ty = clean.array(4, i32t);
+        let main_ty = clean.func_ty(void, vec![]);
+        clean.ptr(main_ty);
+        let _ = clean.function("main", main_ty, None, true);
+        let lds = clean.global("lds", arr_ty, 3);
+        let pure_ty = clean.func_ty(i32t, vec![i32t, i32t]);
+        clean.ptr(pure_ty);
+        let live_op = clean.function("dx.op.unaryBits.i32", pure_ty, Some(Attr::ReadNone), false);
+        let entry = clean.new_block();
+        let loop_hdr = clean.new_block();
+        let exit = clean.new_block();
+        let (k0, k1, _k2, k7) = (clean.i32(0), clean.i32(1), clean.i32(2), clean.i32(7));
+        let _ = clean.element(entry, lds, k0); // registers ptr_in(i32, 3) in same type order
+        clean.blocks[entry].body.clear();
+        clean.insts.clear();
+        let live_call = clean.call(entry, live_op, vec![k1, k7]);
+        clean.terminate(entry, Term::Br(loop_hdr));
+        let live_phi = clean.phi(loop_hdr, i32t);
+        let next_val = clean.bin(loop_hdr, Bin::Add, live_phi, k1);
+        let cond = clean.cmp(loop_hdr, pred::IULT, next_val, k7);
+        clean.terminate(loop_hdr, Term::CondBr(cond, loop_hdr, exit));
+        clean.set_phi(live_phi, vec![(live_call, entry), (next_val, loop_hdr)]);
+        let out_ptr = clean.element(exit, lds, k0);
+        clean.store(exit, out_ptr, next_val);
+        clean.terminate(exit, Term::Ret);
+
+        let clean_bytes = clean.write();
+        assert_eq!(bytes, clean_bytes);
+    }
+
+    #[test]
+    fn side_effecting_atomics_with_unused_results_stay_live() {
+        let mut m = Module::default();
+        let void = m.void();
+        let i32t = m.int(32);
+        let arr_ty = m.array(4, i32t);
+        let main_ty = m.func_ty(void, vec![]);
+        m.ptr(main_ty);
+        let _ = m.function("main", main_ty, None, true);
+        let lds = m.global("lds", arr_ty, 3);
+
+        let atomic_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        m.ptr(atomic_ty);
+        let uav_atomic = m.function(
+            "dx.op.atomicBinOp.i32",
+            atomic_ty,
+            Some(Attr::NoUnwind),
+            false,
+        );
+
+        let b = m.new_block();
+        let (k0, k3, k5) = (m.i32(0), m.i32(3), m.i32(5));
+        let arg_a = m.bin(b, Bin::Add, k0, k3);
+        let _unused_uav = m.call(b, uav_atomic, vec![k0, arg_a]);
+
+        let arg_b = m.bin(b, Bin::Mul, k3, k5);
+        let ptr = m.element(b, lds, k0);
+        let _unused_rmw = m.atomic(b, Rmw::Add, ptr, arg_b);
+
+        let arg_c = m.bin(b, Bin::Sub, k5, k3);
+        let _unused_cas = m.cmpxchg(b, ptr, k0, arg_c);
+        m.terminate(b, Term::Ret);
+
+        let idx = |v: V| match v {
+            V::Inst(i) => i as usize,
+            _ => unreachable!(),
+        };
+        let live = m.live();
+        assert!(live[idx(arg_a)], "dx.op.atomicBinOp operand must stay live");
+        assert!(live[idx(arg_b)], "AtomicRmw operand must stay live");
+        assert!(live[idx(arg_c)], "CmpXchg operand must stay live");
+        // Notice the `extractvalue` wrapper inside `cmpxchg()` is unused and eliminated!
+        assert!(!live[idx(_unused_cas)]);
+        let _ = m.write();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn post_dce_shader_flags_validate_with_dxil() {
+        use super::super::container::SigElement;
+        use super::super::shader::{Shader, flags};
+        use super::super::validator::Validator;
+        use crate::dxbc::{Container, FourCC};
+
+        let mut s = Shader::new(true);
+        s.outputs.push(SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        });
+        let b = s.entry;
+
+        // Emit dead instructions that originally set INT64, WAVE_OPS,
+        // RESOURCE_HEAP, SAMPLER_HEAP, and TYPED_UAV_LOADS.
+        let i64t = s.m.int(64);
+        let k64 = s.m.int_const(i64t, 99);
+        let k7 = s.m.i32(7);
+        let zext = s.m.cast(b, Cast::ZExt, k7, i64t);
+        let sum64 = s.m.bin(b, Bin::Add, zext, k64);
+        let _dead_i64 = s.m.cast(b, Cast::Trunc, sum64, s.t.i32);
+        s.flags |= flags::INT64;
+
+        let _dead_wave = s.op(b, "waveGetLaneIndex", Attr::ReadNone, s.t.i32, 111, &[]);
+        s.flags |= flags::WAVE_OPS;
+        let _dead_root_srv = s.root_srv_handle(0);
+
+        let idx0 = s.m.i32(0);
+        let uav_h = s.heap_handle(b, idx0, false, (10 | 0x1000, 0x409));
+        let _samp_h = s.heap_handle(b, idx0, true, (14, 0));
+        let iu = s.m.undef(s.t.i32);
+        let _dead_uav_ld = s.op(
+            b,
+            "bufferLoad.f32",
+            Attr::ReadOnly,
+            s.t.res_ret,
+            68,
+            &[uav_h, idx0, iu],
+        );
+        s.flags |= flags::TYPED_UAV_LOADS;
+
+        // Only constant SV_Target stores are live.
+        for col in 0..4u8 {
+            let args = [
+                s.m.i32(0),
+                s.m.i32(0),
+                s.m.i8(col),
+                s.m.f32(1.0f32.to_bits()),
+            ];
+            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+        s.m.terminate(b, Term::Ret);
+
+        let container = s.finish();
+        let parsed = Container::parse(&container).unwrap();
+        let sfi0 = u64::from_le_bytes(parsed.part(FourCC::SFI0).unwrap().data.try_into().unwrap());
+        assert_eq!(sfi0, 0, "dead feature flags must be pruned after DCE");
+
+        if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+            let mut copy = container.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy)
+                .expect("DXIL validation failed after DCE");
+            assert_eq!(copy[4..20], ours[..]);
+        }
     }
 }

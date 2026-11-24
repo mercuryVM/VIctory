@@ -475,7 +475,9 @@ impl Shader {
             None
         };
         // Entry properties: shader flags (tag 0), thread-group size (4),
-        // wave size (11).
+        // wave size (11). Prune instruction-driven flags to those surviving
+        // dead-code elimination so declared flags match live usage.
+        self.flags = self.m.active_flags(self.flags);
         let mut props = Vec::new();
         if self.flags != 0 {
             props.push(i32c(&mut self, 0));
