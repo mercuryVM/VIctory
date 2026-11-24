@@ -22,6 +22,7 @@
 //! a first-lane read keeps the host wave's first lane (see the shortcut in
 //! `lower`).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::gfx10::Fields;
@@ -55,15 +56,16 @@ fn reachable(st: &Structured, from: usize) -> Vec<bool> {
     seen
 }
 
+/// Per block, the blocks reachable from it (itself included).
+fn reach_table(st: &Structured) -> Vec<Vec<bool>> {
+    (0..st.exits.len()).map(|b| reachable(st, b)).collect()
+}
+
 /// Blocks on a cycle of the lanes' control flow.
-fn in_cycle(st: &Structured) -> Vec<bool> {
+fn in_cycle(st: &Structured, reach: &[Vec<bool>]) -> Vec<bool> {
     let n = st.exits.len();
     (0..n)
-        .map(|b| {
-            lane_successors(st, b)
-                .into_iter()
-                .any(|s| reachable(st, s)[b])
-        })
+        .map(|b| lane_successors(st, b).into_iter().any(|s| reach[s][b]))
         .collect()
 }
 
@@ -73,17 +75,18 @@ fn in_cycle(st: &Structured) -> Vec<bool> {
 /// iteration limit, which ends the lane).
 pub(crate) fn all_threads(st: &Structured) -> Vec<bool> {
     let n = st.exits.len();
-    let cycle = in_cycle(st);
+    let reach = reach_table(st);
+    let cycle = in_cycle(st, &reach);
     let after_loop: Vec<bool> = {
         let mut seen = vec![false; n];
         for b in (0..n).filter(|&b| cycle[b]) {
-            for (s, r) in reachable(st, b).into_iter().enumerate() {
+            for (s, &r) in reach[b].iter().enumerate() {
                 seen[s] |= r;
             }
         }
         seen
     };
-    let from_entry = reachable(st, 0);
+    let from_entry = &reach[0];
     (0..n)
         .map(|b| {
             if !from_entry[b] || cycle[b] || after_loop[b] {
@@ -120,7 +123,13 @@ struct Lanes<'a> {
     values: HashSet<Value>,
     /// Compare and carry results whose lane bit may differ beyond EXEC.
     bits: HashSet<Value>,
+    /// [`Lanes::bool_varies`] answers that were yes: they stay yes, as
+    /// what varies only grows.
+    yes: RefCell<HashSet<(Bool, Vec<Bool>)>>,
 }
+
+/// Case splits a [`Lanes::bool_varies`] search makes before it answers yes.
+const VARIES_BUDGET: usize = 1 << 12;
 
 impl Lanes<'_> {
     fn atom_varies(&self, a: Atom) -> bool {
@@ -136,7 +145,22 @@ impl Lanes<'_> {
     /// can disagree on `bit`.
     fn bool_varies(&self, bit: Bool, b: usize, guard: Option<Bool>) -> bool {
         let within: Vec<Bool> = [self.st.reach[b]].into_iter().chain(guard).collect();
-        self.st.bools.varies(bit, &within, &|a| self.atom_varies(a))
+        self.varies_in(bit, within)
+    }
+
+    fn varies_in(&self, bit: Bool, within: Vec<Bool>) -> bool {
+        let key = (bit, within);
+        if self.yes.borrow().contains(&key) {
+            return true;
+        }
+        let r = self
+            .st
+            .bools
+            .varies_within(bit, &key.1, &|a| self.atom_varies(a), VARIES_BUDGET);
+        if r {
+            self.yes.borrow_mut().insert(key);
+        }
+        r
     }
 
     /// A lane mask's bit, by any of its dwords' values.
@@ -191,24 +215,25 @@ pub(crate) fn varying<'a>(p: &'a Program, st: &'a Structured) -> Varying<'a> {
             .map(|&(_, v)| v)
             .collect(),
         bits: HashSet::new(),
+        yes: RefCell::new(HashSet::new()),
     };
     let masks: HashSet<Value> = st.masks.keys().chain(st.highs.keys()).copied().collect();
-    let cycle = in_cycle(st);
+    let reach = reach_table(st);
+    let cycle = in_cycle(st, &reach);
     let mut divergent_loop;
     loop {
         let before = (l.values.len(), l.bits.len());
         // Blocks reachable from each side of a divergent branch.
-        let splits: Vec<(Vec<bool>, Vec<bool>)> = (0..n)
+        let splits: Vec<(&Vec<bool>, &Vec<bool>)> = (0..n)
             .filter_map(|b| l.divergent(b))
-            .map(|(t, f)| (reachable(st, t), reachable(st, f)))
+            .map(|(t, f)| (&reach[t], &reach[f]))
             .collect();
         // Loops some lanes leave before others: a block on a cycle with a
         // divergent branch, and every block on a cycle through it.
         divergent_loop = vec![false; n];
         for b in (0..n).filter(|&b| cycle[b] && l.divergent(b).is_some()) {
-            let from = reachable(st, b);
             for c in 0..n {
-                if from[c] && reachable(st, c)[b] {
+                if reach[b][c] && reach[c][b] {
                     divergent_loop[c] = true;
                 }
             }
@@ -444,9 +469,7 @@ impl Varying<'_> {
                         && matches!(r, Reg::S(_))
                         && let Some(m) = self.lanes.mask_bit(x)
                     {
-                        return !st
-                            .bools
-                            .varies(m, &within_here, &|a| self.lanes.atom_varies(a));
+                        return !self.lanes.varies_in(m, within_here.clone());
                     }
                     self.uniform_in(x, within, seen, steps)
                 })

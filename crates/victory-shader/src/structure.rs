@@ -247,6 +247,21 @@ impl Bools {
     /// lane), each picks the others for itself. Yes when the search grows
     /// too large to finish.
     pub fn varies(&self, b: Bool, within: &[Bool], varies: &dyn Fn(Atom) -> bool) -> bool {
+        self.varies_within(b, within, varies, MAX_MEET)
+    }
+
+    /// [`Bools::varies`] giving up (yes) after `budget` case splits. No
+    /// atom of `b` that varies: no.
+    pub fn varies_within(
+        &self,
+        b: Bool,
+        within: &[Bool],
+        varies: &dyn Fn(Atom) -> bool,
+        mut budget: usize,
+    ) -> bool {
+        if !self.vars(b).into_iter().any(|v| varies(self.atoms[v as usize])) {
+            return false;
+        }
         let lane = |holds: bool| {
             within
                 .iter()
@@ -254,7 +269,6 @@ impl Bools {
                 .chain([(b, holds)])
                 .collect::<Vec<_>>()
         };
-        let mut budget = MAX_MEET;
         self.differ_in(lane(true), lane(false), varies, &mut budget)
     }
 
