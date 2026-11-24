@@ -1269,36 +1269,6 @@ fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
     (stride != 0 && end <= u64::from(size)).then(|| u64::from(first) * stride)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{expanded_vertices, rect_source};
-
-    #[test]
-    fn rectangle_vertices_inside_their_buffer() {
-        assert_eq!(rect_source(0, 3, 16, 48), Some(0));
-        assert_eq!(rect_source(3, 3, 16, 96), Some(48));
-        assert_eq!(rect_source(3, 3, 16, 95), None);
-        assert_eq!(rect_source(0, 3, 0, 48), None);
-    }
-
-    /// `first + count` past 32 bits wrapped to a small count before, which
-    /// passed the bounds check and read far outside the buffer.
-    #[test]
-    fn rectangle_bounds_do_not_wrap() {
-        assert_eq!(rect_source(u32::MAX, 3, 16, u32::MAX), None);
-        assert_eq!(rect_source(u32::MAX - 1, 3, 1, u32::MAX), None);
-        assert_eq!(rect_source(u32::MAX, u32::MAX, u32::MAX, u32::MAX), None);
-    }
-
-    #[test]
-    fn expanded_counts_fit_32_bits() {
-        assert_eq!(expanded_vertices(3), Some(6));
-        assert_eq!(expanded_vertices(7), Some(12));
-        assert_eq!(expanded_vertices(u32::MAX / 6 * 3), Some(u32::MAX / 6 * 6));
-        assert_eq!(expanded_vertices(u32::MAX), None);
-    }
-}
-
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
     // SAFETY: an open list.
@@ -1527,5 +1497,35 @@ mod tests {
             readback.Unmap(0, None);
         }
         assert_eq!(pixels, [[0, 255, 0, 255]; (SIDE * SIDE) as usize]);
+    }
+}
+
+#[cfg(test)]
+mod rect_tests {
+    use super::{expanded_vertices, rect_source};
+
+    #[test]
+    fn rectangle_vertices_inside_their_buffer() {
+        assert_eq!(rect_source(0, 3, 16, 48), Some(0));
+        assert_eq!(rect_source(3, 3, 16, 96), Some(48));
+        assert_eq!(rect_source(3, 3, 16, 95), None);
+        assert_eq!(rect_source(0, 3, 0, 48), None);
+    }
+
+    /// `first + count` past 32 bits wrapped to a small count before, which
+    /// passed the bounds check and read far outside the buffer.
+    #[test]
+    fn rectangle_bounds_do_not_wrap() {
+        assert_eq!(rect_source(u32::MAX, 3, 16, u32::MAX), None);
+        assert_eq!(rect_source(u32::MAX - 1, 3, 1, u32::MAX), None);
+        assert_eq!(rect_source(u32::MAX, u32::MAX, u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn expanded_counts_fit_32_bits() {
+        assert_eq!(expanded_vertices(3), Some(6));
+        assert_eq!(expanded_vertices(7), Some(12));
+        assert_eq!(expanded_vertices(u32::MAX / 6 * 3), Some(u32::MAX / 6 * 6));
+        assert_eq!(expanded_vertices(u32::MAX), None);
     }
 }

@@ -1306,6 +1306,7 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
+    // SAFETY: null or the title's room for a description.
     if let Some(out) = unsafe { out.as_mut() } {
         let mut desc = resource(this).desc;
         // Native D3D12 reports the levels it actually allocated for an
