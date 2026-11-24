@@ -642,6 +642,7 @@ impl<'a> Lower<'a> {
         let mut split = false;
         let mut wants_console_flow = false;
         let mut no_console_flow = None;
+        let mut as_32 = false;
         let mut group_waves = 1;
         let mut console_threads = [0; 3];
         if let StageIo::Cs(cs) = x.native.io {
@@ -757,7 +758,9 @@ impl<'a> Lower<'a> {
                     group_waves = n / 64;
                     s.threads = Some([64, 1, 1]);
                 }
-                no_console_flow = if group_waves == 1 && n > 64 {
+                // Diagnostic: see `emit::wave64_as_32`.
+                as_32 = group_waves == 1 && n > 64 && super::wave64_as_32() && x.target.runs(32);
+                no_console_flow = if group_waves == 1 && n > 64 && !as_32 {
                     Some(
                         "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
                     )
@@ -777,7 +780,7 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                wants_console_flow = no_console_flow.is_none() && x.target.runs(32);
+                wants_console_flow = no_console_flow.is_none() && x.target.runs(32) && !as_32;
             }
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
@@ -831,7 +834,7 @@ impl<'a> Lower<'a> {
                 // In halves only where the host cannot run the console wave.
                 split = x.native.wave64 && !x.target.runs(64);
             }
-            if split {
+            if split || as_32 {
                 s.wave_size = Some(32);
             } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
