@@ -86,9 +86,15 @@ impl Task {
     }
 }
 
+struct PendingTask {
+    task: Task,
+    /// Composite queues share ports but each queue has its own cancellation state.
+    owner: Arc<AtomicBool>,
+}
+
 struct Port {
     mode: Mode,
-    tasks: Mutex<VecDeque<Task>>,
+    tasks: Mutex<VecDeque<PendingTask>>,
     ready: Condvar,
 }
 
@@ -116,15 +122,25 @@ impl Port {
         port
     }
 
-    fn submit(&self, task: Task) {
+    fn submit(&self, owner: &Arc<AtomicBool>, task: Task) -> bool {
         match self.mode {
             Mode::Immediate => task.run(false),
             Mode::ThreadPool => POOL.submit(task),
             Mode::Manual | Mode::Serialized => {
-                lock(&self.tasks).push_back(task);
+                let mut tasks = lock(&self.tasks);
+                if owner.load(Ordering::Acquire) {
+                    drop(tasks);
+                    task.run(true);
+                    return false;
+                }
+                tasks.push_back(PendingTask {
+                    task,
+                    owner: Arc::clone(owner),
+                });
                 self.ready.notify_one();
             }
         }
+        true
     }
 
     /// The next queued task, waiting up to `timeout_ms`.
@@ -141,7 +157,7 @@ impl Port {
                 .unwrap_or_else(|e| e.into_inner())
                 .0
         };
-        tasks.pop_front()
+        tasks.pop_front().map(|pending| pending.task)
     }
 }
 
@@ -193,7 +209,7 @@ impl Pool {
 pub struct Queue {
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
-    terminated: AtomicBool,
+    terminated: Arc<AtomicBool>,
 }
 
 impl Queue {
@@ -201,7 +217,7 @@ impl Queue {
         Arc::new(Queue {
             ports,
             monitors: Mutex::default(),
-            terminated: AtomicBool::new(false),
+            terminated: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -225,7 +241,9 @@ impl Queue {
     }
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
-        self.ports[port as usize].submit(task);
+        if !self.ports[port as usize].submit(&self.terminated, task) {
+            return;
+        }
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
         for (_, context, callback) in monitors {
@@ -378,7 +396,15 @@ pub fn XTaskQueueTerminate(
     };
     queue.terminated.store(true, Ordering::Release);
     for port in &queue.ports {
-        let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
+        let mut pending = Vec::new();
+        lock(&port.tasks).retain(|entry| {
+            if Arc::ptr_eq(&entry.owner, &queue.terminated) {
+                pending.push(entry.task);
+                false
+            } else {
+                true
+            }
+        });
         for task in pending {
             task.run(true);
         }
@@ -1177,6 +1203,60 @@ mod tests {
         }
         assert!(FIRST.load(Ordering::SeqCst));
         XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn terminating_one_queue_keeps_other_work_on_the_shared_port() {
+        extern "system" fn record(context: *mut c_void, canceled: bool) {
+            // SAFETY: both callbacks use the test's live atomic values.
+            let state = unsafe { &*context.cast::<AtomicU32>() };
+            state.store(if canceled { 2 } else { 1 }, Ordering::SeqCst);
+        }
+        let (mut first, mut second) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueCreate(0, 0, &mut first), S_OK);
+        let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueGetPort(first, WORK, &mut work), S_OK);
+        assert_eq!(XTaskQueueGetPort(first, COMPLETION, &mut completion), S_OK);
+        assert_eq!(
+            XTaskQueueCreateComposite(work, completion, &mut second),
+            S_OK
+        );
+
+        let first_result = AtomicU32::new(0);
+        let second_result = AtomicU32::new(0);
+        let first_context = std::ptr::from_ref(&first_result).cast_mut().cast();
+        let second_context = std::ptr::from_ref(&second_result).cast_mut().cast();
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(first, WORK, 0, first_context, Some(record)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(second, WORK, 0, second_context, Some(record)),
+            S_OK
+        );
+
+        assert_eq!(
+            XTaskQueueTerminate(second, false, std::ptr::null_mut(), None),
+            S_OK
+        );
+        let first_after_terminate = first_result.load(Ordering::SeqCst);
+        let second_after_terminate = second_result.load(Ordering::SeqCst);
+        // Deliver an already accepted callback after termination, as a delayed
+        // submission could do. It cannot become pending on the shared port.
+        second_result.store(0, Ordering::SeqCst);
+        queue(second)
+            .unwrap()
+            .deliver(WORK, Task::new(second_context, record));
+        let late_result = second_result.load(Ordering::SeqCst);
+        let dispatched = XTaskQueueDispatch(first, WORK, 0);
+        let port_empty = !XTaskQueueDispatch(first, WORK, 0);
+        XTaskQueueCloseHandle(second);
+        XTaskQueueCloseHandle(first);
+        assert_eq!(second_after_terminate, 2);
+        assert_eq!(first_after_terminate, 0);
+        assert_eq!(late_result, 2);
+        assert!(dispatched && port_empty);
+        assert_eq!(first_result.load(Ordering::SeqCst), 1);
     }
 
     #[test]
