@@ -1417,3 +1417,113 @@ fn scalar_loads_through_a_root_constant_pair_read_its_root_srv() {
         vop1(0x001, 0, sgpr(6)), // v_mov_b32 v0, s6
     ]);
 }
+
+/// Indexed (structured) loads, stores and atomics through a root UAV whose
+/// title declares a stride reach byte `index * stride + offset` of the
+/// buffer the root UAV binds: the host view is raw, with no stride of its own.
+#[test]
+fn structured_access_through_a_root_uav_reaches_index_times_stride() {
+    const STRIDE: u32 = 8;
+    // MUBUF `op vdata, vaddr(index), s[srsrc:srsrc+3], 0 idxen offset:off`.
+    let mubuf_idxen = |op: u32, vdata: u8, vaddr: u8, srsrc: u8, off: u16| -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | 1 << 13 | (off as u32 & 0xFFF),
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    };
+    const STORE: u32 = 0x1C; // buffer_store_dword
+    const LOAD: u32 = 0x0C; // buffer_load_dword
+    const ATOMIC_ADD: u32 = 0x32; // buffer_atomic_add (no return)
+
+    let mut words = vec![
+        // A buffer descriptor around the root UAV s[0:1] in s[8:11].
+        s_mov_b32(8, 0),
+        s_mov_b32(9, 1),
+        s_mov_b32(10, 0xC1), // -1 records
+        s_mov_b32(11, 0xFF),
+        0x3101_4FAC,
+        vop1(0x001, 1, 128 + 2), // v1 = 2 (index)
+        vop1(0x001, 2, 0xFF),    // v2 = 0xABCD
+        0x0000_ABCD,
+        vop1(0x001, 3, 128 + 5), // v3 = 5
+        vop1(0x001, 5, 128),     // v5 = 0 (index)
+    ];
+    // Element 2: dword 5 = 0xABCD, dword 4 += 5; then element 0, dword 0 =
+    // what element 2 byte 4 holds.
+    words.extend(mubuf_idxen(STORE, 2, 1, 8, 4));
+    words.extend(mubuf_idxen(ATOMIC_ADD, 3, 1, 8, 0));
+    words.extend(mubuf_idxen(LOAD, 4, 1, 8, 4));
+    words.extend(mubuf_idxen(STORE, 4, 5, 8, 0));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: STRIDE,
+            dwords: 2,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let st = structure::structure(&p).expect("structure");
+    let container = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&container).expect("container");
+    let shader = super::emit(&c, &native, &p, &st, &io, &res).expect("emit");
+    assert_eq!(shader.root_uavs, vec![0]);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; 4])), (1, Root::Uav(8))],
+                    views: &[],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(
+            &out[0][..8],
+            &[0xABCD, 0, 0, 0, 5, 0xABCD, 0, 0],
+            "{label}: element 2 is bytes 16..24 of the buffer"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
