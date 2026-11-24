@@ -465,6 +465,31 @@ mod tests {
     }
 
     #[test]
+    fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let first = list.scratch(1).unwrap();
+        let second = list.scratch(1).unwrap();
+        assert_eq!(second.0 - first.0, 256);
+        assert_eq!(second.1 as usize - first.1 as usize, 256);
+        assert_eq!(list.scratch.lock().unwrap().chunks[0].capacity, FIRST_SCRATCH_CHUNK);
+        let large = list.scratch(96 << 10).unwrap();
+        assert_eq!(list.scratch.lock().unwrap().chunks[1].capacity, 128 << 10);
+        assert!(list.scratch(u64::MAX).is_none());
+        assert!(list.scratch(SCRATCH_CHUNK + 1).is_some());
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert_eq!(list.scratch(96 << 10).unwrap(), large);
+        assert_eq!(list.scratch.lock().unwrap().chunks.len(), 2);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert_eq!(list.scratch(512).unwrap(), first);
+        list.close();
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -726,7 +751,7 @@ fn node_is_list(
 /// the bytes used in it.
 #[derive(Default)]
 struct Scratch {
-    chunks: Vec<(ID3D12Resource, usize, u64)>,
+    chunks: Vec<ScratchChunk>,
     current: usize,
     used: u64,
 }
@@ -735,6 +760,14 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
+
+struct ScratchChunk {
+    _buffer: ID3D12Resource,
+    mapped: usize,
+    gpu: u64,
+    capacity: u64,
+}
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -1499,7 +1532,7 @@ impl HostList {
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        let len = len.max(1).next_multiple_of(256);
+        let len = len.max(1).checked_next_multiple_of(256)?;
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
@@ -1508,21 +1541,30 @@ impl HostList {
             self.deferred().uploads.push(buffer);
             return Some((gpu, data));
         }
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        while let Some(chunk) = s.chunks.get(s.current) {
+            if len <= chunk.capacity - s.used {
+                break;
+            }
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
-            name(&buffer, || "list scratch".into());
+            let next = s.chunks.last().map_or(FIRST_SCRATCH_CHUNK, |c| 2 * c.capacity);
+            let capacity = len.next_multiple_of(FIRST_SCRATCH_CHUNK).max(next).min(SCRATCH_CHUNK);
+            let (buffer, data) = host.upload_buffer(capacity)?;
+            name(&buffer, || format!("list scratch {capacity:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            s.chunks.push((buffer, data as usize, gpu));
+            #[cfg(feature = "diagnostics")]
+            tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
+                chunk = s.current, requested = len, capacity, "allocated list scratch");
+            s.chunks.push(ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity });
             s.used = 0;
         }
-        let (_, data, gpu) = s.chunks[s.current];
+        let chunk = &s.chunks[s.current];
         let at = s.used;
+        let result = (chunk.gpu + at, (chunk.mapped + at as usize) as *mut u8);
         s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        Some(result)
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
