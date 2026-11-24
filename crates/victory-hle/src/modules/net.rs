@@ -1048,8 +1048,16 @@ mod tests {
                 named.name
             );
         }
-        // Every override names a real export of its DLL.
-        for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
+        // Every override names a real export of its DLL, except the ones
+        // newer than the oldest host we run on: Windows 10's winhttp.dll
+        // lacks `WinHttpGetProxySettingsEx` (#118), and the title only
+        // reaches our override, never the host's.
+        const NEWER_THAN_WINDOWS_10: &[&str] = &["WinHttpGetProxySettingsEx"];
+        for e in m
+            .exports
+            .iter()
+            .filter(|e| !e.name.starts_with('#') && !NEWER_THAN_WINDOWS_10.contains(&e.name))
+        {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
             } else {
