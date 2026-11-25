@@ -515,12 +515,28 @@ fn converter() -> Option<&'static Converter> {
 }
 
 fn compile() -> windows::core::Result<Converter> {
+    compile_source(SOURCE)
+}
+
+fn compile_source(source: &str) -> windows::core::Result<Converter> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
-        D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("depth"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, Some(&mut errors))
+        D3DCompile(
+            source.as_ptr().cast(),
+            source.len(),
+            s!("depth"),
+            None,
+            None,
+            s!("main"),
+            s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
     };
     if let Err(e) = compiled {
         if let Some(errors) = errors {
@@ -531,16 +547,98 @@ fn compile() -> windows::core::Result<Converter> {
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    // SAFETY: the blob's own bytes; the root signature is inside the shader,
+    // or serialized beside it when the compiler dropped `[RootSignature]`.
     unsafe {
         let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let root: ID3D12RootSignature = match device.CreateRootSignature(0, bytes) {
+            Ok(root) => root,
+            Err(e) => {
+                // Wine's builtin `d3dcompiler_47` ignores `[RootSignature]`;
+                // serialize the converter's signature directly instead.
+                let root = fallback_root_signature(device)?;
+                tracing::debug!(
+                    error = %e,
+                    "depth conversion: shader blob has no root signature, built fallback"
+                );
+                root
+            }
+        };
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
             ..Default::default()
         })?;
         Ok(Converter { root, pso })
+    }
+}
+
+/// Serializes `RS` (`RootConstants(num32BitConstants=8, b0), UAV(u0)`) when
+/// Wine's compiler drops `[RootSignature]` from the shader blob.
+fn fallback_root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let params = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 8,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+    ];
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        NumStaticSamplers: 0,
+        pStaticSamplers: std::ptr::null(),
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    let mut error: Option<ID3DBlob> = None;
+    // SAFETY: `desc` points at live `params`; out pointers are ours.
+    let serialized = unsafe {
+        D3D12SerializeRootSignature(
+            &desc,
+            D3D_ROOT_SIGNATURE_VERSION_1_0,
+            &mut blob,
+            Some(&mut error),
+        )
+    };
+    if let Err(e) = serialized {
+        if let Some(error) = error {
+            // SAFETY: the blob's own bytes.
+            let text = unsafe {
+                std::slice::from_raw_parts(
+                    error.GetBufferPointer().cast::<u8>(),
+                    error.GetBufferSize(),
+                )
+            };
+            tracing::warn!(
+                "depth conversion root signature: {}",
+                String::from_utf8_lossy(text)
+            );
+        }
+        return Err(e);
+    }
+    let blob = blob.ok_or_else(windows::core::Error::empty)?;
+    // SAFETY: the blob's own bytes, alive through `CreateRootSignature`.
+    unsafe {
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
     }
 }
 
@@ -572,5 +670,73 @@ mod tests {
         assert_eq!(again(DEPTH, &mut last, DEPTH, false), None);
         assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
         assert_eq!(last, Some(TWIN));
+    }
+
+    /// When the shader blob carries no embedded root signature (as with Wine's
+    /// builtin `d3dcompiler_47`, which drops `[RootSignature]`), the converter
+    /// builds its signature via `D3D12SerializeRootSignature` and converts
+    /// 16-bit depth to 24-bit and back.
+    #[test]
+    fn converter_falls_back_when_shader_blob_has_no_root_signature() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let stripped = SOURCE.replace("[RootSignature(RS)]", "");
+        assert_ne!(stripped, SOURCE);
+        let c = compile_source(&stripped).expect("fallback converter");
+        let (buf, data) = host.shared_buffer(512).unwrap();
+        // 4x4 16-bit depth at offset 0 (pitch 8), 24-bit depth at offset 256 (pitch 16).
+        for i in 0..16usize {
+            // SAFETY: inside the mapped 512-byte buffer.
+            unsafe { (data.add(i * 2) as *mut u16).write(0x1234) };
+        }
+        let list = host.new_list().unwrap();
+        let to_depth = [4u32, 4, 8, 0, 16, 256, 1, 0];
+        // SAFETY: an open list, live converter and shared buffer.
+        unsafe {
+            list.list.SetComputeRootSignature(&c.root);
+            list.list.SetPipelineState(&c.pso);
+            list.list
+                .SetComputeRootUnorderedAccessView(1, buf.GetGPUVirtualAddress());
+            list.list
+                .SetComputeRoot32BitConstants(0, 8, to_depth.as_ptr().cast(), 0);
+            list.list.Dispatch(1, 4, 1);
+            list.list.ResourceBarrier(&[uav_barrier()]);
+        }
+        list.close();
+        host.execute(&[&list]);
+        for i in 0..16usize {
+            // SAFETY: inside the mapped 512-byte buffer.
+            let got = unsafe { (data.add(256 + i * 4) as *const u32).read() };
+            assert_eq!(got, 0x123412, "24-bit depth at texel {i}");
+        }
+        // Reverse: 24-bit 0.5 (0x800000) -> 16-bit 32768 (0x8000).
+        for i in 0..16usize {
+            // SAFETY: inside the mapped 512-byte buffer.
+            unsafe {
+                (data.add(i * 2) as *mut u16).write(0);
+                (data.add(256 + i * 4) as *mut u32).write(0x800000);
+            }
+        }
+        list.reset();
+        let to_twin = [4u32, 4, 8, 0, 16, 256, 0, 0];
+        // SAFETY: an open list, live converter and shared buffer.
+        unsafe {
+            list.list.SetComputeRootSignature(&c.root);
+            list.list.SetPipelineState(&c.pso);
+            list.list
+                .SetComputeRootUnorderedAccessView(1, buf.GetGPUVirtualAddress());
+            list.list
+                .SetComputeRoot32BitConstants(0, 8, to_twin.as_ptr().cast(), 0);
+            list.list.Dispatch(1, 4, 1);
+            list.list.ResourceBarrier(&[uav_barrier()]);
+        }
+        list.close();
+        host.execute(&[&list]);
+        for i in 0..16usize {
+            // SAFETY: inside the mapped 512-byte buffer.
+            let got = unsafe { (data.add(i * 2) as *const u16).read() };
+            assert_eq!(got, 32768, "16-bit depth at texel {i}");
+        }
     }
 }
