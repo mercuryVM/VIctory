@@ -115,10 +115,16 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     }
 }
 
+/// Lowerings [`lower_program`] makes, each with one more phi given up on,
+/// before it stops. Across the title's programs those that translate need
+/// at most 68; the console flow of the largest ray-tracing programs went on
+/// past 500 (over four minutes each) and failed anyway.
+const MAX_TRIES: usize = 128;
+
 fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     let mut direct_center = false;
-    loop {
+    for _ in 0..MAX_TRIES {
         let mut lower = Lower::new(parts, &bad, numeric_selects);
         if direct_center {
             lower.s.flags |= flags::BARYCENTRICS;
@@ -157,6 +163,10 @@ fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, Shader
             Err(Stop::Fail(e)) => return Err(e),
         }
     }
+    Err(ShaderError::Unsupported {
+        offset: 0,
+        what: "phis that do not settle in 128 lowerings",
+    })
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
