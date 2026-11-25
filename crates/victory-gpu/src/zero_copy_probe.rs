@@ -275,7 +275,7 @@ fn zero_copy_layout_probe() {
         let h3: ID3D12Heap = device13.OpenExistingHeapFromAddress1(v3 as *const _, small).unwrap();
         let b3 = gpu.placed(&h3).unwrap();
         let pageable: ID3D12Pageable = h3.cast().unwrap();
-        let evicted = gpu.device.Evict(1, &Some(pageable));
+        let evicted = gpu.device.Evict(&[Some(pageable)]);
         let unmapped = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v3.cast() });
         println!("  evicted ({evicted:?}) with a buffer alive, then unmap: returned {unmapped}");
         drop(b3);

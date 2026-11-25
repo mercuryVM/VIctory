@@ -43,6 +43,9 @@ pub(crate) struct Shadow {
     /// what the GPU wrote differs. Disjoint segments (offset, bytes) in
     /// order, and the 64 KiB pieces (by title address) already compared.
     before: Mutex<Snapshot>,
+    /// Not a copy: a buffer over title memory itself (`crate::inplace`),
+    /// which nothing brings up to date or copies back.
+    in_place: bool,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -154,6 +157,9 @@ impl Shadow {
     // shortcut: a page the copy holds only in part (at its ends) has no
     // "copied" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
+        if self.in_place {
+            return 0; // the GPU wrote title memory itself
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
@@ -192,6 +198,10 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.in_place {
+            list.keep(&self.buffer);
+            return;
+        }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
@@ -206,7 +216,30 @@ impl Shadow {
             tracked: crate::watch::track(start as usize, len as usize, true),
             pending: Mutex::default(),
             before: Mutex::default(),
+            in_place: false,
         }
+    }
+
+    /// A buffer over title memory `[start, start + len)` itself (its GPU
+    /// address `gpu`): what the title writes there the GPU reads, and the
+    /// other way round, so it is never brought up to date nor copied back.
+    pub(crate) fn new_in_place(buffer: ID3D12Resource, gpu: u64, start: u64, len: u64) -> Shadow {
+        Shadow {
+            buffer,
+            data: start as *mut u8,
+            gpu,
+            start,
+            len,
+            tracked: None,
+            pending: Mutex::default(),
+            before: Mutex::default(),
+            in_place: true,
+        }
+    }
+
+    /// Whether this is title memory used in place (not a copy).
+    pub(crate) fn is_in_place(&self) -> bool {
+        self.in_place
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -226,6 +259,9 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.in_place {
+            return;
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -238,6 +274,9 @@ impl Shadow {
     /// heap), in reused memory (fresh snapshots cost ~2.3 million page
     /// faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        if self.in_place {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -299,6 +338,9 @@ impl Shadow {
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        if self.in_place {
+            return 0;
+        }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
@@ -379,6 +421,9 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if self.in_place {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -482,7 +527,7 @@ pub(crate) fn generation() -> u64 {
     GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
 
-fn changed() {
+pub(crate) fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
@@ -526,6 +571,11 @@ fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: 
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    if crate::inplace::enabled()
+        && let Some(shadow) = crate::inplace::find(address, end)
+    {
+        return Some(shadow);
+    }
     let mut map = buffers();
     let key = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end);
     let Some(key) = key else {
@@ -710,6 +760,7 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
     let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.extend(crate::inplace::all());
     all
 }
 
@@ -727,6 +778,7 @@ pub(crate) fn near(va: u64) -> String {
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
     );
+    all.extend(crate::inplace::all().iter().map(|s| (s.gpu, s.start, s.len)));
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();
     let mut text = match below {

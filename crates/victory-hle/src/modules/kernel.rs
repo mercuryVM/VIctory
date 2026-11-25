@@ -11,6 +11,16 @@ use std::ffi::{CStr, c_void};
 
 use crate::{HleModule, HostPolicy, hle_export, registry, runtime};
 
+/// The title's `VirtualFree`: title memory the host GPU uses in place
+/// (`VICTORY_ZERO_COPY`) has a heap open on it, which keeps the system from
+/// freeing it, so that goes first.
+pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32 {
+    use windows_sys::Win32::System::Memory::MEM_RELEASE;
+    victory_gpu::title_memory_freeing(address as usize, size, kind & MEM_RELEASE != 0);
+    // SAFETY: the title's own arguments, as it passed them.
+    unsafe { windows_sys::Win32::System::Memory::VirtualFree(address, size, kind) }
+}
+
 /// `GetModuleHandleW(NULL)` must return the title's image, not our exe;
 /// title images and our console modules are found by name.
 pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
@@ -369,12 +379,14 @@ pub(crate) fn module() -> HleModule {
             "kernel32.dll",
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
+            "api-ms-win-core-memory-*",
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
         ],
         exports: vec![
+            hle_export!(VirtualFree),
             hle_export!(GetModuleHandleW),
             hle_export!(GetModuleHandleA),
             hle_export!(GetModuleFileNameW),

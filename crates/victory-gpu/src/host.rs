@@ -2107,6 +2107,10 @@ impl Batch {
         address: usize,
         len: usize,
     ) {
+        // Title memory used in place: what shaders write is there already.
+        if shadow.is_in_place() {
+            return;
+        }
         if self.new_gpu_write(shadow, address, len) {
             // The first declaration needs the refreshed bytes for its snapshot.
             // Another declaration of this exact range is already pending until
@@ -2117,6 +2121,9 @@ impl Batch {
     }
 
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        if shadow.is_in_place() {
+            return;
+        }
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
             return;
