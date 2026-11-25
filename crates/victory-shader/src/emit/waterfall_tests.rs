@@ -73,6 +73,7 @@ fn build_with_handle_count(words: &[u32], buffers: bool, nonuniform_handles: u32
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        linked_cols: None,
     })
     .expect("lower");
     assert_eq!(lowered.nonuniform_handles, nonuniform_handles);

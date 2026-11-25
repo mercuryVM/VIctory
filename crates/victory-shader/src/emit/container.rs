@@ -138,6 +138,23 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     out
 }
 
+/// The most a mesh shader's outputs may take, in bytes (D3D12).
+pub(crate) const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
+
+/// A mesh shader's output size as the DXIL validator measures it against
+/// [`MESH_OUTPUT_LIMIT`]: 4 bytes per component of every vertex element
+/// and primitive element, times the maxima rounded up to multiples of 32.
+pub(crate) fn mesh_output_bytes(
+    vertex: &[SigElement],
+    primitive: &[SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> u64 {
+    let scalars = |els: &[SigElement]| els.iter().map(|e| u64::from(e.cols)).sum::<u64>();
+    let align = |n: u32| u64::from(n).next_multiple_of(32);
+    4 * (scalars(vertex) * align(max_vertices) + scalars(primitive) * align(max_primitives))
+}
+
 /// A resource bound by register, as `PSV0` lists it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Binding {
@@ -420,5 +437,43 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    fn element(row: u32, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: "TEXCOORD".into(),
+            index: row,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn mesh_output_size_counts_components_and_aligned_maxima() {
+        // Components, not rows: 4 + 3 + 1 (two elements share row 1) and 2.
+        let vertex = [element(0, 0, 4), element(1, 0, 3), element(1, 3, 1)];
+        let primitive = [element(0, 0, 2)];
+        assert_eq!(
+            mesh_output_bytes(&vertex, &primitive, 64, 128),
+            4 * (8 * 64 + 2 * 128)
+        );
+        // Maxima round up to multiples of 32.
+        assert_eq!(
+            mesh_output_bytes(&vertex, &primitive, 33, 1),
+            mesh_output_bytes(&vertex, &primitive, 64, 32)
+        );
+        assert_eq!(mesh_output_bytes(&[], &[], 256, 256), 0);
+        // 32 components at 256 vertices are the limit itself; a primitive
+        // output on top passes it.
+        let rows: Vec<SigElement> = (0..8).map(|r| element(r, 0, 4)).collect();
+        assert_eq!(mesh_output_bytes(&rows, &[], 256, 256), MESH_OUTPUT_LIMIT);
+        let over = mesh_output_bytes(&rows, &primitive, 256, 1);
+        assert_eq!(over, MESH_OUTPUT_LIMIT + 4 * 2 * 32);
     }
 }
