@@ -87,6 +87,21 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// each a device removal shortly after; #59).
 const DYNAMIC: u32 = 1 << 18;
 
+/// Dynamic slots taken now, over all view heaps, and the most taken at
+/// once since [`take_dynamic_peak`] (for the frame line).
+static DYNAMIC_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DYNAMIC_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Dynamic slots of the largest view heap.
+static DYNAMIC_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The most dynamic slots taken at once (over all view heaps) since the
+/// last call, and the dynamic slots of the largest view heap.
+pub(crate) fn take_dynamic_peak() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = DYNAMIC_TAKEN.load(Relaxed);
+    (DYNAMIC_PEAK.swap(now, Relaxed), DYNAMIC_TOTAL.load(Relaxed))
+}
+
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
@@ -141,8 +156,10 @@ impl HostHeap {
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
+                    // The full dynamic range, as upstream #1548 proposes: fewer
+                    // title slots mirrored, more for the tables past them.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - DYNAMIC, DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -168,6 +185,7 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        DYNAMIC_TOTAL.fetch_max(u64::from(extra), std::sync::atomic::Ordering::Relaxed);
         let h = HostHeap {
             heap,
             cpu,
@@ -316,6 +334,11 @@ impl HostHeap {
         };
         taken[first..first + n].fill(true);
         *next = ((first + n) % self.dynamic as usize) as u32;
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let now = DYNAMIC_TAKEN.fetch_add(n as u64, Relaxed) + n as u64;
+            DYNAMIC_PEAK.fetch_max(now, Relaxed);
+        }
         Some(self.count + first as u32)
     }
 
@@ -366,7 +389,9 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            let freed = slots.iter().filter(|&&t| t).count() as u64;
             slots.fill(false);
+            DYNAMIC_TAKEN.fetch_sub(freed, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
