@@ -8,6 +8,9 @@
 // would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(all(windows, feature = "diagnostics"))]
+mod press_file;
+
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ops::Deref;
@@ -372,6 +375,8 @@ pub struct Hub {
     /// Apart from the state: XInput can be slow, and the title reads
     /// readings every frame.
     source: Mutex<Box<dyn Source>>,
+    #[cfg(all(windows, feature = "diagnostics"))]
+    press_file: Option<Mutex<press_file::PressFile>>,
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
@@ -403,6 +408,10 @@ impl Hub {
             },
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
+            #[cfg(all(windows, feature = "diagnostics"))]
+            press_file: std::env::var_os("VICTORY_PRESS_FILE")
+                .filter(|path| !path.is_empty())
+                .map(|path| Mutex::new(press_file::PressFile::new(path.into()))),
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
@@ -445,8 +454,22 @@ impl Hub {
     fn poll(&self) {
         let (pads, keys) = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let mut pads = [None; PADS + 1];
+            for (slot, pad) in pads[..PADS].iter_mut().enumerate() {
+                *pad = source.pad(slot);
+            }
+            let keys = source.keys();
+            if pads[..PADS].iter().all(Option::is_none) {
+                pads[FALLBACK] = Some(fallback(&keys));
+            }
+            #[cfg(all(windows, feature = "diagnostics"))]
+            if let Some(file) = &self.press_file
+                && let Some(button) = lock(file).sample(std::time::Instant::now())
+                && let Some(pad) = pads.iter_mut().flatten().next()
+            {
+                pad.buttons |= button;
+            }
+            (pads, keys)
         };
         let drain = {
             let mut state = self.state();
@@ -526,17 +549,14 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
+        pads: [Option<PadState>; PADS + 1],
         keys: Vec<KeyState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
-        self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
     }
@@ -918,7 +938,7 @@ fn forget(this: This, token: u64) {
 extern "system" fn stop_callback(this: This, token: u64) {
     forget(this, token);
 }
-/// Stops the callback, then waits up to `timeout` µs for a call of it that
+/// Stops the callback, then waits up to `timeout` Âµs for a call of it that
 /// is running; false on time-out, or from inside that callback (it cannot
 /// wait for itself), as documented. Either way it is never called again.
 extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> bool {
@@ -936,7 +956,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
