@@ -407,7 +407,7 @@ impl State {
         };
         self.heap_of(table)
             .and_then(|heap| Some((heap.host()?, heap.index(table)?)))
-            .is_some_and(|(host, index)| index >= host.count())
+            .is_some_and(|(host, index)| !host.remapped() && index >= host.count())
     }
 
     /// The host addresses of the bound view heap's title-memory page table
@@ -814,7 +814,7 @@ impl State {
         };
         let copy = std::sync::Arc::as_ptr(&shadow) as usize;
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
-            return Some((index, offset));
+            return Some((host.shader_index(index), offset));
         }
         let (run_heap, next, end) = self.root_run;
         if run_heap != key || next >= end {
@@ -830,7 +830,8 @@ impl State {
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
         host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
         self.root_slots.insert((key, copy, uav), index);
-        Some((index, offset))
+        // Shaders see it at its index in a capped heap's map.
+        Some((host.shader_index(index), offset))
     }
 
     /// Gives the host list the title's heaps if it has others.
@@ -1108,7 +1109,7 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            if !host.remapped() && index >= host.count() {
                 fresh.push(u.slot);
             }
         }

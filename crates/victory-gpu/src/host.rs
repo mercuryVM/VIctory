@@ -2607,6 +2607,10 @@ impl Meter {
             if !slot_use.is_empty() {
                 tracing::info!("title view slots draws read per frame, by range:{slot_use}");
             }
+            let pages = crate::descriptor::host::pool_use();
+            if !pages.is_empty() {
+                tracing::info!("{pages}");
+            }
             if let Some(host) = host() {
                 host.log_video_memory();
             }
@@ -2946,6 +2950,7 @@ pub(crate) fn retire(resource: ID3D12Resource) {
 
 /// After a submission has run, with none running: the retired resources go.
 pub(crate) fn release_retired() {
+    crate::descriptor::host::released();
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
     drop(retired);
 }

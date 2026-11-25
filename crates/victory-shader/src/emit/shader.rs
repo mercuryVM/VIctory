@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -29,6 +29,13 @@ pub const HEAP_SAMPLERS: u32 = 2048;
 /// holds no buffer view where a shader reads one at an index it computes
 /// (`emit`, "Buffer views at computed heap indices").
 pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+/// View heap indices shaders compute are title indices (and the host's
+/// own past them, below [`HEAP_VIEWS`]); the host may keep a slot elsewhere
+/// in its heap (NVIDIA takes 10^6 views, a title's heap may hold more).
+/// The host slot of index `i` is at dword `HEAP_MAP + i` of the view-stride
+/// table (`t`[`VIEW_STRIDES`]), which shaders read before they index the
+/// heap.
+pub const HEAP_MAP: u32 = HEAP_VIEWS;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -458,7 +465,26 @@ impl Shader {
         // reads whatever memory follows its heap): the last slot instead.
         let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
-        let index = self.m.select(block, over, last, index);
+        let mut index = self.m.select(block, over, last, index);
+        if !sampler {
+            // Where the host keeps the slot (`HEAP_MAP`).
+            let table = self.root_srv_handle(VIEW_STRIDES);
+            let first = self.m.i32(HEAP_MAP);
+            let entry = self.m.bin(block, Bin::Add, index, first);
+            let four = self.m.i32(4);
+            let at = self.m.bin(block, Bin::Mul, entry, four);
+            let (iu, mask) = (self.m.undef(self.t.i32), self.m.i8(1));
+            let r = self.op(
+                block,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.t.res_ret,
+                139,
+                &[table, at, iu, mask, four],
+            );
+            let host = self.m.extract(block, r, 0);
+            index = self.m.cast(block, Cast::Bitcast, host, self.t.i32);
+        }
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,

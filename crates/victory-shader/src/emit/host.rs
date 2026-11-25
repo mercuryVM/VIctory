@@ -132,6 +132,74 @@ fn default_adapter_is_warp() -> bool {
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
 static WARP_LOCK: Mutex<()> = Mutex::new(());
 
+/// Root signatures made, latest last, with the index of their view-stride
+/// table parameter if they have one (every one is listed: a new root
+/// signature may take a released one's address).
+static STRIDES: std::sync::Mutex<Vec<(usize, Option<u32>)>> = std::sync::Mutex::new(Vec::new());
+
+/// A view-stride table as the host gives one (`t`[`super::VIEW_STRIDES`]):
+/// `strides` from index 0, then the identity map entries shaders read
+/// heap indices through (`super::HEAP_MAP`).
+/// [`stride_table`] of no strides, made once per device (16 MiB each: one
+/// per draw ran the test process out of memory).
+#[cfg(test)]
+fn default_stride_table(device: &ID3D12Device) -> Result<ID3D12Resource, String> {
+    static MADE: std::sync::Mutex<Vec<(usize, ID3D12Resource)>> = std::sync::Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let key = device.as_raw() as usize;
+    if let Some((_, b)) = made.iter().find(|m| m.0 == key) {
+        return Ok(b.clone());
+    }
+    let b = stride_table(device, &[])?;
+    made.push((key, b.clone()));
+    Ok(b)
+}
+
+fn stride_table(device: &ID3D12Device, strides: &[u32]) -> Result<ID3D12Resource, String> {
+    let dwords = (super::HEAP_MAP + super::HEAP_VIEWS) as usize;
+    let mut data = vec![0u32; dwords];
+    data[..strides.len().min(super::HEAP_VIEWS as usize)]
+        .copy_from_slice(&strides[..strides.len().min(super::HEAP_VIEWS as usize)]);
+    for i in 0..super::HEAP_VIEWS {
+        data[(super::HEAP_MAP + i) as usize] = i;
+    }
+    // SAFETY: plain creation, mapping and filling of an upload buffer.
+    unsafe {
+        let mut b: Option<ID3D12Resource> = None;
+        device
+            .CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_UPLOAD,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: (dwords * 4) as u64,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut b,
+            )
+            .map_err(err)?;
+        let b = b.ok_or("no stride table")?;
+        let mut p = std::ptr::null_mut();
+        b.Map(0, None, Some(&mut p)).map_err(err)?;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), p.cast::<u32>(), dwords);
+        b.Unmap(0, None);
+        Ok(b)
+    }
+}
+
 impl Host {
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
         self.warp
@@ -218,6 +286,12 @@ impl Host {
             .collect();
         views.sort_unstable();
         views.dedup();
+        // The view-stride table last, after the title-memory views: every
+        // shader indexing the heap reads it, and tests name the others by
+        // their place.
+        let stride_view = (super::VIEW_STRIDES, 1);
+        let with_strides = views.contains(&stride_view);
+        views.retain(|&v| v != stride_view);
         let mut views: Vec<(u32, u32, u8)> = views
             .into_iter()
             .map(|(slot, kind)| (u32::from(slot), super::ROOT_CBV_SPACE, kind))
@@ -231,7 +305,15 @@ impl Host {
         if stages.iter().any(|(s, _)| s.view_addresses) {
             views.push((1, super::MEMORY_SPACE, 1));
         }
+        if with_strides {
+            views.push((u32::from(super::VIEW_STRIDES), super::ROOT_CBV_SPACE, 1));
+        }
+        let mut strides = None;
         for (register, space, kind) in views {
+            if (register, space, kind) == (u32::from(super::VIEW_STRIDES), super::ROOT_CBV_SPACE, 1)
+            {
+                strides = Some(params.len() as u32);
+            }
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
                     0 => D3D12_ROOT_PARAMETER_TYPE_CBV,
@@ -295,7 +377,12 @@ impl Host {
         let bytes = unsafe {
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
         };
-        self.root_signature_bytes(bytes)
+        let made = self.root_signature_bytes(bytes)?;
+        STRIDES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((made.as_raw() as usize, strides));
+        Ok(made)
     }
 
     /// Creates a root signature from serialized root signature bytes (or a
@@ -303,7 +390,30 @@ impl Host {
     pub fn root_signature_bytes(&self, bytes: &[u8]) -> Result<ID3D12RootSignature, String> {
         let _guard = self.lock_warp();
         // SAFETY: `bytes` is a live slice of root-signature or container bytes.
-        unsafe { self.device.CreateRootSignature(0, bytes) }.map_err(err)
+        let made: ID3D12RootSignature =
+            unsafe { self.device.CreateRootSignature(0, bytes) }.map_err(err)?;
+        // Listed without a view-stride table (`root_signature_for` lists
+        // its own after): it may take a released one's address.
+        STRIDES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((made.as_raw() as usize, None));
+        Ok(made)
+    }
+
+    /// The root parameter of the view-stride table (`t`[`super::VIEW_STRIDES`])
+    /// in a root signature [`Host::root_signature_for`] made, if a stage
+    /// reads it: bound to [`stride_table`] of no strides unless a
+    /// dispatch's roots give one.
+    pub fn strides_param(root: &ID3D12RootSignature) -> Option<u32> {
+        let key = root.as_raw() as usize;
+        STRIDES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|f| f.0 == key)
+            .and_then(|f| f.1)
     }
 
     /// A compute pipeline; user data is root parameter 0.
@@ -656,6 +766,15 @@ impl Host {
                 user_data.as_ptr().cast(),
                 0,
             );
+            // The view-stride table every heap index goes through.
+            let _strides = match Host::strides_param(&root) {
+                Some(param) => {
+                    let b = stride_table(dev, &[])?;
+                    list.SetComputeRootShaderResourceView(param, b.GetGPUVirtualAddress());
+                    Some(b)
+                }
+                None => None,
+            };
             list.Dispatch(1, 1, 1);
             list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                 Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -1128,6 +1247,10 @@ impl Host {
                     }
                     Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
+            }
+            if let Some(param) = Host::strides_param(root) {
+                let b = default_stride_table(dev)?;
+                list.SetGraphicsRootShaderResourceView(param, b.GetGPUVirtualAddress());
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
@@ -1827,7 +1950,11 @@ impl Host {
                         list.SetComputeRootDescriptorTable(*param, at);
                     }
                     Root::View { srv, data } => {
-                        let b = upload(data)?;
+                        let b = if *srv && Host::strides_param(root) == Some(*param) {
+                            stride_table(dev, data)?
+                        } else {
+                            upload(data)?
+                        };
                         let va = b.GetGPUVirtualAddress();
                         if *srv {
                             list.SetComputeRootShaderResourceView(*param, va);
@@ -1852,6 +1979,13 @@ impl Host {
                         uavs.push((b, None, n, rb));
                     }
                 }
+            }
+            // The view-stride table where the dispatch gives none.
+            if let Some(param) = Host::strides_param(root)
+                && !d.roots.iter().any(|r| r.0 == param)
+            {
+                let b = default_stride_table(dev)?;
+                list.SetComputeRootShaderResourceView(param, b.GetGPUVirtualAddress());
             }
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
