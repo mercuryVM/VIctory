@@ -12,7 +12,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{HostShader, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -393,6 +393,10 @@ impl HostPipeline {
                 shaders,
             );
         }
+        let linked = match stages.as_slice() {
+            [(ms, D3D12_SHADER_VISIBILITY_MESH, _), (ps, D3D12_SHADER_VISIBILITY_PIXEL, _)] => linked(ms, ps),
+            _ => None,
+        };
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -511,15 +515,22 @@ impl HostPipeline {
                 return None;
             }
         };
-        // The bytecode of the stage with this visibility (none if absent).
+        // The bytecode of the stage with this visibility (none if absent);
+        // a mesh and pixel pair linked for each other replaces both.
         let code = |visibility: D3D12_SHADER_VISIBILITY| {
             let stage = stages.iter().find(|s| s.1 == visibility);
+            let linked = linked.as_ref().and_then(|(ms, ps)| match visibility {
+                D3D12_SHADER_VISIBILITY_MESH => Some(ms),
+                D3D12_SHADER_VISIBILITY_PIXEL => Some(ps),
+                _ => None,
+            });
             stage
                 .and_then(|&(s, _, program)| s.translated_as(program))
-                .map_or(D3D12_SHADER_BYTECODE::default(), |t| {
+                .map(|t| linked.unwrap_or(&t.host))
+                .map_or(D3D12_SHADER_BYTECODE::default(), |h| {
                     D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                        BytecodeLength: t.host.dxil.len(),
+                        pShaderBytecode: h.dxil.as_ptr().cast(),
+                        BytecodeLength: h.dxil.len(),
                     }
                 })
         };
@@ -797,6 +808,37 @@ fn mesh_pipeline(
         // SAFETY: as above.
         || unsafe { device.CreatePipelineState(&desc) },
     )
+}
+
+/// A mesh program whose outputs pass D3D12's 32 KiB (the validator refuses
+/// it; drivers may take it and misbehave) and its pixel program, re-emitted
+/// for each other without the values the pixel program never reads
+/// ([`victory_shader::emit::translate_linked`]). `None` when the mesh
+/// program fits, or the pair cannot be linked with the bindings the root
+/// signature is made from.
+fn linked(ms: &Arc<Shader>, ps: &Arc<Shader>) -> Option<(HostShader, HostShader)> {
+    let (m, p) = (&ms.translated()?.host, &ps.translated()?.host);
+    let same = |a: &HostShader, b: &HostShader| {
+        a.user_data == b.user_data
+            && a.samplers == b.samplers
+            && a.root_cbvs == b.root_cbvs
+            && a.root_srvs == b.root_srvs
+    };
+    match victory_shader::emit::translate_linked(&ms.container, &ps.container, &p.dxil) {
+        Ok(None) => None,
+        Ok(Some((lm, lp))) if same(&lm, m) && same(&lp, p) => {
+            tracing::info!(shaders = ?[ms, ps], "mesh outputs past 32 KiB: linked to the pixel shader");
+            Some((lm, lp))
+        }
+        Ok(Some(_)) => {
+            tracing::warn!(shaders = ?[ms, ps], "mesh outputs past 32 KiB: linked shaders bind differently, kept as they are");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(shaders = ?[ms, ps], error = %e, "mesh outputs past 32 KiB: not linked");
+            None
+        }
+    }
 }
 
 /// The bytes of shader code (none for an absent stage).
