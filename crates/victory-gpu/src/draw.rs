@@ -89,6 +89,9 @@ pub(crate) struct State {
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
+    /// The view-stride table last kept in the host list, so that its draws
+    /// keep it once rather than once per stage ([`State::bind`]).
+    stride_table: usize,
 }
 
 impl Drop for State {
@@ -690,7 +693,12 @@ impl State {
                             not_run("view strides without a view heap");
                             return false;
                         };
-                        list.keep(table);
+                        // Kept once per table: the same table is bound again
+                        // by every draw of this pipeline.
+                        if self.stride_table != table.as_raw() as usize {
+                            self.stride_table = table.as_raw() as usize;
+                            list.keep(table);
+                        }
                         // SAFETY: an open list; the table lives while the list
                         // holds it.
                         unsafe {
