@@ -666,12 +666,11 @@ pub(crate) struct HostList {
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
-    stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    stamps: Mutex<gpu_timestamps::Timestamps>,
 }
 
-/// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
-const STAMPS: u32 = 4096;
+mod gpu_timestamps;
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -1013,7 +1012,7 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
-                stamps: OnceLock::new(),
+                stamps: Mutex::default(),
             })
         }
     }
@@ -1489,80 +1488,11 @@ impl Host {
 }
 
 impl HostList {
-    /// The timestamp heap and its read-back buffer (diagnostics, timing on).
-    #[cfg(feature = "diagnostics")]
-    fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
-        if !timing() {
-            return None;
-        }
-        self.stamps
-            .get_or_init(|| {
-                let device = &host()?.device;
-                let mut heap: Option<ID3D12QueryHeap> = None;
-                let mut back: Option<ID3D12Resource> = None;
-                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
-                let desc = D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: u64::from(STAMPS) * 8,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    ..Default::default()
-                };
-                // SAFETY: plain object creation.
-                unsafe {
-                    device
-                        .CreateQueryHeap(
-                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
-                            &mut heap,
-                        )
-                        .ok()?;
-                    device
-                        .CreateCommittedResource(
-                            &readback,
-                            D3D12_HEAP_FLAG_NONE,
-                            &desc,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            None,
-                            &mut back,
-                        )
-                        .ok()?;
-                }
-                Some((heap?, back?))
-            })
-            .as_ref()
-    }
-
-    /// The noted commands that took longest on the GPU, longest first, as
-    /// (milliseconds, text) (diagnostics, timing on, after the list ran).
+    /// The longest intervals between command markers in the completed list.
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
-            return Vec::new();
-        };
-        let mut data = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
-        // SAFETY: a read-back buffer the finished list resolved into.
-        let stamps: Vec<u64> = unsafe {
-            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
-                return Vec::new();
-            }
-            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
-            back.Unmap(0, None);
-            s
-        };
-        let mut times: Vec<(f64, String)> = (0..count)
-            .map(|i| {
-                let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
-            })
-            .collect();
-        times.sort_by(|a, b| b.0.total_cmp(&a.0));
-        times.truncate(n);
-        times
+        self.stamps.lock().unwrap_or_else(|e| e.into_inner()).slowest(&notes, frequency, n)
     }
 
     /// Whether `node` of the device-removed data (its breadcrumbs) is this
@@ -1589,13 +1519,9 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
-        if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
-            // SAFETY: an open list, our heap and read-back buffer.
-            unsafe {
-                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
-                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
-            }
+        if timing() {
+            let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            self.stamps.lock().unwrap_or_else(|e| e.into_inner()).close(&self.list, notes.len());
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
@@ -1810,12 +1736,11 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if dred_on() {
-            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
-                // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
-            }
             let what = what();
+            let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            if timing() {
+                self.stamps.lock().unwrap_or_else(|e| e.into_inner()).record(&self.list, notes.len());
+            }
             traced(&what);
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
@@ -1823,10 +1748,7 @@ impl HostList {
             unsafe {
                 self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
-            self.notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((what, range));
+            notes.push((what, range));
         }
     }
 
