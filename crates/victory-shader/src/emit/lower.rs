@@ -5539,7 +5539,20 @@ impl<'a> Lower<'a> {
                     return Err("a saturating or negated dot product");
                 }
                 let mut xs = Vec::new();
+                let mut folded = false;
                 for k in 0..2 {
+                    // An inline f16 constant ignores op_sel and op_sel_hi: the
+                    // compiler's fold (`sel_hi_lo`) places the pattern in the
+                    // low half alone, and the instruction reads it as it is.
+                    // A host driver reads a constant dot operand's low half in
+                    // both halves though, so such a dot is taken by hand from
+                    // the byte products rather than through the intrinsic.
+                    if let Some(Operand::Const(cc @ 240..=248)) = v.src.get(k).copied() {
+                        folded = true;
+                        let held = Operand::Const(cc);
+                        xs.push(self.f16_operand(inst, &held)?);
+                        continue;
+                    }
                     let x = s(self, k)?;
                     let (lo, hi) = (v.opsel >> k & 1 != 0, v.opsel_hi >> k & 1 != 0);
                     if (lo, hi) == (false, true) {
@@ -5557,14 +5570,25 @@ impl<'a> Lower<'a> {
                 }
                 let acc = s(self, 2)?;
                 let i32_ty = self.s.t.i32;
-                let r = self.s.op(
-                    c,
-                    "dot4AddPacked.i32",
-                    Attr::ReadNone,
-                    i32_ty,
-                    163,
-                    &[acc, xs[0], xs[1]],
-                );
+                let r = if folded {
+                    let mut dot = acc;
+                    for t in 0..4u8 {
+                        let a = self.select_bits(xs[0], t, true);
+                        let b = self.select_bits(xs[1], t, true);
+                        let p = self.s.m.bin(c, Bin::Mul, a, b);
+                        dot = self.s.m.bin(c, Bin::Add, dot, p);
+                    }
+                    dot
+                } else {
+                    self.s.op(
+                        c,
+                        "dot4AddPacked.i32",
+                        Attr::ReadNone,
+                        i32_ty,
+                        163,
+                        &[acc, xs[0], xs[1]],
+                    )
+                };
                 int(self, r)
             }
             "v_mov_b32" => {
