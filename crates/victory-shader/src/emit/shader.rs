@@ -7,6 +7,17 @@ use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
 pub const USER_DATA_SPACE: u32 = 0;
+/// Groups per row of a folded dispatch. The host runs at most 65,535
+/// groups per dimension, the console more: a one-dimensional dispatch of
+/// more groups runs folded, as rows of this many groups along z, the
+/// groups past the last full row in a second dispatch. Compute shaders
+/// that read their group id read the fold from `b1` in
+/// [`USER_DATA_SPACE`] (one dword; every compute root signature has it): 0
+/// for a dispatch as given, else the first group the dispatch runs plus
+/// one; their group is then that first group plus x plus z times this,
+/// and z is 0.
+pub const GROUP_FOLD_ROW: u32 = 65535;
+
 /// Where immediate samplers are bound: `s<n>` in this space.
 pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
@@ -103,6 +114,9 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// The group fold's handle (`b1` in [`USER_DATA_SPACE`]), once read:
+    /// see [`GROUP_FOLD_ROW`].
+    pub fold: Option<V>,
     /// The title-memory page table's handle, once read.
     pub memory: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
@@ -167,6 +181,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            fold: None,
             memory: None,
             memory_dirty: None,
             view_addresses: None,
@@ -257,6 +272,30 @@ impl Shader {
         );
         // The size is known in `finish`, which fixes this placeholder.
         self.annotate(block, h, 13, u32::MAX)
+    }
+
+    /// The handle of the group fold constant (`b1` in [`USER_DATA_SPACE`],
+    /// one dword), made in the entry block.
+    pub fn fold_handle(&mut self) -> V {
+        if let Some(h) = self.fold {
+            return h;
+        }
+        let one = self.m.i32(1);
+        let bind = [one, one, self.m.i32(USER_DATA_SPACE), self.m.i8(2)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let block = self.entry;
+        let (i, f) = (self.m.i32(1), self.m.bool(false));
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, i, f],
+        );
+        let h = self.annotate(block, h, 13, 16);
+        self.fold = Some(h);
+        h
     }
 
     /// The handle of the root CBV of root parameter `slot`, made in the
@@ -491,6 +530,7 @@ impl Shader {
             s.m.md_value(c)
         };
         if self.user_data > 0
+            || self.fold.is_some()
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
@@ -522,6 +562,29 @@ impl Shader {
                     kind: 2,
                     space: USER_DATA_SPACE,
                     register: 0,
+                    dxil_kind: 13,
+                });
+            }
+            if self.fold.is_some() {
+                let arr = self.m.array(4, self.t.i32);
+                let ty = self.m.named_struct("GroupFold", vec![arr]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let ops = vec![
+                    Some(i32c(&mut self, cbv_list.len() as u32)),
+                    Some(self.m.md_value(u)),
+                    Some(empty),
+                    Some(i32c(&mut self, USER_DATA_SPACE)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, 16)),
+                    None,
+                ];
+                cbv_list.push(Some(self.m.md_node(ops)));
+                bindings.push(Binding {
+                    kind: 2,
+                    space: USER_DATA_SPACE,
+                    register: 1,
                     dxil_kind: 13,
                 });
             }

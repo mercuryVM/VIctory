@@ -205,6 +205,8 @@ pub mod validator;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
+mod fold_tests;
+#[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
 
@@ -214,8 +216,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_STRIDES,
+    GROUP_FOLD_ROW, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE,
+    SAMPLER_SPACE, USER_DATA_SPACE, VIEW_STRIDES,
 };
 
 /// The loop limit without an override: 2^20.

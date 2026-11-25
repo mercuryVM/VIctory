@@ -71,6 +71,9 @@ pub(crate) struct Shader {
     /// (diagnostics: `VICTORY_SKIP_WAVE64`).
     #[cfg(all(windows, feature = "diagnostics"))]
     wave64: OnceLock<bool>,
+    /// Its native program's thread-group size in threads (0: unknown).
+    #[cfg(windows)]
+    group: OnceLock<u32>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -103,6 +106,8 @@ impl Shader {
             translated: Default::default(),
             #[cfg(all(windows, feature = "diagnostics"))]
             wave64: OnceLock::new(),
+            #[cfg(windows)]
+            group: OnceLock::new(),
         }
     }
 }
@@ -270,6 +275,46 @@ fn with_resources(
         None => Vec::new(),
     };
     Ok(Translated { host, used })
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// Its native program's thread-group size in threads: `numthreads` of a
+    /// compute program, the lanes of a mesh program's group; 0 if neither.
+    fn group(&self) -> u32 {
+        *self.group.get_or_init(|| {
+            use victory_shader::native::StageIo;
+            victory_shader::Container::parse(&self.container)
+                .ok()
+                .and_then(|c| {
+                    c.part(victory_shader::FourCC::DXIL)
+                        .map(|p| p.data.to_vec())
+                })
+                .and_then(|d| victory_shader::native::native_programs(&d).ok())
+                .and_then(|ps| {
+                    ps.iter().find_map(|p| match &p.io {
+                        StageIo::Cs(cs) => Some(cs.threads.iter().product::<u32>()),
+                        StageIo::Ms(ms) => Some(ms.threads),
+                        _ => None,
+                    })
+                })
+                .unwrap_or(0)
+        })
+    }
+}
+
+/// The thread-group size in threads of the compute or mesh program of the
+/// pipeline `this` (0 if unknown), and that program's hash.
+#[cfg(windows)]
+pub(crate) fn group_of(this: This) -> (u32, String) {
+    if this.is_null() {
+        return (0, String::new());
+    }
+    pipeline(this)
+        .shaders
+        .iter()
+        .find(|s| matches!(s.stage, "compute" | "mesh"))
+        .map_or((0, String::new()), |s| (s.group(), s.hash.clone()))
 }
 
 #[repr(C)]
