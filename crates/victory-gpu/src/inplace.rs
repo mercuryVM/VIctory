@@ -68,7 +68,11 @@ struct Regions {
     refused: BTreeSet<usize>,
 }
 
-static REGIONS: Mutex<Regions> = Mutex::new(Regions { by_start: BTreeMap::new(), span: 0, refused: BTreeSet::new() });
+static REGIONS: Mutex<Regions> = Mutex::new(Regions {
+    by_start: BTreeMap::new(),
+    span: 0,
+    refused: BTreeSet::new(),
+});
 
 fn regions() -> std::sync::MutexGuard<'static, Regions> {
     REGIONS.lock().unwrap_or_else(|e| e.into_inner())
@@ -106,6 +110,9 @@ pub(crate) fn find(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// The region holding `[address, end)`, the innermost if several do.
 fn holding(r: &Regions, address: usize, end: usize) -> Option<&Arc<Shadow>> {
     let lowest = end.saturating_sub(r.span);
+    if lowest > address {
+        return None;
+    }
     r.by_start
         .range(lowest..=address)
         .rev()
@@ -146,8 +153,14 @@ fn allocation_kind(at: usize) -> Option<(usize, usize, bool)> {
     const MAPPED_PAGE_FILE: u32 = 1 << 3;
     const MAPPED_PHYSICAL: u32 = 1 << 4;
     // SAFETY: filled by the query when it succeeded.
-    let view = unsafe { region.Anonymous.Flags } & (MAPPED_DATA_FILE | MAPPED_PAGE_FILE | MAPPED_PHYSICAL) != 0;
-    (ok != 0 && !region.AllocationBase.is_null()).then_some((region.AllocationBase as usize, region.RegionSize, view))
+    let view = unsafe { region.Anonymous.Flags }
+        & (MAPPED_DATA_FILE | MAPPED_PAGE_FILE | MAPPED_PHYSICAL)
+        != 0;
+    (ok != 0 && !region.AllocationBase.is_null()).then_some((
+        region.AllocationBase as usize,
+        region.RegionSize,
+        view,
+    ))
 }
 
 /// Title GPU memory the runtime reserved (`XMemVirtualAlloc`), by base:
@@ -157,11 +170,17 @@ static TITLE: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 
 /// The runtime reserved title GPU memory `[base, base + len)`.
 pub(crate) fn allocated(base: usize, len: usize) {
-    TITLE.lock().unwrap_or_else(|e| e.into_inner()).insert(base, len);
+    TITLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(base, len);
 }
 
 fn is_title(base: usize) -> bool {
-    TITLE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&base)
+    TITLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&base)
 }
 
 /// The committed pages of `[base, base + len)` around `at`, as one run.
@@ -174,7 +193,10 @@ fn committed_run(base: usize, len: usize, at: usize) -> Option<(usize, usize)> {
         if unsafe { VirtualQuery(cursor as *const _, &mut info, size_of_val(&info)) } == 0 {
             break;
         }
-        let (from, to) = (info.BaseAddress as usize, (info.BaseAddress as usize + info.RegionSize).min(end));
+        let (from, to) = (
+            info.BaseAddress as usize,
+            (info.BaseAddress as usize + info.RegionSize).min(end),
+        );
         if info.State == MEM_COMMIT {
             run = Some(match run {
                 Some((a, b)) if b == from => (a, to),
@@ -238,14 +260,18 @@ fn open(address: usize, end: usize) -> Option<Arc<Shadow>> {
     let started = std::time::Instant::now();
     // SAFETY: committed title memory; the heap is released before the title
     // unmaps or frees it (`release`).
-    let opened = |from: usize, to: usize| unsafe { device13.OpenExistingHeapFromAddress1::<ID3D12Heap>(from as *const _, to - from) };
+    let opened = |from: usize, to: usize| unsafe {
+        device13.OpenExistingHeapFromAddress1::<ID3D12Heap>(from as *const _, to - from)
+    };
     // All of it first (a view is committed whole when mapped; a refusal
     // costs ~1 ms), else the committed pages around the range (walking the
     // regions costs ~0.4 ms each in a guarded view).
     let (heap, from, to) = match opened(from, to) {
         Ok(h) => (h, from, to),
         Err(_) => {
-            let Some((a, b)) = committed_run(from, to - from, address) else { return refuse("not committed") };
+            let Some((a, b)) = committed_run(from, to - from, address) else {
+                return refuse("not committed");
+            };
             let (a, b) = (a.next_multiple_of(ALIGN), b / ALIGN * ALIGN);
             if address < a || end > b {
                 return refuse("the range reaches pages not committed");
@@ -262,7 +288,10 @@ fn open(address: usize, end: usize) -> Option<Arc<Shadow>> {
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         Flags: D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         ..Default::default()
@@ -270,12 +299,21 @@ fn open(address: usize, end: usize) -> Option<Arc<Shadow>> {
     let mut buffer: Option<ID3D12Resource> = None;
     // SAFETY: a buffer over all of the heap.
     if let Err(e) = unsafe {
-        host.device.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+        host.device.CreatePlacedResource(
+            &heap,
+            0,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )
     } {
         return refuse(&format!("buffer refused: {e}"));
     }
     let buffer = buffer?;
-    crate::host::name(&buffer, || format!("title memory in place {from:#x}+{:#x}", to - from));
+    crate::host::name(&buffer, || {
+        format!("title memory in place {from:#x}+{:#x}", to - from)
+    });
     let ms = started.elapsed().as_millis() as u64;
     OPENED[0].fetch_add(1, Relaxed);
     OPENED[1].fetch_add((to - from) as u64, Relaxed);
@@ -291,14 +329,25 @@ fn open(address: usize, end: usize) -> Option<Arc<Shadow>> {
     );
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new_in_place(buffer, gpu, from as u64, (to - from) as u64));
+    let shadow = Arc::new(Shadow::new_in_place(
+        buffer,
+        gpu,
+        from as u64,
+        (to - from) as u64,
+    ));
     let mut r = regions();
     // Another thread may have opened one for the same memory meanwhile.
     if let Some(s) = holding(&r, address, end) {
         return Some(s.clone());
     }
     r.span = r.span.max(to - from);
-    r.by_start.insert(from, Region { shadow: shadow.clone(), _heap: heap });
+    r.by_start.insert(
+        from,
+        Region {
+            shadow: shadow.clone(),
+            _heap: heap,
+        },
+    );
     drop(r);
     crate::shadow::changed();
     Some(shadow)
@@ -306,7 +355,11 @@ fn open(address: usize, end: usize) -> Option<Arc<Shadow>> {
 
 /// Every region's buffer object (for [`crate::shadow::all`]).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    regions().by_start.values().map(|r| r.shadow.clone()).collect()
+    regions()
+        .by_start
+        .values()
+        .map(|r| r.shadow.clone())
+        .collect()
 }
 
 /// The title is about to unmap or free `[at, at + len)`: the heaps over it
@@ -332,10 +385,16 @@ fn release_now(at: usize, len: usize) {
             })
             .map(|(&k, _)| k)
             .collect();
-        let gone = keys.into_iter().filter_map(|k| r.by_start.remove(&k).map(|v| (k, v))).collect();
+        let gone = keys
+            .into_iter()
+            .filter_map(|k| r.by_start.remove(&k).map(|v| (k, v)))
+            .collect();
         // The allocation may come back as something else: ask again then.
         r.refused.retain(|&base| base < at || base >= end);
-        TITLE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&base, _| base < at || base >= end);
+        TITLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&base, _| base < at || base >= end);
         gone
     };
     if gone.is_empty() {
@@ -379,7 +438,10 @@ pub(crate) fn log(frames: f64) {
     if !enabled() {
         return;
     }
-    let f: Vec<f64> = FRAME.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    let f: Vec<f64> = FRAME
+        .iter()
+        .map(|a| a.swap(0, Relaxed) as f64 / frames)
+        .collect();
     let open = regions().by_start.len();
     tracing::info!(
         "zero-copy per frame: {:.0} ranges in place {:.1} MB, {:.0} on the copy path {:.1} MB; {:.1} releases ({:.1} still held); \
@@ -400,7 +462,9 @@ pub(crate) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
 
     const MIB: usize = 1 << 20;
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
@@ -412,11 +476,17 @@ mod tests {
         // SAFETY: plain objects of ours, used once.
         unsafe {
             let queue: ID3D12CommandQueue = device
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
                 .unwrap();
-            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-            let list: ID3D12GraphicsCommandList =
-                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap();
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .unwrap();
             list.CopyBufferRegion(dst, 0, src, 0, len as u64);
             list.Close().unwrap();
             queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
@@ -430,23 +500,35 @@ mod tests {
 
     fn mapped(kind: D3D12_HEAP_TYPE, len: usize) -> (ID3D12Resource, *mut u8) {
         let device = &crate::host::host().unwrap().device;
-        let heap = D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: kind,
+            ..Default::default()
+        };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: len as u64,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let state = if kind == D3D12_HEAP_TYPE_UPLOAD { D3D12_RESOURCE_STATE_GENERIC_READ } else { D3D12_RESOURCE_STATE_COPY_DEST };
+        let state = if kind == D3D12_HEAP_TYPE_UPLOAD {
+            D3D12_RESOURCE_STATE_GENERIC_READ
+        } else {
+            D3D12_RESOURCE_STATE_COPY_DEST
+        };
         let mut r: Option<ID3D12Resource> = None;
         let mut p = std::ptr::null_mut();
         // SAFETY: plain creation and mapping.
         unsafe {
-            device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r).unwrap();
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r)
+                .unwrap();
             r.as_ref().unwrap().Map(0, None, Some(&mut p)).unwrap();
         }
         (r.unwrap(), p.cast())
@@ -462,15 +544,33 @@ mod tests {
         }
         let len = 4 * MIB;
         // SAFETY: a fresh write-watched allocation, as the runtime makes.
-        let title = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
         assert_ne!(title, 0);
         // Not the runtime's title memory: the copy path.
         assert!(find(title as u64, title as u64 + 64).is_none());
         allocated(title, len);
         let shadow = find(title as u64 + 4096, title as u64 + 8192).expect("in place");
         assert!(shadow.is_in_place());
-        assert_eq!(shadow.range(), (title as u64, len as u64), "the whole allocation");
-        assert!(Arc::ptr_eq(&find(title as u64 + MIB as u64, title as u64 + 2 * MIB as u64).unwrap(), &shadow), "one heap");
+        assert!(holding(&regions(), title, usize::MAX).is_none());
+        assert_eq!(
+            shadow.range(),
+            (title as u64, len as u64),
+            "the whole allocation"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &find(title as u64 + MIB as u64, title as u64 + 2 * MIB as u64).unwrap(),
+                &shadow
+            ),
+            "one heap"
+        );
         // The title writes; the GPU reads it, with no refresh.
         // SAFETY: committed memory of ours.
         unsafe { std::ptr::write_bytes(title as *mut u8, 0x5a, len) };
@@ -478,7 +578,11 @@ mod tests {
         let (back, b) = mapped(D3D12_HEAP_TYPE_READBACK, len);
         gpu_copy(&back, &shadow.buffer, len);
         // SAFETY: the readback mapping, the copy done.
-        assert!(unsafe { std::slice::from_raw_parts(b, len) }.iter().all(|&x| x == 0x5a));
+        assert!(
+            unsafe { std::slice::from_raw_parts(b, len) }
+                .iter()
+                .all(|&x| x == 0x5a)
+        );
         // The GPU writes; the title reads it, with no copy-back.
         let (up, u) = mapped(D3D12_HEAP_TYPE_UPLOAD, len);
         // SAFETY: the upload mapping.
@@ -488,14 +592,22 @@ mod tests {
         assert_eq!(shadow.copy_back(title, len), 0);
         assert_eq!(shadow.copy_back_page(title), 0);
         // SAFETY: the title's memory.
-        assert!(unsafe { std::slice::from_raw_parts(title as *const u8, len) }.iter().all(|&x| x == 0xc3));
+        assert!(
+            unsafe { std::slice::from_raw_parts(title as *const u8, len) }
+                .iter()
+                .all(|&x| x == 0xc3)
+        );
         // While the heap is open the system keeps the memory; released, not.
         drop((back, up));
         drop(shadow);
         release_now(title, len);
         assert!(find_open(title).is_none());
         // SAFETY: our allocation, no heap on it any more.
-        assert_ne!(unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) }, 0, "freed once released");
+        assert_ne!(
+            unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) },
+            0,
+            "freed once released"
+        );
     }
 
     /// Memory not committed where the range is keeps the copy path, and the
@@ -520,7 +632,10 @@ mod tests {
         // SAFETY: ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
         release_now(p, 2 * MIB);
-        assert!(!regions().refused.contains(&p), "a freed allocation is asked again if it comes back");
+        assert!(
+            !regions().refused.contains(&p),
+            "a freed allocation is asked again if it comes back"
+        );
     }
 
     fn find_open(at: usize) -> Option<Arc<Shadow>> {
