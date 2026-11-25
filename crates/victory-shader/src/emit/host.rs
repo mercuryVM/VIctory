@@ -131,6 +131,7 @@ fn default_adapter_is_warp() -> bool {
 /// Serializes WARP (`d3d10warp.dll`) operations across threads: concurrent
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
 static WARP_LOCK: Mutex<()> = Mutex::new(());
+
 /// Root signatures made with a group fold parameter, and its index.
 static FOLDS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
 
