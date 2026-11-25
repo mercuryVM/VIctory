@@ -192,7 +192,10 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
-    let (host, cached) = crate::shader_cache::host_shader(container);
+    // Translated for the host's wave sizes (the console's wave64 programs
+    // run as two 32-lane waves where the host has no 64-lane ones).
+    let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
+    let (host, cached) = crate::shader_cache::host_shader(container, target);
     (host.and_then(|host| with_resources(container, host)), cached)
 }
 
