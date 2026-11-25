@@ -193,6 +193,8 @@ mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
+mod join_tests;
+#[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 mod lower;
 mod rect;
