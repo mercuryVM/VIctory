@@ -37,6 +37,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+mod page_batch;
+
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
 /// made the checks of the world's big buffers cost more than the copies
 /// they saved.
@@ -356,8 +358,9 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
         n == 0 || info.State != MEM_COMMIT
     };
     let mut taken = Vec::with_capacity(pages.len());
-    let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
-    let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p)).collect();
+    // Normalize alias pages before grouping protection calls. Exclude
+    // every active writer under the same guard lock as before.
+    let pages = page_batch::eligible(pages, &g.busy);
     let mut i = 0;
     while i < pages.len() {
         if g.protected.contains(&pages[i]) {
@@ -606,6 +609,31 @@ pub(crate) mod tests {
     pub(crate) fn free(p: usize) {
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn overlapping_kernel_writers_keep_pages_open_until_both_finish() {
+        let p = pool(6);
+        let t = track(p, 6 * PAGE, true).expect("tracked pool");
+        assert_eq!(t.take(p, p + 6 * PAGE), [(p, p + 6 * PAGE)]);
+        let first = writing(p + PAGE, 3 * PAGE);
+        let second = writing(p + 2 * PAGE, 3 * PAGE);
+        let duplicate = writing(p + 2 * PAGE, 3 * PAGE);
+        let extra = [writing(p, 1), writing(p + 5 * PAGE, 1), writing(p + 5 * PAGE, 1)];
+        let _ = t.take(p, p + 6 * PAGE);
+        assert!((0..6).all(|i| t.changed(p / PAGE + i)));
+        drop(first);
+        drop(second);
+        drop(extra);
+        let _ = t.take(p, p + 6 * PAGE);
+        for i in 0..6 {
+            assert_eq!(t.changed(p / PAGE + i), (2..5).contains(&i));
+        }
+        drop(duplicate);
+        let _ = t.take(p, p + 6 * PAGE);
+        assert!((0..6).all(|i| !t.changed(p / PAGE + i)));
+        drop(t);
+        free(p);
     }
 
     /// Everything is changed at first; after taking, only what is written
