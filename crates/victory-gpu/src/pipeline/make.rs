@@ -565,6 +565,9 @@ mod tests {
     /// back; one still missing one waits for `unpark`.
     #[test]
     fn parking_checks_the_translations_under_the_lock() {
+        // Both are queued as a first use would queue them: workers of other
+        // tests may take and make them, and count them off `WAITING`.
+        WAITING.fetch_add(2, Ordering::Relaxed);
         let done = super::super::shader("compute", b"parking: done");
         let _ = done.translated();
         let p = Arc::new(Pending::new(vec![done], None));
