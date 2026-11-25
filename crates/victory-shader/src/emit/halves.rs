@@ -115,6 +115,8 @@ pub(crate) fn all_threads(st: &Structured) -> Vec<bool> {
 
 /// A [`Lanes::bool_varies`] question: the bit, the block, the guard.
 type Question = (Bool, usize, Option<Bool>);
+/// Answers to [`Question`]s, with the set sizes they were given at.
+type Answers = std::cell::RefCell<HashMap<Question, (bool, (usize, usize))>>;
 
 /// What may differ between the lanes of one console wave (see [`varying`]).
 struct Lanes<'a> {
@@ -129,7 +131,7 @@ struct Lanes<'a> {
     /// can only make lanes differ more). Each question searches up to
     /// `MAX_MEET` steps; asked again on every pass, they took ~1 s of a
     /// world mesh program's translation.
-    answers: std::cell::RefCell<HashMap<Question, (bool, (usize, usize))>>,
+    answers: Answers,
 }
 
 impl Lanes<'_> {
