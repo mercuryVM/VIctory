@@ -75,13 +75,26 @@ impl Pending {
             #[cfg(feature = "diagnostics")]
             log_built(&self.key);
             let (user, kernel) = super::thread_cpu_since(cpu);
-            tracing::debug!(
-                shaders = ?self.shaders,
-                ms = started.elapsed().as_millis() as u64,
-                user_ms = user,
-                kernel_ms = kernel,
-                "pipeline made"
-            );
+            let ms = started.elapsed().as_millis() as u64;
+            // A slow one at info: CPU time near the wall time is a slow
+            // driver compile, much below it a worker kept off the CPU.
+            if ms >= SLOW_MS {
+                tracing::info!(
+                    shaders = ?self.shaders,
+                    ms,
+                    user_ms = user,
+                    kernel_ms = kernel,
+                    "a host pipeline was slow to make"
+                );
+            } else {
+                tracing::debug!(
+                    shaders = ?self.shaders,
+                    ms,
+                    user_ms = user,
+                    kernel_ms = kernel,
+                    "pipeline made"
+                );
+            }
             made
         });
         let (lock, done) = &DONE;
@@ -89,6 +102,9 @@ impl Pending {
         done.notify_all();
     }
 }
+
+/// Wall time from which making a host pipeline is logged at info.
+const SLOW_MS: u64 = 10_000;
 
 /// What identifies a title pipeline across runs: its shader containers
 /// and graphics state.
@@ -278,11 +294,16 @@ fn queue(p: Arc<Pending>, now: bool) {
 /// A worker: makes queued pipelines, those draws wait for first, and saves
 /// the cache when idle (first uses of pipelines made before).
 fn work() {
-    // Below the title's own threads (loading, recording).
-    // SAFETY: a plain call on our own thread.
-    unsafe {
-        use windows::Win32::System::Threading::*;
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    // At the title's own priority: below it, the workers starved in the
+    // world while the title kept every core busy, and about a thousand
+    // pipelines draws wait for stayed unmade for minutes (RTX 5070, 16
+    // threads). `VICTORY_PIPELINE_PRIORITY=below` keeps the old one.
+    if std::env::var("VICTORY_PIPELINE_PRIORITY").is_ok_and(|v| v.trim() == "below") {
+        // SAFETY: a plain call on our own thread.
+        unsafe {
+            use windows::Win32::System::Threading::*;
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
     }
     let (lock, work) = &QUEUES;
     loop {
