@@ -4,6 +4,9 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
+#[cfg(feature = "diagnostics")]
+mod stall;
+
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -1132,6 +1135,8 @@ impl Host {
         };
         // The final device check already identifies the run in a single-run submission.
         let mut removed_in = (runs.len() == 1).then_some(0);
+        #[cfg(feature = "diagnostics")]
+        let mut reported_stall = false;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1146,7 +1151,21 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        #[cfg(feature = "diagnostics")]
+                        let timeout = stall::timeout(reported_stall);
+                        #[cfg(not(feature = "diagnostics"))]
+                        let timeout = INFINITE;
+                        if WaitForSingleObject(self.event, timeout)
+                            == windows::Win32::Foundation::WAIT_TIMEOUT
+                        {
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                let per_group = if timing() { 1 } else { max_runs };
+                                stall::report(*submitted, i, groups.len(), runs, per_group);
+                                reported_stall = true;
+                            }
+                            WaitForSingleObject(self.event, INFINITE);
+                        }
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
@@ -1158,7 +1177,10 @@ impl Host {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                tracing::warn!(
+                    ms = started.elapsed().as_millis(), commands, fence = *submitted,
+                    list = runs[i].id, "slow host list"
+                );
                 for (ms, op) in runs[i].slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
