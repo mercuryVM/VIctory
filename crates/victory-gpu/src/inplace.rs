@@ -577,8 +577,8 @@ mod tests {
         assert_eq!(shadow.update(title, len), 0, "nothing to bring up to date");
         let (back, b) = mapped(D3D12_HEAP_TYPE_READBACK, len);
         gpu_copy(&back, &shadow.buffer, len);
-        // SAFETY: the readback mapping, the copy done.
         assert!(
+            // SAFETY: the readback mapping, the copy done.
             unsafe { std::slice::from_raw_parts(b, len) }
                 .iter()
                 .all(|&x| x == 0x5a)
@@ -591,8 +591,8 @@ mod tests {
         gpu_copy(&shadow.buffer, &up, len);
         assert_eq!(shadow.copy_back(title, len), 0);
         assert_eq!(shadow.copy_back_page(title), 0);
-        // SAFETY: the title's memory.
         assert!(
+            // SAFETY: the title's memory.
             unsafe { std::slice::from_raw_parts(title as *const u8, len) }
                 .iter()
                 .all(|&x| x == 0xc3)
@@ -602,8 +602,8 @@ mod tests {
         drop(shadow);
         release_now(title, len);
         assert!(find_open(title).is_none());
-        // SAFETY: our allocation, no heap on it any more.
         assert_ne!(
+            // SAFETY: our allocation, no heap on it any more.
             unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) },
             0,
             "freed once released"
