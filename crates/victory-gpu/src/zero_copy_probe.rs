@@ -270,10 +270,35 @@ fn zero_copy_layout_probe() {
         let mut info = MEMORY_BASIC_INFORMATION::default();
         VirtualQuery(v2 as *const _, &mut info, size_of_val(&info));
         println!("  after the heap is released: state {:#x}", info.State);
+        // Evicted, with a placed buffer still alive: can the view go?
+        let v3 = MapViewOfFile(section, FILE_MAP_WRITE, 0, (BIG / 2 + small) as u32, small).Value.cast::<u8>();
+        let h3: ID3D12Heap = device13.OpenExistingHeapFromAddress1(v3 as *const _, small).unwrap();
+        let b3 = gpu.placed(&h3).unwrap();
+        let pageable: ID3D12Pageable = h3.cast().unwrap();
+        let evicted = gpu.device.Evict(1, &Some(pageable));
+        let unmapped = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v3.cast() });
+        println!("  evicted ({evicted:?}) with a buffer alive, then unmap: returned {unmapped}");
+        drop(b3);
+        drop(h3);
+        let unmapped = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v3.cast() });
+        println!("  after both released, unmap: returned {unmapped}");
+        // A UAV-capable placed buffer on an opened heap.
+        let v4 = MapViewOfFile(section, FILE_MAP_WRITE, 0, (BIG / 2 + 2 * small) as u32, small).Value.cast::<u8>();
+        let h4: ID3D12Heap = device13.OpenExistingHeapFromAddress1(v4 as *const _, small).unwrap();
+        let mut r: Option<ID3D12Resource> = None;
+        let made = gpu.device.CreatePlacedResource(
+            &h4,
+            0,
+            &Gpu::buffer_desc(small, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut r,
+        );
+        println!("  UAV + cross-adapter buffer on an opened heap: {made:?}");
         // Many 64 KiB heaps over the committed part.
         let t = Instant::now();
         let mut many = Vec::new();
-        for i in 0..2048 {
+        for i in 0..16 {
             match device13.OpenExistingHeapFromAddress1::<ID3D12Heap>(view.add(BIG / 2 + i * 65536) as *const _, 65536) {
                 Ok(h) => many.push(h),
                 Err(e) => {
