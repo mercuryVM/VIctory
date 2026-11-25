@@ -91,12 +91,26 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
 
 /// The translation of a console shader container for a host that runs
 /// `target`'s wave sizes, from the cache when there is one, and whether it
-/// came from there.
-pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, String>, bool) {
-    let translate =
-        |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
+/// came from there: the program [`victory_shader::emit::translate`] picks,
+/// or with `stage` the program of that hardware stage (the ES or GS half of
+/// a geometry pipeline).
+pub fn host_shader(
+    container: &[u8],
+    stage: Option<HwStage>,
+    target: Target,
+) -> (Result<HostShader, String>, bool) {
+    let translate = |c: &[u8]| {
+        match stage {
+            Some(stage) => victory_shader::emit::translate_stage_for(c, stage, target),
+            None => victory_shader::emit::translate_for(c, target),
+        }
+        .map_err(|e| e.to_string())
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, &target_key(build(), target), container, translate),
+        Some(cache) => {
+            let key = target_key(&build_for(build(), stage), target);
+            cached(cache, &key, container, translate)
+        }
         None => (translate(container), false),
     }
 }
@@ -108,6 +122,23 @@ fn target_key(build: &[u8; 32], target: Target) -> [u8; 32] {
     h.update(build);
     h.update(&target.key());
     *h.finalize().as_bytes()
+}
+
+/// The build key of a translation: the build's own for the default
+/// program (as before stages could be asked for), else mixed with the
+/// stage, so the ES and VS translations of one container are separate
+/// entries.
+fn build_for(build: &[u8; 32], stage: Option<HwStage>) -> [u8; 32] {
+    match stage {
+        None => *build,
+        Some(stage) => {
+            let mut h = blake3::Hasher::new();
+            h.update(build);
+            h.update(b"stage");
+            h.update(format!("{stage:?}").as_bytes());
+            *h.finalize().as_bytes()
+        }
+    }
 }
 
 /// The cache entry's converter: the build and the container in, the

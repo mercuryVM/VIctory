@@ -42,7 +42,7 @@ const fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
 }
 
 /// VOP3 `op vdst, src0, src1, src2` (no modifiers).
-const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+pub(super) const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     [
         0x35 << 26 | (op as u32 & 0x3FF) << 16 | vdst as u32,
         (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
@@ -1494,28 +1494,6 @@ fn v_cmp_class_f16_matches_rdna2() {
     });
 }
 
-/// A compute program in an `ACCC` part, as the AMD upscaler's are: `body`
-/// leaves its result in v0, stored to the raw UAV of the table at user data
-/// 4 (root parameter 1). Translated from the container's bytes.
-fn fspx_cs(body: &[u32]) -> HostShader {
-    use crate::native::tests::{fspx, fspx_resource};
-    let mut words = vec![s_mov_b32(5, 0x80)];
-    words.extend_from_slice(&s_load_dwordx4(8, 4));
-    words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
-    words.push(S_ENDPGM);
-    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let part = fspx(
-        &code,
-        5 << 1,
-        [1, 1, 1],
-        true,
-        &[fspx_resource(3, 3, 0, 0, 4, 1)],
-    );
-    let container = crate::dxbc::build(&[(crate::FourCC::ACCC, &part)]);
-    super::translate(&container).expect("translate")
-}
-
 /// VOP3P `v_dot4_i32_i8 vdst, src0, src1, src2`, `opsel` and `opsel_hi`
 /// one bit per source.
 const fn dot4(vdst: u8, src0: u16, src1: u16, src2: u16, opsel: u32, opsel_hi: u32) -> [u32; 2] {
@@ -1536,16 +1514,29 @@ fn dot4_ref(a: u32, b: u32, acc: u32) -> u32 {
     })
 }
 
-/// The upscaler's integer dot products, from an `ACCC` container to the
-/// host GPU: op_sel picks each multiplicand's low half, op_sel_hi its high
-/// half (a constant folded in as `sel_hi_lo(2.0)` is 0x4000), and
-/// `v_dot4c` accumulates into its destination.
+/// The upscaler's integer dot products on the host GPU: op_sel picks each
+/// multiplicand's low half, op_sel_hi its high half (a constant folded in as
+/// `sel_hi_lo(2.0)` is 0x4000), and `v_dot4c` accumulates into its
+/// destination.
+///
+/// The program is a plain compute shader rather than an `ACCC`-shaped one:
+/// in an FSPX program the user data are the hardware's own SGPRs, so the only
+/// operands it can carry to the dot instruction are literals — and a literal
+/// multiplicand is exactly what the RDNA1 driver folds into the constant form
+/// that zero-extends it (#1782). A title's operands are computed, so this
+/// runs the same instructions with values loaded at run time.
 #[test]
 fn fspx_programs_run_with_the_hardwares_dot_products() {
     let (a, b, acc) = (0x0302_FB02u32, 0x80FF_7F01u32, 0x7FFF_FFF0u32);
+    // The operands reach the shader as user data, not as literals: a literal
+    // `v_mov` is folded by the driver into the dot instruction's constant form
+    // (`v_dot4c`), and on RDNA1 that form zero-extends the bytes of the
+    // constant operand (#1782). A value loaded at run time keeps the general
+    // form, which is the case a title's shader has whenever its operands are
+    // computed rather than declared.
     let mut load = Vec::new();
-    for (v, x) in [(1, a), (2, b), (3, acc)] {
-        load.extend([vop1(0x001, v, 0xFF), x]); // v_mov_b32 vN, literal
+    for (v, s) in [(1, 0), (2, 1), (3, 2)] {
+        load.push(vop1(0x001, v, sgpr(s))); // v_mov_b32 vN, sN
     }
     let cases: [(Vec<u32>, u32); 4] = [
         (
@@ -1573,8 +1564,8 @@ fn fspx_programs_run_with_the_hardwares_dot_products() {
     for (body, want) in cases {
         let mut words = load.clone();
         words.extend(&body);
-        let shader = fspx_cs(&words);
-        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &[[a, b, acc, 0]], |backend, _, _, got| {
             assert_eq!(got, want, "{backend}: {body:08x?}");
         });
     }

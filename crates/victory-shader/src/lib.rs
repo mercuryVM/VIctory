@@ -20,7 +20,8 @@ pub mod structure;
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
-    HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
+    GeometryIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource,
+    native_programs,
 };
 
 /// A hash of what this translator is built from: its sources, manifest and

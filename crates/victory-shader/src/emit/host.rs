@@ -510,6 +510,37 @@ impl Host {
         gs: &[u8],
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        self.graphics_pipeline_with(root, vs, (!gs.is_empty()).then_some(gs), ps)
+    }
+
+    /// A pipeline with a geometry stage: the ES half of a vertex container
+    /// as `vs` (`translate_stage(.., HwStage::Es)`), the GS half of a
+    /// geometry container as `gs` (`HwStage::Gs`) and a pixel shader. User
+    /// data of the vertex stage is root parameter 0, the geometry stage's 1,
+    /// the pixel stage's 2; triangles in.
+    pub fn geometry_pipeline(
+        &self,
+        vs: &HostShader,
+        gs: &HostShader,
+        ps: &HostShader,
+    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        let root = self.root_signature_for(&[
+            (vs, D3D12_SHADER_VISIBILITY_VERTEX),
+            (gs, D3D12_SHADER_VISIBILITY_GEOMETRY),
+            (ps, D3D12_SHADER_VISIBILITY_PIXEL),
+        ])?;
+        let pso = self.graphics_pipeline_with(&root, &vs.dxil, Some(&gs.dxil), &ps.dxil)?;
+        Ok((root, pso))
+    }
+
+    /// As [`Host::pipeline_with`], with a geometry stage if `gs` is given.
+    pub fn graphics_pipeline_with(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        gs: Option<&[u8]>,
+        ps: &[u8],
+    ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
         let names: Vec<CString> = inputs
             .iter()
@@ -541,10 +572,12 @@ impl Host {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),
             },
-            GS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
-                BytecodeLength: gs.len(),
-            },
+            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: gs.as_ptr().cast(),
+                    BytecodeLength: gs.len(),
+                }
+            }),
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {
                 FillMode: D3D12_FILL_MODE_SOLID,
@@ -1278,6 +1311,7 @@ impl Host {
                     Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
+            list.ClearRenderTargetView(rtv, &[0.0; 4], None);
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
