@@ -176,6 +176,8 @@ mod diff_tests;
 mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod join_tests;
 mod lower;
 mod rect;
 pub use rect::rectangle_gs;

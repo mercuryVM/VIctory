@@ -231,6 +231,9 @@ struct Lower<'a> {
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
+    /// In the block being lowered: an SCC the block's one predecessor's
+    /// EXEC branch decides (see [`Lower::edge_scc`]), and its value.
+    edge_scc: Option<(Value, bool)>,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
@@ -623,6 +626,7 @@ impl<'a> Lower<'a> {
                 _ => MaskData::None,
             },
             mask_ok: false,
+            edge_scc: None,
             ballots: HashMap::new(),
             balloting: HashSet::new(),
             def_block: p
@@ -1252,6 +1256,7 @@ impl<'a> Lower<'a> {
                 .filter(|&q| self.block[q].is_some())
                 .collect();
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
+            self.edge_scc = self.edge_scc(b);
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
                 let val = match phi.reg {
                     Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
@@ -1542,6 +1547,12 @@ impl<'a> Lower<'a> {
             self.read_phis.insert(v);
         }
         let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
+        if let Some((scc, x)) = self.edge_scc
+            && scc == v
+            && !matches!(self.vals.get(&v), Some(Val::Bit(_)))
+        {
+            return Ok(Val::Bit(self.s.m.bool(x)));
+        }
         match self.vals.get(&v) {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
@@ -1556,6 +1567,62 @@ impl<'a> Lower<'a> {
             return Ok(val);
         }
         Err("a value defined after its use")
+    }
+
+    /// Where block `b`'s one predecessor ends in `s_cbranch_execz` or
+    /// `execnz` on the EXEC that a bitwise scalar operation wrote together
+    /// with the SCC current there: that SCC ("the result is not zero") is
+    /// what the branch tests, so on each edge it is known: zero where a
+    /// waterfall loop is left. Not a wave operation there, for on the host
+    /// lanes leaving the loop may run beside lanes still in it.
+    fn edge_scc(&self, b: usize) -> Option<(Value, bool)> {
+        let p = self.x.p;
+        let &[q] = &p.blocks[b].preds[..] else {
+            return None;
+        };
+        let Exit::Branch { taken, not_taken } = p.blocks[q].exit else {
+            return None;
+        };
+        let insts = &p.blocks[q].insts;
+        let (branch, body) = insts.split_last()?;
+        let zero_taken = match branch.name() {
+            "s_cbranch_execz" => true,
+            "s_cbranch_execnz" => false,
+            _ => return None,
+        };
+        if taken == not_taken {
+            return None;
+        }
+        let w = body.iter().rev().find(|i| i.write(Reg::Scc).is_some())?;
+        let width = if self.x.native.wave64 { "_b64" } else { "_b32" };
+        let op = w.name().strip_prefix("s_")?.strip_suffix(width)?;
+        let op = op
+            .strip_suffix("_saveexec")
+            .or_else(|| op.strip_suffix("_wrexec"))
+            .unwrap_or(op);
+        let bitwise = matches!(
+            op,
+            "and"
+                | "or"
+                | "xor"
+                | "andn1"
+                | "andn2"
+                | "orn1"
+                | "orn2"
+                | "nand"
+                | "nor"
+                | "xnor"
+                | "not"
+        );
+        let halves = 1 + u8::from(self.x.native.wave64);
+        let same = (0..halves).all(|h| {
+            let e = branch.read(Reg::S(EXEC + h));
+            e.is_some() && w.write(Reg::S(EXEC + h)) == e
+        });
+        if !bitwise || !same {
+            return None;
+        }
+        Some((w.write(Reg::Scc)?, (taken == b) != zero_taken))
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
@@ -2410,20 +2477,7 @@ impl<'a> Lower<'a> {
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
-                    Some(h) => Some(self.get(h)?),
-                    None => None,
-                };
-                let lo = self.get(v)?;
-                let word = |w: Val| match w {
-                    Val::I32(x) => Ok(x),
-                    _ => Err("an opaque lane mask"),
-                };
-                let lo = word(lo)?;
-                let hi = hi.map(word).transpose()?;
-                Ok(self.lane_bit(at, lo, hi))
-            }
+            Atom::Opaque(v) if self.console_lanes => self.number_bit(v, at),
             Atom::Constant(k) if self.console_lanes => {
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
@@ -2432,6 +2486,23 @@ impl<'a> Lower<'a> {
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
+    }
+
+    /// The lane's own bit, in DXIL block `at`, of the number `v` holds (and
+    /// its pair's high dword in wave64): a mask the console holds as data.
+    fn number_bit(&mut self, v: Value, at: usize) -> Result<V, Why> {
+        let hi = match self.pair_high(v) {
+            Some(h) => Some(self.get(h)?),
+            None => None,
+        };
+        let lo = self.get(v)?;
+        let word = |w: Val| match w {
+            Val::I32(x) => Ok(x),
+            _ => Err("an opaque lane mask"),
+        };
+        let lo = word(lo)?;
+        let hi = hi.map(word).transpose()?;
+        Ok(self.lane_bit(at, lo, hi))
     }
 
     /// The bit of lane `lane` in the mask `lo`, `hi`.
@@ -9747,7 +9818,19 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let read = live.contains(&(phi.value, n));
-                let x = match (self.vals.get(&arg).copied(), bit) {
+                let mut val = self.vals.get(&arg).copied();
+                // A register the compiler reuses, a lane mask on this edge and
+                // data on another: with console lanes, the mask's number.
+                if read
+                    && !bit
+                    && self.mask_data == MaskData::Console
+                    && !matches!(val, Some(Val::I32(_)))
+                    && (self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg))
+                    && let Ok(x) = self.mask_dword(arg)
+                {
+                    val = Some(Val::I32(x));
+                }
+                let x = match (val, bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     // No lane from this edge reads it, or no lane comes
                     // along it at all: any value will do.
@@ -9786,11 +9869,19 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                let arg = phi.args[n];
+                let x = match self.x.st.masks.get(&arg) {
+                    Some(&m) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                    // A register the compiler reuses, data on this edge (a
+                    // loop's carried bit set): with console lanes, the lane's
+                    // own bit of the number, as for an opaque mask.
+                    None if self.console_lanes => self
+                        .number_bit(arg, qb)
+                        .map_err(|w| unsupported(offset, w))?,
+                    None => {
+                        return Err(unsupported(offset, "a lane-mask join of an untracked mask"));
+                    }
+                };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
