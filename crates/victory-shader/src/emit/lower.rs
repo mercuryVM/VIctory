@@ -1456,7 +1456,7 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => return self.group_id(c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -1519,6 +1519,46 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// Component `c` of a compute program's group id, read in the entry
+    /// block, as the console numbers it in a folded dispatch too
+    /// ([`super::shader::GROUP_FOLD_ROW`]).
+    fn group_id(&mut self, c: u8) -> Val {
+        let Val::I32(g) = self.compute_id("groupId.i32", 94, c) else {
+            unreachable!()
+        };
+        if c == 1 || self.s.threads.is_none() || self.s.mesh.is_some() {
+            return Val::I32(g);
+        }
+        let e = self.s.entry;
+        let h = self.s.fold_handle();
+        let row = self.s.m.i32(0);
+        let r = self.s.op(
+            e,
+            "cbufferLoadLegacy.i32",
+            Attr::ReadOnly,
+            self.s.t.cbuf_ret,
+            59,
+            &[h, row],
+        );
+        let fold = self.s.m.extract(e, r, 0);
+        let zero = self.s.m.i32(0);
+        let folded = self.s.m.cmp(e, pred::NE, fold, zero);
+        if c == 2 {
+            return Val::I32(self.s.m.select(e, folded, zero, g));
+        }
+        // First group plus x plus z rows.
+        let Val::I32(z) = self.compute_id("groupId.i32", 94, 2) else {
+            unreachable!()
+        };
+        let one = self.s.m.i32(1);
+        let first = self.s.m.bin(e, Bin::Sub, fold, one);
+        let row = self.s.m.i32(super::shader::GROUP_FOLD_ROW);
+        let rows = self.s.m.bin(e, Bin::Mul, z, row);
+        let x = self.s.m.bin(e, Bin::Add, first, g);
+        let x = self.s.m.bin(e, Bin::Add, x, rows);
+        Val::I32(self.s.m.select(e, folded, x, g))
     }
 
     /// A component of a compute thread or group id, read in the entry block.
