@@ -3328,6 +3328,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(first_raw, second_raw);
         assert_eq!(first_ptr, second_ptr);
         drop((first, second));
+        // SAFETY: the list was reset and reopened above; this closes it.
         unsafe { list.list.Close().expect("close list") };
         list.reset();
     }
