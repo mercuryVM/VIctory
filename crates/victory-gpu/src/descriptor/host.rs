@@ -994,11 +994,17 @@ impl HostHeap {
         Some(view)
     }
 
-    /// The view host slot `index` was made from, in a few words, with the
+    /// The view title slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
+        if index >= self.title {
+            return None;
+        }
+        let Some(index) = self.host_slot(index, false) else {
+            return Some("null".into());
+        };
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
@@ -1850,6 +1856,13 @@ mod tests {
         assert_eq!(heap.host_slot(title, true), Some(slot), "kept");
         assert_eq!(heap.shader_index(slot), title);
         assert_eq!(entry(title), slot);
+        #[cfg(feature = "diagnostics")]
+        {
+            // This assigned slot holds no descriptor yet. Looking up its
+            // title index directly in the shorter host array returned None.
+            assert_eq!(heap.describe_slot(title).as_deref(), Some("null"));
+            assert!(heap.describe_slot(heap.title).is_none());
+        }
         let other = heap.host_slot(title + 7, true).expect("a slot");
         assert_ne!(other, slot);
         heap.unmap(title);
