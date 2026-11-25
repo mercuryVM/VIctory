@@ -1217,9 +1217,7 @@ fn a_mask_copied_dword_by_dword_stops_instead_of_recursing() {
     // In the console flow (a host without 64-lane waves) and per lane.
     for (lanes_min, lanes_max, why) in [
         (32, 32, "an opaque lane mask"),
-        // (The fork's ballot at the use reaches the mask's own bits, which
-        // are this opaque dword again.)
-        (32, 64, "an opaque lane mask"),
+        (32, 64, "a lane mask holding lanes elsewhere read as data"),
     ] {
         let target = super::Target {
             lanes_min,
