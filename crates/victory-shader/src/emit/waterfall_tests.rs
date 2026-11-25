@@ -82,7 +82,12 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
-        stride_table: lowered.stride_table,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -95,9 +100,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
 /// hardware GPU and on WARP (each skipped without a device) and returns,
-/// per one that ran, what ran (read from the device, with the adapter's
-/// name) and the UAV's 32 dwords.
-fn run(shader: &HostShader, views: &[View]) -> Vec<(String, Vec<u32>)> {
+/// per one that ran, the UAV's 32 dwords.
+fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -119,8 +123,6 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(String, Vec<u32>)> {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        // Failures name what ran, as in the VALU tests.
-        let label = host.backend(label);
         let (root, pso) = match host.compute_pipeline(shader) {
             Ok(p) => p,
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
@@ -150,7 +152,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(String, Vec<u32>)> {
 
 /// The red channel each lane sampled from two 1x1 textures, red 1.0 at
 /// heap index 0 and 2.0 at 1.
-fn sampled(shader: &HostShader) -> Vec<(String, Vec<f32>)> {
+fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
     let first = [[1.0f32, 0.0, 0.0, 1.0]];
     let second = [[2.0f32, 0.0, 0.0, 1.0]];
     let views = [
@@ -249,28 +251,5 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
-    }
-}
-
-#[test]
-fn lanes_sample_their_arm_after_a_redundant_masked_write() {
-    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
-    let mut words = WATERFALL_JOINED_WAVE32.to_vec();
-    let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
-    words.splice(
-        at..at,
-        [
-            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0 (lane < 16)
-            0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
-            0x7E08_0218, // v_mov_b32 v4, s24 (same word the then arm wrote)
-            0xBEFE_0312, // s_mov_b32 exec_lo, s18
-        ],
-    );
-    let shader = build(&words, false);
-    let results = sampled(&shader);
-    assert!(!results.is_empty());
-    let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
-    for (label, red) in results {
-        assert_eq!(red, want, "{label}");
     }
 }

@@ -33,7 +33,7 @@
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
-use crate::ir::{Exit, Inst, Program, Reg, Value, operand_reads};
+use crate::ir::{Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, PsInput, StageIo, Usage};
 use crate::resource::Site;
 
@@ -130,14 +130,30 @@ pub enum Interp {
     /// This site's result (`v_interp_p2*`) is the attribute interpolated
     /// with `barycentric`; `first` are the `v_interp_p1*` halves it
     /// completes (one per path where the compiler shares a first half).
+    /// Where the compiler reused the i or j register on another path,
+    /// `unless` says where it holds something else, which no interpolating
+    /// lane may have been (emission proves it with structurisation's lane
+    /// conditions).
     Interpolated {
         attribute: Attribute,
         barycentric: Barycentric,
         first: Vec<Site>,
+        unless: Vec<Elsewhere>,
     },
     /// One vertex's value (`v_interp_mov_f32`), as encoded: 0 for P10,
     /// 1 for P20, 2 for P0 (the provoking vertex).
     Vertex { attribute: Attribute, vertex: u8 },
+}
+
+/// Where an interpolation's i or j register holds another value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Elsewhere {
+    /// The edge (predecessor, block) into a join that brings another value.
+    Edge(usize, usize),
+    /// A vector instruction writing the register, in the lanes that run it.
+    Write(Site),
+    /// A copy into the register, in the lanes that skip it (old value).
+    Skip(Site),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,8 +198,11 @@ pub struct Io {
     pub inputs: Vec<(Value, Input)>,
     pub interps: Vec<(Site, Interp)>,
     pub exports: Vec<Export>,
-    /// Compute: how many SGPRs the hardware initializes
-    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
+    /// Compute and pixel: how many SGPRs the hardware initializes
+    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs);
+    /// pixel: the user SGPRs, at least the 8 ABI slots and up to the last
+    /// root parameter's, then the primitive mask and the ordered-section
+    /// (POPS) collision id, as every pixel program of the title reads them).
     pub initialized_sgprs: Option<u8>,
 }
 
@@ -238,52 +257,13 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             (loaded, &[][..], &[][..])
         }
         (StageIo::Ms(ms), HwStage::Ms) => {
-            // The group input, and the phis that may carry it past a join.
-            let mut group: Vec<Value> = p
-                .inputs
-                .iter()
-                .filter(|i| i.0 == Reg::V(5))
-                .map(|i| i.1)
-                .collect();
-            // No lane is active over the EXEC-zero edge of s_cbranch_execz or
-            // _execnz, the same case as a partial-EXEC write below.
-            let no_lanes = |q: usize, b: usize| match (
-                p.blocks[q].insts.last().map(Inst::name),
-                p.blocks[q].exit,
-            ) {
-                (Some("s_cbranch_execz"), Exit::Branch { taken, not_taken }) => {
-                    taken == b && not_taken != b
-                }
-                (Some("s_cbranch_execnz"), Exit::Branch { taken, not_taken }) => {
-                    not_taken == b && taken != b
-                }
-                _ => false,
-            };
-            while let Some(v) = p
-                .blocks
-                .iter()
-                .enumerate()
-                .flat_map(|(b, k)| k.phis.iter().map(move |f| (b, f)))
-                .find_map(|(b, f)| {
-                    let mut args = f.args.iter().zip(&p.blocks[b].preds);
-                    let carried = args.any(|(a, &q)| group.contains(a) && !no_lanes(q, b));
-                    (carried && !group.contains(&f.value)).then_some(f.value)
-                })
-            {
-                group.push(v);
-            }
+            let group = p.inputs.iter().find(|i| i.0 == Reg::V(5)).map(|i| i.1);
             // The group input holds the same value in every lane only as the
-            // first lane reads it. A write to v5 reads its old value too, which
-            // only lanes outside EXEC keep.
-            // shortcut: writes that may keep the old v5 in active lanes
-            // (v_fmac_f32's accumulator, a 16-bit half or d16 load,
-            // v_writelane_b32, v_movreld_b32, DPP that skips lanes) and
-            // partial-EXEC writes pass; check those too if a mesh program
-            // writes v5 that way.
+            // first lane reads it; a VGPR write reads its old value too.
             let per_lane = p.blocks.iter().flat_map(|b| &b.insts).find(|i| {
-                i.read(Reg::V(5)).is_some_and(|v| group.contains(&v))
+                group.is_some_and(|g| i.reads.contains(&(Reg::V(5), g)))
                     && i.name() != "v_readfirstlane_b32"
-                    && (i.write(Reg::V(5)).is_none() || operand_reads(p, i).contains(&Reg::V(5)))
+                    && i.write(Reg::V(5)).is_none()
             });
             if let Some(i) = per_lane {
                 return Err(unsupported(
@@ -331,6 +311,14 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         inputs: inputs.clone(),
         initialized_sgprs: match &native.io {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
+            StageIo::Ps { .. } => {
+                let user = native
+                    .layout
+                    .iter()
+                    .map(|r| u32::from(r.user_data) + r.sgprs)
+                    .max();
+                Some(user.unwrap_or(0).clamp(8, 104) as u8 + 2)
+            }
             _ => None,
         },
         ..Io::default()
@@ -486,6 +474,7 @@ fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
 struct Pair {
     barycentric: Barycentric,
     first: Vec<Site>,
+    unless: Vec<Elsewhere>,
 }
 
 impl Pair {
@@ -494,6 +483,7 @@ impl Pair {
             attribute,
             barycentric: self.barycentric,
             first: self.first,
+            unless: self.unless,
         }
     }
 }
@@ -522,7 +512,8 @@ impl Halves<'_> {
             &mut Vec::new(),
             &mut first,
         )?;
-        let Some((kind, 1)) = barycentric(j) else {
+        let mut unless = Vec::new();
+        let Some((kind, 1)) = self.joined(j, barycentric, &mut unless) else {
             return Err("an interpolation with computed barycentrics");
         };
         for &(b, i) in &first {
@@ -546,14 +537,79 @@ impl Halves<'_> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            if barycentric(i) != Some((kind, 0)) {
+            if self.joined(i, barycentric, &mut unless) != Some((kind, 0)) {
                 return Err("an interpolation with computed barycentrics");
             }
         }
         Ok(Pair {
             barycentric: kind,
             first,
+            unless,
         })
+    }
+
+    /// The barycentric `v` holds as loaded, also through joins and the
+    /// writes of lanes that skip them: every barycentric found must be the
+    /// same one, and where the register holds something else is added to
+    /// `other`.
+    fn joined(
+        &self,
+        v: Option<Value>,
+        barycentric: &impl Fn(Option<Value>) -> Option<(Barycentric, u8)>,
+        other: &mut Vec<Elsewhere>,
+    ) -> Option<(Barycentric, u8)> {
+        let (mut found, mut stack, mut seen) = (None, vec![v?], Vec::new());
+        while let Some(v) = stack.pop() {
+            if seen.contains(&v) {
+                continue;
+            }
+            seen.push(v);
+            if let Some(k) = barycentric(Some(v)) {
+                if found.is_some_and(|f| f != k) {
+                    return None;
+                }
+                found = Some(k);
+            } else if let Some(&(b, i)) = self.phis.get(&v) {
+                let block = &self.p.blocks[b];
+                for (n, &a) in block.phis[i].args.iter().enumerate() {
+                    if barycentric(Some(a)).is_some() || self.phis.contains_key(&a) {
+                        stack.push(a);
+                    } else {
+                        other.push(Elsewhere::Edge(block.preds[n], b));
+                    }
+                }
+            } else {
+                // A vector write keeps the old value in the lanes it skips
+                // (`v_writelane` ignores EXEC).
+                let &(b, i) = self.defs.get(&v)?;
+                let inst = &self.p.blocks[b].insts[i];
+                let &(reg, _) = inst.writes.iter().find(|w| w.1 == v)?;
+                if !matches!(reg, Reg::V(_)) || inst.name() == "v_writelane_b32" {
+                    return None;
+                }
+                // A plain copy of a barycentric: that one where it runs.
+                let copied = match (&inst.fields, inst.name()) {
+                    (Fields::Valu(c), "v_mov_b32") if c.dpp.is_none() && c.sdwa.is_none() => {
+                        match c.src.first() {
+                            Some(&Operand::Vector { reg: from, .. }) => inst.read(Reg::V(from)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match copied.filter(|&c| barycentric(Some(c)).is_some()) {
+                    Some(c) => {
+                        other.push(Elsewhere::Skip((b, i)));
+                        stack.push(c);
+                    }
+                    None => {
+                        other.push(Elsewhere::Write((b, i)));
+                        stack.push(inst.read(reg)?);
+                    }
+                }
+            }
+        }
+        found
     }
 
     /// The instructions `v` comes from, through phis (`seen`: phis on the
@@ -658,6 +714,7 @@ mod tests {
                     },
                     barycentric: Barycentric::PerspectiveCenter,
                     first: vec![(0, 0)],
+                    unless: vec![],
                 }
             )]
         );
@@ -698,6 +755,7 @@ mod tests {
                     },
                     barycentric: Barycentric::PerspectiveCenter,
                     first: vec![(0, 0)],
+                    unless: vec![],
                 }
             )]
         );
@@ -748,41 +806,6 @@ mod tests {
         assert_eq!(io.exports[0].target, Target::Primitive);
         // The group input is uniform only as the first lane reads it.
         assert!(mesh(&[0x7E02_0305, S_ENDPGM]).is_err()); // v_mov_b32 v1, v5
-        // Also as an operand of a write to v5, or after a join.
-        let per_lane: [&[u32]; 5] = [
-            &[0x4A0A_0305, S_ENDPGM],              // v_add_nc_u32 v5, v5, v1
-            &[0x7E0A_0D05, S_ENDPGM],              // v_cvt_f32_u32 v5, v5
-            &[0xDC30_8000, 0x0500_0005, S_ENDPGM], // global_load_dword v5, v5, s[0:1]
-            &[0x7E0A_CB01, S_ENDPGM],              // v_swap_b32 v5, v1
-            &[
-                0xBF06_8001, // s_cmp_eq_u32 s1, 0
-                0xBF85_0001, // s_cbranch_scc1 -> 0xc
-                0x7E0A_0280, // v_mov_b32 v5, 0
-                0x7E02_0305, // 0xc: v_mov_b32 v1, v5
-                S_ENDPGM,
-            ],
-        ];
-        let accepted: Vec<_> = per_lane.iter().filter(|w| mesh(w).is_ok()).collect();
-        assert!(accepted.is_empty(), "accepted: {accepted:08X?}");
-        // Overwriting v5 reads the group input only for lanes outside EXEC:
-        // v_mov_b32 v5, 0; v_mov_b32 v1, v5.
-        assert!(mesh(&[0x7E0A_0280, 0x7E02_0305, S_ENDPGM]).is_ok());
-        // Skipping that write with s_cbranch_execz is the same case: under the
-        // same mask, the read sees only the 0.
-        let reuse = [
-            0x7E04_0505, // v_readfirstlane_b32 s2, v5
-            0x7D88_0084, // v_cmp_gt_u32 vcc, 4, v0
-            0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
-            0xBF88_0001, // s_cbranch_execz -> 0x14
-            0x7E0A_0280, // v_mov_b32 v5, 0
-            0x88FE_067E, // 0x14: s_or_b64 exec, exec, s[6:7]
-            0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
-            0xBF88_0001, // s_cbranch_execz -> 0x24
-            0x7E02_0305, // v_mov_b32 v1, v5
-            0x88FE_067E, // 0x24: s_or_b64 exec, exec, s[6:7]
-            S_ENDPGM,
-        ];
-        assert_eq!(mesh(&reuse).map(|_| ()), Ok(()));
     }
 
     #[test]

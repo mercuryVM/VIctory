@@ -6,11 +6,6 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
-// Test-only: the symbols must be exported by whatever module hosts the device, and the
-// application defines its own copy in `apps/victory`. Two definitions in one binary would
-// collide at link time.
-#[cfg(test)]
-pub mod agility;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
@@ -18,6 +13,7 @@ pub mod gfx10;
 pub mod io;
 pub mod ir;
 pub mod native;
+pub mod range;
 pub mod resource;
 pub mod structure;
 
@@ -27,9 +23,10 @@ pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
 };
 
-/// Deterministic BLAKE3 hex digest of `victory-shader`'s source tree, computed
-/// at build time so shader caches invalidate automatically when translator code
-/// changes without being wiped by unrelated crate rebuilds.
+/// A hash of what this translator is built from: its sources, manifest and
+/// build script, the workspace's lock file and the compiler's version. Caches
+/// of translations key on it, so a changed translator never serves an old
+/// translation.
 pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

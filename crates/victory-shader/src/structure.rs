@@ -11,6 +11,14 @@
 //! lane that reaches it; what it cannot prove stays as the instruction's
 //! guard, a per-lane `if` around it.
 //!
+//! A pixel's discard (`s_andn2 live, live, exec`, then "no lane is left":
+//! the exit) is the exception: on the console a discarded lane whose quad
+//! has a live lane stays in EXEC (`s_wqm` of the live mask), a helper of
+//! the quad's derivatives, and no lane takes the exit while its wave has a
+//! live lane. Here it runs on as a live lane and is discarded at that point
+//! ([`Structured::discards`]): the host's `discard` keeps it as a helper
+//! (derivatives read it) and drops its outputs and stores.
+//!
 //! The control-flow graph keeps its shape and must be reducible (DXIL's
 //! only requirement). Helper lanes of a pixel shader count as live: on PC
 //! their side effects are dropped too, and what they compute is only read
@@ -22,6 +30,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
+use crate::resource::lane_of;
 
 /// A per-lane boolean: a node of [`Bools`]. Equal functions are equal nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -99,9 +108,6 @@ impl Hasher for Fx {
 
 const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
-/// Cap the `ite` memo table so complex shaders cannot trigger multi-tens-of-MB
-/// HashMap resizes (e.g. 35 MB at 2^21 buckets) under concurrent compilation.
-const MAX_MEMO: usize = 1 << 18;
 /// Case splits [`Bools::meet`] makes before it gives up.
 const MAX_MEET: usize = 1 << 16;
 
@@ -187,9 +193,6 @@ impl Bools {
     }
 
     fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
-        if self.overflow {
-            return Bool::FALSE;
-        }
         if f == Bool::TRUE || g == h {
             return g;
         }
@@ -208,12 +211,7 @@ impl Bools {
         let lo = self.ite(f0, g0, h0);
         let hi = self.ite(f1, g1, h1);
         let r = self.mk(v, lo, hi);
-        if !self.overflow {
-            if self.memo.len() >= MAX_MEMO {
-                self.memo.clear();
-            }
-            self.memo.insert((f, g, h), r);
-        }
+        self.memo.insert((f, g, h), r);
         r
     }
 
@@ -238,7 +236,62 @@ impl Bools {
     /// `b` where `holds`, its negation where not. Yes when the search grows
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
-        Meet::new(self).solve(all.to_vec())
+        let mut budget = MAX_MEET;
+        self.meet_in(all.to_vec(), &mut budget, &mut HashSet::new())
+    }
+
+    /// `refuted`: conditions no lane meets, so a split reaching them again
+    /// stops at once (diagrams sharing most atoms reach the same ones often).
+    fn meet_in(
+        &self,
+        mut all: Vec<(Bool, bool)>,
+        budget: &mut usize,
+        refuted: &mut HashSet<Vec<(Bool, bool)>>,
+    ) -> bool {
+        let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
+        if all.iter().any(fails) {
+            return false;
+        }
+        all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+        all.sort_unstable();
+        all.dedup();
+        if refuted.contains(&all) {
+            return false;
+        }
+        if all.is_empty() || *budget == 0 {
+            return true;
+        }
+        *budget -= 1;
+        let top = |b: Bool| self.nodes[b.0 as usize].0;
+        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
+        let met = [false, true].into_iter().any(|value| {
+            let next = all
+                .iter()
+                .map(|&(b, holds)| {
+                    let (lo, hi) = self.split(b, v);
+                    (if value { hi } else { lo }, holds)
+                })
+                .collect();
+            self.meet_in(next, budget, refuted)
+        });
+        if !met {
+            refuted.insert(all);
+        }
+        met
+    }
+
+    /// The value `atom` has in every lane meeting `facts` (as [`Bools::meet`]
+    /// takes them), if they decide it.
+    pub fn decides(&self, facts: &[(Bool, bool)], atom: Atom) -> Option<bool> {
+        let x = *self
+            .unique
+            .get(&(*self.ids.get(&atom)?, Bool::FALSE, Bool::TRUE))?;
+        let can = |value| self.meet(&[facts, &[(x, value)]].concat());
+        match (can(false), can(true)) {
+            (false, true) => Some(true),
+            (true, false) => Some(false),
+            _ => None,
+        }
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
@@ -249,9 +302,6 @@ impl Bools {
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
-        if self.overflow {
-            return Bool::FALSE;
-        }
         let (v, lo, hi) = self.nodes[b.0 as usize];
         if v == TERMINAL {
             return b;
@@ -303,222 +353,6 @@ impl Bools {
     }
 }
 
-/// Ephemeral SAT solver for [`Bools::meet`] over immutable BDD nodes.
-struct Meet<'a> {
-    bools: &'a Bools,
-    extra: Vec<(u32, Bool, Bool)>,
-    extra_unique: Map<(u32, Bool, Bool), Bool>,
-    restrict_memo: Map<Bool, Bool>,
-    forced: Map<u32, bool>,
-    failed: HashSet<Vec<(Bool, bool)>, BuildHasherDefault<Fx>>,
-    budget: usize,
-    overflow: bool,
-}
-
-impl<'a> Meet<'a> {
-    fn new(bools: &'a Bools) -> Self {
-        Self {
-            bools,
-            extra: Vec::new(),
-            extra_unique: Map::default(),
-            restrict_memo: Map::default(),
-            forced: Map::default(),
-            failed: HashSet::with_hasher(BuildHasherDefault::default()),
-            budget: MAX_MEET,
-            overflow: false,
-        }
-    }
-
-    fn node(&self, b: Bool) -> (u32, Bool, Bool) {
-        let idx = b.0 as usize;
-        if idx < self.bools.nodes.len() {
-            self.bools.nodes[idx]
-        } else {
-            self.extra[idx - self.bools.nodes.len()]
-        }
-    }
-
-    fn split(&self, b: Bool, v: u32) -> (Bool, Bool) {
-        match self.node(b) {
-            (bv, lo, hi) if bv == v => (lo, hi),
-            _ => (b, b),
-        }
-    }
-
-    fn mk(&mut self, v: u32, lo: Bool, hi: Bool) -> Bool {
-        if lo == hi {
-            return lo;
-        }
-        if let Some(&b) = self.bools.unique.get(&(v, lo, hi)) {
-            return b;
-        }
-        if let Some(&b) = self.extra_unique.get(&(v, lo, hi)) {
-            return b;
-        }
-        if self.extra.len() >= MAX_NODES
-            || self.bools.nodes.len() + self.extra.len() >= u32::MAX as usize
-        {
-            self.overflow = true;
-            return Bool::FALSE;
-        }
-        let b = Bool((self.bools.nodes.len() + self.extra.len()) as u32);
-        self.extra.push((v, lo, hi));
-        self.extra_unique.insert((v, lo, hi), b);
-        b
-    }
-
-    fn restrict(&mut self, b: Bool, forced: &Map<u32, bool>, max_v: u32) -> Bool {
-        let (bv, lo, hi) = self.node(b);
-        if bv == TERMINAL || bv > max_v || self.overflow {
-            return b;
-        }
-        if let Some(&r) = self.restrict_memo.get(&b) {
-            return r;
-        }
-        let r = if let Some(&value) = forced.get(&bv) {
-            self.restrict(if value { hi } else { lo }, forced, max_v)
-        } else {
-            let l = self.restrict(lo, forced, max_v);
-            let h = self.restrict(hi, forced, max_v);
-            if self.overflow {
-                return Bool::FALSE;
-            }
-            if l == lo && h == hi {
-                b
-            } else {
-                self.mk(bv, l, h)
-            }
-        };
-        self.restrict_memo.insert(b, r);
-        r
-    }
-
-    /// Canonicalizes constraints and propagates forced top-variable assignments to
-    /// a fixed point before branching into larger BDDs.
-    fn propagate(&mut self, all: &mut Vec<(Bool, bool)>) -> Option<bool> {
-        loop {
-            let mut i = 0;
-            while i < all.len() {
-                let (b, holds) = all[i];
-                if b == if holds { Bool::FALSE } else { Bool::TRUE } {
-                    return Some(false);
-                }
-                if b == Bool::FALSE || b == Bool::TRUE {
-                    all.swap_remove(i);
-                } else {
-                    i += 1;
-                }
-            }
-            all.sort_unstable();
-            all.dedup();
-            if all.windows(2).any(|w| w[0].0 == w[1].0 && w[0].1 != w[1].1) {
-                return Some(false);
-            }
-            if all.len() <= 1 {
-                // Any single non-constant reduced ROBDD node attains both `false` and `true`.
-                return Some(true);
-            }
-
-            let mut forced = std::mem::take(&mut self.forced);
-            forced.clear();
-            let mut max_v = 0u32;
-            let mut conflict = false;
-            for &(b, holds) in all.iter() {
-                let (v, lo, hi) = self.node(b);
-                debug_assert_ne!(v, TERMINAL);
-                let bad = if holds { Bool::FALSE } else { Bool::TRUE };
-                let req = if lo == bad {
-                    Some(true)
-                } else if hi == bad {
-                    Some(false)
-                } else {
-                    None
-                };
-                if let Some(val) = req {
-                    if let Some(prev) = forced.insert(v, val) {
-                        if prev != val {
-                            conflict = true;
-                            break;
-                        }
-                    } else {
-                        max_v = max_v.max(v);
-                    }
-                }
-            }
-            if conflict {
-                self.forced = forced;
-                return Some(false);
-            }
-            if forced.is_empty() {
-                self.forced = forced;
-                return None;
-            }
-            self.restrict_memo.clear();
-            for (b, _) in all.iter_mut() {
-                *b = self.restrict(*b, &forced, max_v);
-            }
-            self.forced = forced;
-            if self.overflow {
-                return Some(true);
-            }
-        }
-    }
-
-    fn solve(&mut self, mut all: Vec<(Bool, bool)>) -> bool {
-        if self.bools.overflow {
-            return true;
-        }
-        if let Some(res) = self.propagate(&mut all) {
-            return res;
-        }
-        if self.failed.contains(&all) {
-            return false;
-        }
-        if self.budget == 0 {
-            return true;
-        }
-        self.budget -= 1;
-        let v = all
-            .iter()
-            .map(|&(b, _)| self.node(b).0)
-            .min()
-            .expect("not empty");
-        let mut score = [0usize; 2];
-        for &(b, holds) in &all {
-            let (bv, lo, hi) = self.node(b);
-            if bv == v {
-                let good = if holds { Bool::TRUE } else { Bool::FALSE };
-                if lo == good {
-                    score[0] += 1;
-                }
-                if hi == good {
-                    score[1] += 1;
-                }
-            }
-        }
-        let order = if score[1] > score[0] {
-            [true, false]
-        } else {
-            [false, true]
-        };
-        for value in order {
-            let next = all
-                .iter()
-                .map(|&(b, holds)| {
-                    let (lo, hi) = self.split(b, v);
-                    (if value { hi } else { lo }, holds)
-                })
-                .collect();
-            if self.solve(next) {
-                return true;
-            }
-        }
-        // Both branches returned false cleanly, so `all` is genuinely UNSAT.
-        self.failed.insert(all);
-        false
-    }
-}
-
 /// How a lane leaves a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneExit {
@@ -558,6 +392,12 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// `v_readlane_b32` results of a constant lane: the SGPR value that
+    /// `v_writelane_b32` spilled to that lane, the same along every path.
+    pub restored: HashMap<Value, Value>,
+    /// A pixel's discards, by block and instruction: the lanes (EXEC there)
+    /// the instruction takes out of the live mask, which here stay in it.
+    pub discards: HashMap<(usize, usize), Bool>,
 }
 
 impl Structured {
@@ -570,16 +410,24 @@ impl Structured {
     }
 }
 
-/// `inst` is `name` with no input or output modifiers.
-fn plain_lane_op(inst: &Inst, name: &str) -> bool {
-    inst.name() == name
-        && matches!(&inst.fields, Fields::Valu(v)
-            if v.abs == 0 && v.neg == 0 && v.opsel == 0 && v.sdwa.is_none() && v.dpp.is_none())
-}
-
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, true)
+}
+
+/// The per-lane form with a pixel's discarded lanes taken out of the live
+/// mask, as the console does: wrong for derivatives after a discard, but
+/// what a program needs whose discarded lanes would read values no
+/// surviving lane does (see [`Structured::discards`]).
+pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, false)
+}
+
+fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    if !helpers {
+        l.kills.clear();
+    }
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -625,8 +473,11 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
-    /// Immediate dominator per block.
-    idom: Vec<usize>,
+    /// See [`Structured::restored`].
+    restored: Map<Value, Value>,
+    /// A pixel's discards (see [`Structured::discards`]) by block and
+    /// instruction.
+    kills: HashSet<(usize, usize)>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -674,10 +525,8 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
-        let idom = crate::ir::idoms(blocks, &order, &index);
-        Ok(Lanes {
+        let mut l = Lanes {
             p,
-            idom,
             order,
             index,
             incoming,
@@ -692,7 +541,73 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
-        })
+            restored: Map::default(),
+            kills: HashSet::new(),
+        };
+        for block in blocks {
+            if let Exit::Branch { taken, not_taken } = block.exit
+                && let Some(last) = block.insts.last()
+                && l.discards(last)
+                && (l.kill_exit(taken) || l.kill_exit(not_taken))
+                && let Some(def) = last.read(Reg::Scc).and_then(|v| l.defs.get(&v))
+            {
+                l.kills.insert(*def);
+            }
+        }
+        for inst in blocks.iter().flat_map(|b| &b.insts) {
+            if let Fields::Valu(v) = &inst.fields
+                && inst.name() == "v_readlane_b32"
+                && let [Operand::Vector { reg, .. }, lane] = v.src[..]
+                && let Some(lane) = lane_of(lane)
+                && let Some(spill) = inst.read(Reg::V(reg))
+                && let Ok(Some(s)) = l.spilled(spill, lane, &mut Vec::new())
+                && let Some(&(_, r)) = inst.writes.first()
+            {
+                l.restored.insert(r, s);
+            }
+        }
+        Ok(l)
+    }
+
+    /// What lane `lane` of VGPR value `v` holds when `v_writelane_b32` put
+    /// an SGPR there: `Ok(None)` for a phi in `seen` (being resolved).
+    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Value>, ()> {
+        if let Some(&(b, i)) = self.phis.get(&v) {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &a in &self.p.blocks[b].phis[i].args {
+                if let Some(s) = self.spilled(a, lane, seen)? {
+                    if found.is_some_and(|f| f != s) {
+                        return Err(());
+                    }
+                    found = Some(s);
+                }
+            }
+            return Ok(found);
+        }
+        let &(b, i) = self.defs.get(&v).ok_or(())?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Valu(w) = &inst.fields else {
+            return Err(());
+        };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+            return Err(());
+        };
+        if inst.name() != "v_writelane_b32" {
+            return Err(());
+        }
+        if lane_of(*at).ok_or(())? != lane {
+            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        }
+        match *value {
+            Operand::Scalar { code, .. } if code != NULL => {
+                inst.read(Reg::S(code)).map(Some).ok_or(())
+            }
+            _ => Err(()),
+        }
     }
 
     fn reset(&mut self) {
@@ -748,14 +663,44 @@ impl<'a> Lanes<'a> {
                     now = Some(e);
                 }
                 self.step(inst, now);
+                if self.kills.contains(&(b, i))
+                    && let Fields::Sop {
+                        dst: Some(Operand::Scalar { code, .. }),
+                        ..
+                    } = inst.fields
+                    && let (Some(old), Some(new)) = (
+                        self.key(|r| inst.read(r), code),
+                        self.key(|r| inst.write(r), code),
+                    )
+                {
+                    let m = self.mask(old).0;
+                    self.masks.insert(new, m);
+                    if let Some(scc) = inst.write(Reg::Scc) {
+                        self.scc_lane.insert(scc, m);
+                    }
+                }
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
                 }
             }
-            if let Exit::Branch { .. } = p.blocks[b].exit
+            if let Exit::Branch { taken, not_taken } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                self.when[b] = Some(self.branch(last));
+                let mut w = self.branch(last);
+                // A discard's "no lane is left" exit: no lane takes it (the
+                // live mask keeps every lane, see `kills`).
+                if last
+                    .read(Reg::Scc)
+                    .and_then(|v| self.defs.get(&v))
+                    .is_some_and(|d| self.kills.contains(d))
+                {
+                    if self.kill_exit(taken) {
+                        w = Bool::FALSE;
+                    } else if self.kill_exit(not_taken) {
+                        w = Bool::TRUE;
+                    }
+                }
+                self.when[b] = Some(w);
             }
         }
         execs
@@ -859,12 +804,14 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 {
-                self.masks
-            } else {
-                Map::default()
-            },
+            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            restored: self.restored.into_iter().collect(),
+            discards: self
+                .kills
+                .iter()
+                .filter_map(|&(b, i)| execs[b][i].map(|e| ((b, i), e)))
+                .collect(),
             bools: self.b,
             exits,
             guards,
@@ -905,14 +852,16 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
-        if let Some(m) = self.restored(k) {
-            self.masks.insert(k, m);
-            return (m, true);
-        }
         let p = self.p;
-        let (m, derived) = match self.join(k) {
-            Some(join) => join,
-            None => {
+        let restored = (
+            self.restored.get(&k.0).copied(),
+            self.restored.get(&k.1).copied(),
+        );
+        let (m, derived) = match (self.join(k), restored) {
+            (Some(join), _) => join,
+            // A mask spilled to VGPR lanes and read back: the same mask.
+            (None, (Some(lo), Some(hi))) => self.mask((lo, hi)),
+            (None, _) => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
                 let m = match (lo, hi) {
@@ -1107,103 +1056,6 @@ impl<'a> Lanes<'a> {
         })
     }
 
-    /// A mask the compiler spilled to VGPR lanes (`v_writelane_b32`, one
-    /// lane per dword) and `k` reads back (`v_readlane_b32` of the same
-    /// lanes): each lane's bit is the one it had when spilled.
-    fn restored(&self, k: Key) -> Option<Bool> {
-        let lo = self.spilled(k.0)?;
-        let hi = if self.p.wave64 {
-            self.spilled(k.1)?
-        } else {
-            lo
-        };
-        self.masks.get(&(lo, hi)).copied()
-    }
-
-    /// The scalar value a `v_readlane_b32` of a constant lane reads back
-    /// from a `v_writelane_b32` of that lane, where it dominates the read.
-    fn spilled(&self, v: Value) -> Option<Value> {
-        let &(b, i) = self.defs.get(&v)?;
-        let inst = &self.p.blocks[b].insts[i];
-        let Fields::Valu(r) = &inst.fields else {
-            return None;
-        };
-        let (true, [Operand::Vector { reg, .. }, at]) =
-            (plain_lane_op(inst, "v_readlane_b32"), &r.src[..])
-        else {
-            return None;
-        };
-        let lane = self.const_lane(*at)?;
-        let s = self
-            .lane_write(inst.read(Reg::V(*reg))?, lane, &mut Vec::new())
-            .ok()??;
-        let born = self.defs.get(&s).map_or(self.order[0], |d| d.0);
-        self.dominates(born, b).then_some(s)
-    }
-
-    /// The scalar value written to `lane` of the VGPR value `v`, through
-    /// writes of other lanes and joins that agree on it (none on a cycle).
-    fn lane_write(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Value>, ()> {
-        if let Some(&(b, i)) = self.phis.get(&v) {
-            if seen.contains(&v) {
-                return Ok(None);
-            }
-            seen.push(v);
-            let mut found = None;
-            for &arg in &self.p.blocks[b].phis[i].args {
-                if let Some(s) = self.lane_write(arg, lane, seen)? {
-                    if found.is_some_and(|f| f != s) {
-                        return Err(());
-                    }
-                    found = Some(s);
-                }
-            }
-            return Ok(found);
-        }
-        let &(b, i) = self.defs.get(&v).ok_or(())?;
-        let inst = &self.p.blocks[b].insts[i];
-        let Fields::Valu(w) = &inst.fields else {
-            return Err(());
-        };
-        let (true, Some(Operand::Vector { reg, .. }), [value, at]) =
-            (plain_lane_op(inst, "v_writelane_b32"), w.dst, &w.src[..])
-        else {
-            return Err(());
-        };
-        if self.const_lane(*at).ok_or(())? != lane {
-            return self.lane_write(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
-        }
-        match *value {
-            Operand::Scalar { code, .. } if code != NULL => {
-                inst.read(Reg::S(code)).map(Some).ok_or(())
-            }
-            _ => Err(()),
-        }
-    }
-
-    fn const_lane(&self, op: Operand) -> Option<u32> {
-        let raw = match op {
-            Operand::Const(c) => crate::resource::inline(c)?,
-            Operand::Literal(x) => x,
-            _ => return None,
-        };
-        Some(raw & if self.p.wave64 { 63 } else { 31 })
-    }
-
-    fn dominates(&self, a: usize, mut b: usize) -> bool {
-        if self.index[a] == usize::MAX || self.index[b] == usize::MAX {
-            return false;
-        }
-        while b != a {
-            let d = self.idom[b];
-            if d == b || d == usize::MAX {
-                return false;
-            }
-            b = d;
-        }
-        true
-    }
-
     fn combine(&mut self, f: &str, a: Bool, c: Bool) -> Option<Bool> {
         let b = &mut self.b;
         Some(match f {
@@ -1255,8 +1107,7 @@ impl<'a> Lanes<'a> {
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
                         takes_mask |= self.masks.contains_key(&k)
-                            || phi && self.mask(k).1
-                            || self.restored(k).is_some();
+                            || phi && !self.joins_loaded(k) && self.mask(k).1;
                     }
                 }
                 let touches_exec =
@@ -1333,6 +1184,68 @@ impl<'a> Lanes<'a> {
             }
             _ => {}
         }
+    }
+
+    /// Whether a join takes a value loaded from memory on some edge: data
+    /// that the other paths leave a stale lane mask in place of (a register
+    /// reused after a branch), so operations on it are no mask operations.
+    fn joins_loaded(&self, k: Key) -> bool {
+        [k.0, k.1].iter().any(|v| {
+            self.phis.get(v).is_some_and(|&(b, i)| {
+                self.p.blocks[b].phis[i].args.iter().any(|a| {
+                    self.defs.get(a).is_some_and(|&(db, di)| {
+                        matches!(self.p.blocks[db].insts[di].fields, Fields::Smem { .. })
+                    })
+                })
+            })
+        })
+    }
+
+    /// Whether `inst` branches on the SCC of `s_andn2 X, X, exec`: whether
+    /// any lane is left in a pixel's live mask after a discard.
+    fn discards(&self, inst: &Inst) -> bool {
+        if !inst.name().starts_with("s_cbranch_scc") {
+            return false;
+        }
+        let Some(&(db, di)) = inst.read(Reg::Scc).and_then(|v| self.defs.get(&v)) else {
+            return false;
+        };
+        let def = &self.p.blocks[db].insts[di];
+        let Fields::Sop {
+            dst: Some(d), src, ..
+        } = &def.fields
+        else {
+            return false;
+        };
+        matches!(def.name(), "s_andn2_b32" | "s_andn2_b64")
+            && src.first() == Some(d)
+            && matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. }))
+    }
+
+    /// Whether a lane entering block `b` leaves the program doing nothing but
+    /// scalar work and a `done` export to `null` (a discard's exit).
+    fn kill_exit(&self, mut b: usize) -> bool {
+        for _ in 0..8 {
+            let block = &self.p.blocks[b];
+            let mut null_done = false;
+            for inst in &block.insts {
+                match inst.fields {
+                    Fields::Exp {
+                        target: 9,
+                        done: true,
+                        ..
+                    } => null_done = true,
+                    Fields::Sop { .. } | Fields::Sopp { .. } => {}
+                    _ => return false,
+                }
+            }
+            match block.exit {
+                Exit::End => return null_done,
+                Exit::Jump(next) if !null_done => b = next,
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// The per-lane condition under which a block's closing branch is taken.
@@ -1479,6 +1392,74 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_spilled_to_a_vgpr_lane_comes_back_as_itself() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE80_036A, // s_mov_b32 s0, vcc_lo
+                0xD761_0001,
+                0x0001_0600, // v_writelane_b32 v1, s0, 3
+                0xD760_0005,
+                0x0001_0701, // v_readlane_b32 s5, v1, 3
+                0xBE86_3C05, // s_and_saveexec_b32 s6, s5
+                0xBF88_0001, // s_cbranch_execz -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let insts = &p.blocks[0].insts;
+        let saved = insts[1].write(Reg::S(0)).unwrap();
+        let restored = insts[3].write(Reg::S(5)).unwrap();
+        assert_eq!(s.restored.get(&restored), Some(&saved));
+        // Skipped exactly where the compare fails, as without the spill.
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits)
+        };
+        let cmp = insts[0].write(Reg::S(VCC)).unwrap();
+        assert_eq!(
+            s.bools.node(when),
+            Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
+        );
+    }
+
+    #[test]
+    fn data_loaded_where_a_mask_was_is_no_mask() {
+        // s1 holds a mask on one path and a loaded value on the other; the
+        // bit test after the join is data (wave32: `_b32` operations would
+        // otherwise read as mask operations).
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE81_036A, // s_mov_b32 s1, vcc_lo
+                0xBF06_8004, // s_cmp_eq_u32 s4, 0
+                0xBF85_0002, // s_cbranch_scc1 -> join
+                0xF400_0041,
+                0xFA00_0000, // s_load_dword s1, s[2:3], 0
+                0x8702_FF01,
+                0x0010_0000, // join: s_and_b32 s2, s1, 0x100000
+                0xBF06_8002, // s_cmp_eq_u32 s2, 0
+                0xBF85_0001, // s_cbranch_scc1 -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let join = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "s_and_b32"))
+            .unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[join] else {
+            panic!("{:?}", s.exits)
+        };
+        let scc = p.blocks[join].insts[1].write(Reg::Scc).unwrap();
+        assert_eq!(s.bools.support(when), vec![Atom::Uniform(scc)]);
+    }
+
+    #[test]
     fn exec_narrowed_without_a_branch_leaves_a_guard() {
         let p = build(
             &[
@@ -1595,180 +1576,5 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
-    }
-
-    #[test]
-    fn meet_pins_forced_variables_across_deep_diamond_chain() {
-        let mut b = Bools::new();
-        let val = Value;
-        let mut reach = Bool::TRUE;
-        for i in 0..24u32 {
-            let x = b.atom(Atom::Lane(val(2 * i + 1)), i as usize);
-            let y = b.atom(Atom::Lane(val(2 * i + 2)), i as usize);
-            let clause = b.or(x, y);
-            reach = b.and(reach, clause);
-        }
-        let tail = b.atom(Atom::Lane(val(100)), 30);
-        let not_tail = b.not(tail);
-        let guarded = b.and(reach, not_tail);
-        // Without bottom-up forced-var restriction, branching on the 24 (x | y) diamonds
-        // explores 3^24 paths and hits MAX_MEET, falsely returning `true`.
-        assert!(!b.meet(&[(guarded, true), (tail, true)]));
-        assert!(b.meet(&[(guarded, true), (tail, false)]));
-
-        // Cascading unit propagation through a forced chain at the bottom.
-        let gate = b.atom(Atom::Uniform(val(101)), 31);
-        let cascade = b.ite(tail, gate, Bool::FALSE);
-        assert!(!b.meet(&[(guarded, true), (cascade, true)]));
-        assert!(b.meet(&[(reach, true), (cascade, true)]));
-    }
-
-    #[test]
-    fn meet_memoizes_diamonds_without_forced_root_vars() {
-        let mut b = Bools::new();
-        let val = Value;
-        let mut reach = Bool::TRUE;
-        for i in 0..22u32 {
-            let x = b.atom(Atom::Lane(val(2 * i + 1)), i as usize);
-            let y = b.atom(Atom::Lane(val(2 * i + 2)), i as usize);
-            let clause = b.or(x, y);
-            reach = b.and(reach, clause);
-        }
-        // Keep the conflict (z0 & !z0) below all 22 diamonds so no variable is
-        // forced at the root; failed-state memoization collapses the DAG.
-        let z0 = b.atom(Atom::Lane(val(200)), 30);
-        let z1 = b.atom(Atom::Lane(val(201)), 30);
-        let eq = b.xor(z0, z1);
-        let c1 = b.and(reach, z0);
-        let nz0 = b.not(z0);
-        let c2 = b.and(reach, nz0);
-        assert!(!b.meet(&[(c1, true), (c2, true)]));
-
-        let same_side = b.and(reach, eq);
-        assert!(b.meet(&[(c1, true), (same_side, true)]));
-        assert!(!b.meet(&[(c1, true), (c1, false)]));
-    }
-
-    #[test]
-    fn meet_handles_canonical_dedup_and_trivial_constraints() {
-        let mut b = Bools::new();
-        let x = b.atom(Atom::Lane(Value(1)), 0);
-        let nx = b.not(x);
-        assert!(b.meet(&[]));
-        assert!(b.meet(&[(Bool::TRUE, true), (Bool::FALSE, false)]));
-        assert!(!b.meet(&[(Bool::FALSE, true)]));
-        assert!(!b.meet(&[(Bool::TRUE, false)]));
-        assert!(b.meet(&[(x, true), (x, true)]));
-        assert!(!b.meet(&[(x, true), (x, false)]));
-        assert!(!b.meet(&[(x, false), (nx, false)]));
-    }
-
-    #[test]
-    fn resource_lane_phi_prunes_dead_arm_behind_diamond_chain() {
-        use crate::native::{HwStage, RootParam, RootType::Table};
-
-        let mut words = vec![
-            0xBE84_0300, // s_mov_b32 s4, s0
-            0xBE85_0380, // s_mov_b32 s5, 0
-            0xF408_0602,
-            0xFA00_0000, // s_load_dwordx4 s[24:27], s[4:5], 0x0
-            0xF408_0802,
-            0xFA00_0020, // s_load_dwordx4 s[32:35], s[4:5], 0x20
-            0xF408_0A02,
-            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
-            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
-            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-        ];
-        // Prepend 20 (a_i | b_i) early-cull diamonds so `reach` carries 3^20 paths into
-        // the `lane_phi` + waterfall below; each cbranch targets the shared final s_endpgm.
-        const DIAMONDS: usize = 20;
-        let mut cbranch_sites = Vec::with_capacity(DIAMONDS);
-        for _ in 0..DIAMONDS {
-            words.extend_from_slice(&[
-                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
-                0xBE8A_036A, // s_mov_b32 s10, vcc_lo
-                0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
-                0x886A_6A0A, // s_or_b32 vcc_lo, s10, vcc_lo
-                0xBE8A_3C6A, // s_and_saveexec_b32 s10, vcc_lo
-                0xBF88_0000, // s_cbranch_execz -> patched to final s_endpgm
-            ]);
-            cbranch_sites.push(words.len() - 1);
-        }
-        // Waterfall descriptor join guarded by `s30` (`24 > v0`); the `!s30` arm never runs
-        // inside the waterfall loop and must be proven dead despite the 20 diamonds above.
-        words.extend_from_slice(&[
-            0xD4C4_001E,
-            0x0002_0098, // v_cmp_gt_u32_e64 s30, 24, v0
-            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
-            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
-            0x8914_147E, // s_xor_b32 s20, exec_lo, s20
-            0xBF88_0004, // s_cbranch_execz -> +4
-            0x7E08_0218, // v_mov_b32 v4, s24
-            0x7E0A_0219, // v_mov_b32 v5, s25
-            0x7E0C_021A, // v_mov_b32 v6, s26
-            0x7E0E_021B, // v_mov_b32 v7, s27
-            0xBE94_3D14, // s_or_saveexec_b32 s20, s20
-            0x897E_147E, // s_xor_b32 exec_lo, exec_lo, s20
-            0xBF88_0007, // s_cbranch_execz -> +7
-            0xBE9F_3C1E, // s_and_saveexec_b32 s31, s30
-            0xBF88_0004, // s_cbranch_execz -> +4
-            0x7E08_0220, // v_mov_b32 v4, s32
-            0x7E0A_0221, // v_mov_b32 v5, s33
-            0x7E0C_0222, // v_mov_b32 v6, s34
-            0x7E0E_0223, // v_mov_b32 v7, s35
-            0x887E_1F7E, // s_or_b32 exec_lo, exec_lo, s31
-            0x887E_147E, // s_or_b32 exec_lo, exec_lo, s20
-            0xBE97_3C1E, // s_and_saveexec_b32 s23, s30
-            0xBF88_0013, // s_cbranch_execz -> +19
-            0xBE9D_037E, // s_mov_b32 s29, exec_lo
-            0x7E18_0504, // v_readfirstlane_b32 s12, v4
-            0x7E1A_0505, // v_readfirstlane_b32 s13, v5
-            0x7E1C_0506, // v_readfirstlane_b32 s14, v6
-            0x7E1E_0507, // v_readfirstlane_b32 s15, v7
-            0xD4E2_0015,
-            0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
-            0xD4E2_0016,
-            0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
-            0x8715_1615, // s_and_b32 s21, s21, s22
-            0xBE95_3C15, // s_and_saveexec_b32 s21, s21
-            0xE030_1000,
-            0x8003_0C10, // buffer_load_dword v12, v16, s[12:15], 0 offen
-            0xBF8C_3F70, // s_waitcnt vmcnt(0)
-            0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
-            0xBF89_FFF1, // s_cbranch_execnz -> loop
-            0xBEFE_031D, // s_mov_b32 exec_lo, s29
-            0xE070_1000,
-            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
-            0x887E_177E, // s_or_b32 exec_lo, exec_lo, s23
-            S_ENDPGM,
-        ]);
-        let end_idx = words.len() - 1;
-        for site in cbranch_sites {
-            let rel = (end_idx - site - 1) as u16;
-            words[site] = 0xBF88_0000 | u32::from(rel);
-        }
-        let p = build(&words, false);
-        let s = structure(&p).unwrap();
-        let layout = [
-            RootParam {
-                root: Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            },
-            RootParam {
-                root: Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 1,
-                slot: 0,
-            },
-        ];
-        let r = crate::resource::track(&p, &layout, HwStage::Cs, Some(&s)).unwrap();
-        assert_eq!(r.waterfall.reads.len(), 4, "{r:?}");
-        assert!(!r.descriptors.is_empty(), "{r:?}");
     }
 }

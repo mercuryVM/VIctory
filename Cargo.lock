@@ -652,6 +652,7 @@ dependencies = [
  "clap",
  "memchr",
  "tempfile",
+ "tracing",
  "victory-core",
  "victory-game",
  "victory-gpu",
@@ -757,7 +758,6 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "miniz_oxide",
  "tempfile",
  "thiserror",

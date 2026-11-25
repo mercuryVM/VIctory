@@ -17,6 +17,9 @@ pub struct FourCC(pub [u8; 4]);
 
 impl FourCC {
     pub const DXIL: FourCC = FourCC(*b"DXIL");
+    /// Native code from another compiler, in place of `DXIL`
+    /// ([`crate::native::fspx_program`]).
+    pub const ACCC: FourCC = FourCC(*b"ACCC");
     pub const STAT: FourCC = FourCC(*b"STAT");
     pub const RTS0: FourCC = FourCC(*b"RTS0");
     pub const PSV0: FourCC = FourCC(*b"PSV0");
@@ -58,8 +61,6 @@ pub struct Part<'a> {
 pub struct Container<'a> {
     pub digest: [u8; 16],
     pub version: (u16, u16),
-    /// Total byte length declared in the DXBC header (`0x18`).
-    pub total_size: usize,
     pub parts: Vec<Part<'a>>,
 }
 
@@ -116,7 +117,6 @@ impl<'a> Container<'a> {
         Ok(Container {
             digest,
             version,
-            total_size: total,
             parts,
         })
     }

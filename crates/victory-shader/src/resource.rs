@@ -12,13 +12,11 @@
 //! memory address is traced through the SSA values back to those
 //! parameters, by data flow: copies, phis that agree, and additions.
 
-use std::collections::HashMap;
-
 use crate::ShaderError;
-use crate::gfx10::{Fields, NULL, Operand, Valu};
+use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
-use crate::structure::{Atom, Bool, Bools, LaneExit, Structured};
+use crate::structure::{Bool, LaneExit, Structured};
 
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
@@ -39,6 +37,18 @@ pub struct Address {
 /// compiler appends after the code and reads through `s_getpc_b64`; the
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
+
+/// [`Address::param`] of title memory at an address the program computes
+/// from data (a pointer loaded from memory or passed in root constants,
+/// arithmetic on such values): lowering takes the address from the
+/// instruction's own operands (decision 0005, title memory).
+pub const MEMORY: usize = usize::MAX - 1;
+
+/// [`Address::param`] of a load from the root signature's memory: a compute
+/// program gets the root parameters past its 16 user SGPRs in memory whose
+/// 40-bit address is in user data 0-1, starting with user-data dword 16.
+/// The offset is the user-data byte offset (dword 16 at 0x40).
+pub const USER_DATA: usize = usize::MAX - 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -115,8 +125,9 @@ pub struct Resources {
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
-    /// User SGPRs holding root parameters: value on entry, layout index,
-    /// dword within the parameter.
+    /// User SGPRs holding root parameters: value on entry (or loaded from
+    /// the root signature's memory, [`USER_DATA`]), layout index, dword
+    /// within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
 }
@@ -161,6 +172,7 @@ pub fn track(
                 let (param, dword) = t.param_of(reg)?;
                 Some((v, param, dword))
             })
+            .chain(t.spilled.iter().map(|(&v, &(param, dword))| (v, param, dword)))
             .collect(),
         ..Resources::default()
     };
@@ -194,6 +206,15 @@ pub fn track(
                 Ok(())
             };
             match &inst.fields {
+                Fields::Image { rsrc, .. } if inst.name().starts_with("image_bvh") => {
+                    if let Some(source) = t.bvh_descriptor(inst, rsrc).map_err(fail)? {
+                        out.descriptors.push(Descriptor {
+                            site,
+                            role: Role::Resource,
+                            source,
+                        });
+                    }
+                }
                 Fields::Image { rsrc, sampler, .. } => {
                     descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
@@ -273,33 +294,15 @@ pub fn track(
 }
 
 /// A dword after copy propagation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Term {
     Const(u32),
     Value(Value),
 }
 
-/// One normalized operand of a pure `v_cmp*` instruction.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct CmpOperand {
-    abs: bool,
-    neg: bool,
-    hi: bool,
-    dwords: Vec<Term>,
-}
-
-/// Canonical identity of a pure per-lane compare, up to operand swap and
-/// (for integer compares) negation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct CompareKey {
-    op: &'static str,
-    ty: &'static str,
-    lhs: CmpOperand,
-    rhs: CmpOperand,
-}
-
 /// A 32-bit sum: optional root parameter (as its first dword), constant,
 /// optional computed term.
+#[derive(Clone, Copy)]
 struct Sum {
     base: Option<Value>,
     offset: u32,
@@ -320,15 +323,56 @@ struct Tracer<'a> {
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
+    /// Values loaded from the root signature's memory ([`USER_DATA`]): the
+    /// root parameter and dword each one is.
+    spilled: std::collections::HashMap<Value, (usize, u32)>,
+    /// The first such value of each parameter dword, which the others are
+    /// copies of.
+    first_spilled: std::collections::HashMap<(usize, u32), Value>,
+    /// The loads from that memory by code offset, with their user-data byte
+    /// offset.
+    spill_at: std::collections::HashMap<usize, Result<u32, &'static str>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
 /// its negation where not.
 type Known = Vec<(Bool, bool)>;
 
+/// Whether some lane can satisfy all of `known`. The search gives up (yes)
+/// on many large conditions, as the reach of blocks deep in a program is,
+/// before it gets to the branch conditions of the path, so those few small
+/// ones are tried alone first: if they cannot hold together, neither can
+/// all.
+fn meet(lanes: &Structured, known: &Known) -> bool {
+    let small: Known = known
+        .iter()
+        .copied()
+        .filter(|&(b, _)| few_atoms(&lanes.bools, b))
+        .collect();
+    (small.len() == known.len() || lanes.bools.meet(&small)) && lanes.bools.meet(known)
+}
+
+/// Whether `b` is a small condition: at most 4 atoms within 32 nodes.
+fn few_atoms(bools: &crate::structure::Bools, b: Bool) -> bool {
+    let (mut atoms, mut stack, mut nodes) = (Vec::new(), vec![b], 0);
+    while let Some(x) = stack.pop() {
+        let Some((atom, lo, hi)) = bools.node(x) else {
+            continue;
+        };
+        nodes += 1;
+        if !atoms.contains(&atom) {
+            atoms.push(atom);
+        }
+        if nodes > 32 || atoms.len() > 4 {
+            return false;
+        }
+        stack.extend([lo, hi]);
+    }
+    true
+}
+
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
-const MAX_MEET: usize = 1 << 16;
 
 impl<'a> Tracer<'a> {
     fn new(
@@ -382,9 +426,105 @@ impl<'a> Tracer<'a> {
             origin: Vec::new(),
             lanes,
             rpo,
+            spilled: Default::default(),
+            first_spilled: Default::default(),
+            spill_at: Default::default(),
         };
         t.origin = t.propagate_copies(n)?;
+        // Loads from the root signature's memory are found by their address,
+        // which copies reach; then a reload is a copy of the first load.
+        for (site, at) in t.spill_loads() {
+            t.spill_at.insert(t.inst(site).machine.offset, at);
+            let Ok(at) = at else { continue };
+            for (k, &(_, v)) in t.inst(site).writes.iter().enumerate() {
+                if let Some(pd) = t.spilled_param(at / 4 + k as u32) {
+                    t.spilled.insert(v, pd);
+                    t.first_spilled.entry(pd).or_insert(v);
+                }
+            }
+        }
+        if !t.spilled.is_empty() {
+            t.origin = t.propagate_copies(n)?;
+        }
         Ok(t)
+    }
+
+    /// The scalar loads from the root signature's memory ([`USER_DATA`])
+    /// and the user-data byte offset each reads at (an error for a computed
+    /// one). Compute programs only: they get 16 user SGPRs, and one whose
+    /// parameters do not fit reads them through the pointer in user data
+    /// 0-1 (its high dword masked to the 40-bit address).
+    fn spill_loads(&self) -> Vec<(Site, Result<u32, &'static str>)> {
+        let input = |r| self.p.inputs.iter().find(|i| i.0 == r).map(|i| i.1);
+        let (Some(lo), Some(hi)) = (input(Reg::S(0)), input(Reg::S(1))) else {
+            return Vec::new();
+        };
+        if self.stage != HwStage::Cs
+            || !self.layout.iter().any(|p| p.user_data >= 16)
+            || self.layout.iter().any(|p| p.user_data < 2 && p.sgprs > 0)
+        {
+            return Vec::new();
+        }
+        let high = |t: Term| {
+            t == Term::Value(hi)
+                || matches!(t, Term::Value(v) if self.sop2(v, &["s_and_b32"]).is_some_and(
+                    |(_, [a, b])| matches!((a, b), (x, Term::Const(_)) | (Term::Const(_), x) if x == Term::Value(hi))
+                ))
+        };
+        let mut out = Vec::new();
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                let Fields::Smem {
+                    base: Operand::Scalar { code, .. },
+                    offset,
+                    soffset,
+                    ..
+                } = &inst.fields
+                else {
+                    continue;
+                };
+                if !inst.name().starts_with("s_load_") {
+                    continue;
+                }
+                let word = |k| inst.read(Reg::S(code + k)).map(|v| self.origin(v));
+                if word(0) != Some(Term::Value(lo)) || !word(1).is_some_and(high) {
+                    continue;
+                }
+                let at = match self.term(inst, soffset) {
+                    Some(Term::Const(c)) => Ok((*offset as u32).wrapping_add(c).wrapping_add(64)),
+                    _ => Err("a computed offset into the root signature's memory"),
+                };
+                out.push(((b, i), at));
+            }
+        }
+        out
+    }
+
+    /// The root parameter and dword that user-data dword `index` holds,
+    /// when it is in the root signature's memory.
+    fn spilled_param(&self, index: u32) -> Option<(usize, u32)> {
+        self.layout.iter().enumerate().find_map(|(i, p)| {
+            let dword = index.checked_sub(p.user_data.into())?;
+            (p.user_data >= 16 && dword < p.sgprs).then_some((i, dword))
+        })
+    }
+
+    /// The root parameter and dword `v` holds on entry or loaded from the
+    /// root signature's memory.
+    fn param_value(&self, v: Value) -> Option<(usize, u32)> {
+        match self.inputs[v.0 as usize] {
+            Some(reg) => self.param_of(reg),
+            None => self.spilled.get(&v).copied(),
+        }
+    }
+
+    /// The value holding dword `dword` of root parameter `param`.
+    fn param_word(&self, param: usize, dword: u32) -> Option<Value> {
+        if self.layout[param].user_data >= 16 && self.stage == HwStage::Cs {
+            return self.first_spilled.get(&(param, dword)).copied();
+        }
+        let reg = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + dword as u8);
+        self.p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1)
     }
 
     /// Optimistic copy propagation: a move's result is its source's
@@ -416,7 +556,16 @@ impl<'a> Tracer<'a> {
                 }
                 for inst in &block.insts {
                     for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
+                        let reload = self
+                            .spilled
+                            .get(&v)
+                            .map(|pd| self.first_spilled[pd])
+                            .filter(|&first| first != v)
+                            .map(Moved::Value);
+                        let new = match reload
+                            .or_else(|| copy_source(inst, k))
+                            .or_else(|| self.restored(inst))
+                        {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
                             None => Some(Term::Value(v)),
@@ -509,8 +658,8 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: Some(v),
         };
-        if let Some(reg) = self.inputs[v.0 as usize] {
-            return match self.param_of(reg) {
+        if self.inputs[v.0 as usize].is_some() || self.spilled.contains_key(&v) {
+            return match self.param_value(v) {
                 Some((_, 0)) => Sum {
                     base: Some(v),
                     offset: 0,
@@ -647,10 +796,89 @@ impl<'a> Tracer<'a> {
     }
 
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
-    /// immediate and offset register).
+    /// immediate and offset register); title memory ([`MEMORY`]) when the
+    /// program computes it from data. Addresses into descriptor heaps, the
+    /// code or an SGPR the root signature does not fill are traced or
+    /// refused.
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+        const DATA: &[&str] = &[
+            "an address not from a root parameter",
+            "an address loaded from memory",
+            "an address from a phi",
+            "an address with two computed terms",
+            "an address with an untracked high half",
+            "an address from a root parameter that is no address",
+            "a constant address",
+        ];
+        match self.traced_address(lo, hi, extra) {
+            // The code's table at an offset the program computes from the
+            // counter (made uniform with a first-lane read, say): lowering
+            // gives the counter the code offset, so `lo` is the byte offset.
+            Err(_) if self.reaches_pc(lo) => match (lo, extra.dynamic) {
+                (Term::Value(v), None) => Ok(Address {
+                    param: CODE,
+                    offset: extra.offset,
+                    dynamic: Some(v),
+                }),
+                _ => Err("an address relative to the program counter"),
+            },
+            Err(why) if DATA.contains(&why) => Ok(Address {
+                param: MEMORY,
+                offset: 0,
+                dynamic: None,
+            }),
+            a => a,
+        }
+    }
+
+    /// Whether the low dword `t` of an address is the program counter's plus
+    /// offsets (a table in the code, which is not title memory on the host),
+    /// through copies, additions, lane reads and phis.
+    fn reaches_pc(&self, t: Term) -> bool {
+        const ADDITIVE: &[&str] = &[
+            "s_mov_b32",
+            "s_add_u32",
+            "s_add_i32",
+            "s_or_b32",
+            "v_mov_b32",
+            "v_add_co_u32",
+            "v_add_nc_u32",
+            "v_add3_u32",
+            "v_lshl_add_u32",
+            "v_or_b32",
+            "v_readfirstlane_b32",
+        ];
+        let Term::Value(v) = t else { return false };
+        let (mut stack, mut seen) = (vec![v], std::collections::HashSet::new());
+        while let Some(v) = stack.pop() {
+            if !seen.insert(v) || seen.len() > 256 {
+                continue;
+            }
+            if let Some((b, i)) = self.phis[v.0 as usize] {
+                stack.extend(&self.p.blocks[b].phis[i].args);
+                continue;
+            }
+            let Some(inst) = self.def(v) else { continue };
+            if inst.name() == "s_getpc_b64" {
+                return true;
+            }
+            if ADDITIVE.contains(&inst.name()) {
+                // Not through the lane mask a vector instruction runs under.
+                let operand =
+                    |r: &&(Reg, Value)| !matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1);
+                stack.extend(inst.reads.iter().filter(operand).map(|r| r.1));
+            }
+        }
+        false
+    }
+
+    /// [`Self::address`] traced to a root parameter or the code.
+    fn traced_address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
+            if s.base.is_some_and(|b| self.heap_base(b)) {
+                return Err("an address into a descriptor heap with two computed terms");
+            }
             return Err("an address with two computed terms");
         }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
@@ -668,17 +896,15 @@ impl<'a> Tracer<'a> {
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }
-        let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
         let (param, _) = self
-            .param_of(reg)
+            .param_value(base)
             .ok_or("an address not from a root parameter")?;
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
-            RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
-                let input = self.p.inputs.iter().find(|i| i.0 == high);
-                Some(input.ok_or("a root descriptor without its high half")?.1)
-            }
+            RootType::Descriptor => Some(
+                self.param_word(param, 1)
+                    .ok_or("a root descriptor without its high half")?,
+            ),
             _ => return Err("an address from a root parameter that is no address"),
         };
         // shortcut: with a computed term, a high half that adds anything to the
@@ -687,12 +913,26 @@ impl<'a> Tracer<'a> {
         if !self.high_half(hi, high)
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
-            return Err("an address with an untracked high half");
+            return Err(if high.is_none() {
+                "an address into a descriptor heap with an untracked high half"
+            } else {
+                "an address with an untracked high half"
+            });
         }
         Ok(Address {
             param,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+        })
+    }
+
+    /// Whether `v` is a root parameter holding a descriptor heap address.
+    fn heap_base(&self, v: Value) -> bool {
+        self.param_value(v).is_some_and(|(p, _)| {
+            matches!(
+                self.layout[p].root,
+                RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap
+            )
         })
     }
 
@@ -731,6 +971,9 @@ impl<'a> Tracer<'a> {
         let Some(v) = dynamic else {
             return "a constant address";
         };
+        if self.param_value(v).is_some() {
+            return "an address from a root parameter that is no address";
+        }
         if self.inputs[v.0 as usize].is_some() {
             return "an address in an SGPR that is no root parameter";
         }
@@ -768,6 +1011,13 @@ impl<'a> Tracer<'a> {
         let Operand::Scalar { code, .. } = *base else {
             return Err("an address not in SGPRs");
         };
+        if let Some(&at) = self.spill_at.get(&inst.machine.offset) {
+            return at.map(|offset| Address {
+                param: USER_DATA,
+                offset,
+                dynamic: None,
+            });
+        }
         let word = |k| Some(self.origin(inst.read(Reg::S(code + k))?));
         let (Some(lo), Some(hi)) = (word(0), word(1)) else {
             return Err("an address not in SGPRs");
@@ -788,10 +1038,17 @@ impl<'a> Tracer<'a> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
-        let words = (0..dwords)
+        let mut words = (0..dwords)
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
+        // A byte access through a buffer descriptor made raw reads what the
+        // descriptor's view does with a raw host view.
+        if !inst.name().contains("format")
+            && let Some(raw) = self.made_raw(&words)
+        {
+            words = raw.to_vec();
+        }
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
         self.classify(&words, &mut Vec::new(), &mut known)
@@ -1004,6 +1261,77 @@ impl<'a> Tracer<'a> {
         Some((inst.read(Reg::Scc)?, set, clear))
     }
 
+    /// The descriptor of `image_bvh*_intersect_ray`: no view, but the BVH's
+    /// address over 256 (dword 0 and the low byte of dword 1) and flags (see
+    /// `emit`'s BVH lowering). Only the flags it emulates pass: box sorting,
+    /// no box growth, no node bound, triangles returning barycentrics. The
+    /// address is a [`Source::Built`] around a root parameter's when the code
+    /// shifted one into place (`s_lshr_b64 ..., 8`), else `None`: the nodes
+    /// are then at a raw GPU address.
+    fn bvh_descriptor(&self, inst: &Inst, op: &Operand) -> Result<Option<Source>, &'static str> {
+        const WHY: &str = "a BVH descriptor with other flags";
+        let Operand::Scalar { code, dwords: 4 } = *op else {
+            return Err("a descriptor not in SGPRs");
+        };
+        let word = |k| {
+            inst.read(Reg::S(code + k))
+                .map(|v| self.origin(v))
+                .ok_or("a descriptor not in SGPRs")
+        };
+        let (Term::Const(w2), Term::Const(w3)) = (word(2)?, word(3)?) else {
+            return Err(WHY);
+        };
+        // Dword 1 holds address bits 32-39 under the flags: a constant, or
+        // the high half of the shift with the flags set.
+        let (high, flags) = match word(1)? {
+            Term::Const(c) => (None, c & !0xFF),
+            Term::Value(v) => match self.set_bits(v) {
+                Some((Term::Value(x), bits)) => (Some(x), bits),
+                _ => return Err(WHY),
+            },
+        };
+        // Bit 123 (dword 3 bit 27) is a page-size hint.
+        if flags != 0x8000_0000 || w2 != u32::MAX || w3 & !(1 << 27) != 0x8100_03FF {
+            return Err(WHY);
+        }
+        let shifted = match word(0)? {
+            Term::Value(lo) => self
+                .def(lo)
+                .filter(|s| s.name() == "s_lshr_b64" && s.writes.first().map(|w| w.1) == Some(lo)),
+            Term::Const(_) => None,
+        };
+        let Some(shift) = shifted else {
+            return if high.is_none() { Ok(None) } else { Err(WHY) };
+        };
+        let Fields::Sop { src, .. } = &shift.fields else {
+            return Err(WHY);
+        };
+        let pair = match (src.first(), src.get(1).and_then(|s| self.term(shift, s))) {
+            (Some(&Operand::Scalar { code, .. }), Some(Term::Const(8))) if code != NULL => {
+                let half = |k| shift.read(Reg::S(code + k)).map(|v| self.origin(v));
+                half(0).zip(half(1))
+            }
+            _ => None,
+        };
+        let (Some((lo, hi)), true) = (pair, high == shift.writes.get(1).map(|w| w.1)) else {
+            return Err(WHY);
+        };
+        let at = Sum {
+            base: None,
+            offset: 0,
+            dynamic: None,
+        };
+        // A computed base (title memory) is read from the operand.
+        match self.address(lo, hi, at) {
+            Ok(address) if address.param != MEMORY => Ok(Some(Source::Built {
+                address,
+                bits: flags,
+                words: [w2, w3],
+            })),
+            _ => Ok(None),
+        }
+    }
+
     /// `v` as some other dword with constant bits set.
     fn set_bits(&self, v: Value) -> Option<(Term, u32)> {
         if let Some((_, [x, Term::Const(bits)] | [Term::Const(bits), x])) =
@@ -1026,6 +1354,45 @@ impl<'a> Tracer<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The words of a buffer descriptor that `words` makes raw, as the
+    /// FidelityFX upscaler's compiler does before byte accesses: the stride
+    /// (dword 1 bits 16-29) cleared, the record count times max(stride, 1),
+    /// out-of-bounds checking by bytes (dword 3 bits 28-29 set). The bounds
+    /// are then the view's size in bytes either way.
+    fn made_raw(&self, words: &[Term]) -> Option<[Term; 4]> {
+        let [w0, Term::Value(w1), Term::Value(w2), Term::Value(w3)] = *words else {
+            return None;
+        };
+        // `x op c` with `c` either side.
+        let with = |v: Value, name: &str, c: u32| match self.sop2(v, &[name])?.1 {
+            [x, Term::Const(k)] | [Term::Const(k), x] if k == c => Some(x),
+            _ => None,
+        };
+        let d1 = with(w1, "s_and_b32", 0xC000_FFFF)?;
+        let Term::Value(m3) = with(w3, "s_or_b32", 0x3000_0000)? else {
+            return None;
+        };
+        let d3 = with(m3, "s_and_b32", 0xCFFF_FFFF)?;
+        let [a, b] = self.sop2(w2, &["s_mul_i32"])?.1;
+        let max = |t: Term| match t {
+            Term::Value(s) => with(s, "s_max_u32", 1),
+            Term::Const(_) => None,
+        };
+        let (d2, field) = match (max(a), max(b)) {
+            (_, Some(f)) => (a, f),
+            (Some(f), None) => (b, f),
+            (None, None) => return None,
+        };
+        let Term::Value(field) = field else {
+            return None;
+        };
+        // s_bfe_u32: offset 16, width 14.
+        let (_, [x, Term::Const(0x000E_0010)]) = self.sop2(field, &["s_bfe_u32"])? else {
+            return None;
+        };
+        (x == d1).then_some([w0, d1, d2, d3])
     }
 
     /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
@@ -1085,8 +1452,7 @@ impl<'a> Tracer<'a> {
     }
 
     /// [`Self::lane_term`], where every lane in `known` runs each VGPR copy
-    /// it follows (or keeps the previous value when a masked copy writes
-    /// what every active lane already holds).
+    /// it follows.
     fn lane_value(&self, mut t: Term, known: &Known) -> Result<Term, &'static str> {
         for _ in 0..MAX_JOINS * 2 {
             let Term::Value(v) = t else { break };
@@ -1096,297 +1462,12 @@ impl<'a> Tracer<'a> {
             }
             if self.varies(t)
                 && let Some(site) = self.defs[v.0 as usize]
-                && let Err(err) = self.runs(site, known)
             {
-                if let Some(old) = self.redundant_vmov(site, v, next, known) {
-                    t = old;
-                    continue;
-                }
-                return Err(err);
+                self.runs(site, known)?;
             }
             t = next;
         }
         Ok(t)
-    }
-
-    /// If `site` is a plain masked `v_mov_b32` writing `v` with `src` whose
-    /// active lanes in `known` already hold `src` in the destination VGPR,
-    /// returns that previous VGPR value.
-    fn redundant_vmov(&self, site: Site, v: Value, src: Term, known: &Known) -> Option<Term> {
-        let lanes = self.lanes?;
-        let guard = lanes
-            .guards
-            .get(site.0)
-            .and_then(|g| g.get(site.1))
-            .copied()
-            .flatten()?;
-        let inst = self.inst(site);
-        if inst.name() != "v_mov_b32" {
-            return None;
-        }
-        let Fields::Valu(f) = &inst.fields else {
-            return None;
-        };
-        let Some(Operand::Vector { reg, .. }) = f.dst else {
-            return None;
-        };
-        if inst.write(Reg::V(reg)) != Some(v)
-            || f.abs != 0
-            || f.neg != 0
-            || f.clamp
-            || f.omod != 0
-            || f.sdwa.is_some()
-            || f.dpp.is_some()
-        {
-            return None;
-        }
-        let old = Term::Value(inst.read(Reg::V(reg))?);
-        let mut active = known.clone();
-        active.extend([(lanes.reach[site.0], true), (guard, true)]);
-        self.equals_under(old, src, &mut active, 0).then_some(old)
-    }
-
-    /// Whether `cur` evaluates to `want` on every feasible lane in `known`.
-    fn equals_under(&self, cur: Term, want: Term, known: &mut Known, depth: usize) -> bool {
-        if depth > MAX_JOINS {
-            return false;
-        }
-        if !self.lanes_meet(known) {
-            return true;
-        }
-        let Ok(cur) = self.lane_value(cur, known) else {
-            return false;
-        };
-        let want = self.lane_value(want, known).unwrap_or(want);
-        if cur == want {
-            return true;
-        }
-        let Term::Value(v) = cur else {
-            return false;
-        };
-        let Some(lanes) = self.lanes else {
-            return false;
-        };
-        if let Some((block, idx)) = self.phis[v.0 as usize] {
-            let preds = &self.p.blocks[block].preds;
-            if preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
-                return false;
-            }
-            for (j, &q) in preds.iter().enumerate() {
-                let n = known.len();
-                known.push((lanes.reach[q], true));
-                if let LaneExit::Branch {
-                    when,
-                    taken,
-                    not_taken,
-                } = lanes.exits[q]
-                    && taken != not_taken
-                {
-                    known.push((when, taken == block));
-                }
-                let ok = self.equals_under(
-                    Term::Value(self.p.blocks[block].phis[idx].args[j]),
-                    want,
-                    known,
-                    depth + 1,
-                );
-                known.truncate(n);
-                if !ok {
-                    return false;
-                }
-            }
-            return true;
-        }
-        if let Some((mask, set_val, clear_val)) = self.lane_picked(v)
-            && let Some(site) = self.defs[v.0 as usize]
-            && self.runs(site, known).is_ok()
-            && let Some(&bit) = lanes.masks.get(&mask)
-        {
-            for (holds, arm) in [(true, set_val), (false, clear_val)] {
-                let n = known.len();
-                known.push((bit, holds));
-                let ok = self.equals_under(arm, want, known, depth + 1);
-                known.truncate(n);
-                if !ok {
-                    return false;
-                }
-            }
-            return true;
-        }
-        false
-    }
-
-    /// Like [`Bools::meet`], additionally enforcing equivalence between
-    /// repeated pure `v_cmp*` atoms whose canonical operation and SSA
-    /// operands match.
-    fn lanes_meet(&self, all: &[(Bool, bool)]) -> bool {
-        let Some(lanes) = self.lanes else {
-            return true;
-        };
-        if !lanes.bools.meet(all) {
-            return false;
-        }
-        let mut by_key: HashMap<CompareKey, Vec<(Atom, bool)>> = HashMap::new();
-        let mut seen = Vec::new();
-        for &(b, _) in all {
-            for atom in lanes.bools.support(b) {
-                if seen.contains(&atom) {
-                    continue;
-                }
-                seen.push(atom);
-                if let Atom::Lane(v) = atom
-                    && let Some((key, neg)) = self.compare_key(v)
-                {
-                    by_key.entry(key).or_default().push((atom, neg));
-                }
-            }
-        }
-        let mut equiv: HashMap<Atom, (usize, bool)> = HashMap::new();
-        let mut groups = 0usize;
-        for atoms in by_key.into_values() {
-            if atoms.len() >= 2 {
-                for (atom, neg) in atoms {
-                    equiv.insert(atom, (groups, neg));
-                }
-                groups += 1;
-            }
-        }
-        if groups == 0 {
-            return true;
-        }
-        let rank = bdd_ranks(&lanes.bools, all);
-        let mut assigned = vec![None; groups];
-        let mut budget = MAX_MEET;
-        meet_equiv(
-            &lanes.bools,
-            all.to_vec(),
-            &rank,
-            &equiv,
-            &mut assigned,
-            &mut budget,
-        )
-    }
-
-    /// Canonical key and polarity for a pure two-operand `v_cmp*` low-dword
-    /// mask result `v`.
-    fn compare_key(&self, v: Value) -> Option<(CompareKey, bool)> {
-        let inst = self.def(v)?;
-        let Fields::Valu(f) = &inst.fields else {
-            return None;
-        };
-        if f.dpp.is_some()
-            || f.sdwa.is_some()
-            || f.clamp
-            || f.omod != 0
-            || f.src.len() != 2
-            || inst.writes.first().is_none_or(|w| w.1 != v)
-        {
-            return None;
-        }
-        let rest = inst
-            .name()
-            .strip_prefix("v_cmpx_")
-            .or_else(|| inst.name().strip_prefix("v_cmp_"))?;
-        let (op, ty) = rest.rsplit_once('_')?;
-        let (is_int, is_64) = match ty {
-            "u16" | "i16" | "u32" | "i32" => (true, false),
-            "u64" | "i64" => (true, true),
-            "f16" | "f32" => (false, false),
-            "f64" => (false, true),
-            _ => return None,
-        };
-        let lhs = self.cmp_operand(inst, &f.src[0], 0, f, is_64)?;
-        let rhs = self.cmp_operand(inst, &f.src[1], 1, f, is_64)?;
-        let (op, mut lhs, mut rhs, negated) = match op {
-            "lt" => ("lt", lhs, rhs, false),
-            "gt" => ("lt", rhs, lhs, false),
-            "eq" => ("eq", lhs, rhs, false),
-            "ne" if is_int => ("eq", lhs, rhs, true),
-            "le" if is_int => ("lt", rhs, lhs, true),
-            "ge" if is_int => ("lt", lhs, rhs, true),
-            "le" => ("le", lhs, rhs, false),
-            "ge" => ("le", rhs, lhs, false),
-            "lg" | "o" | "u" | "nlg" | "neq" => (op, lhs, rhs, false),
-            "nlt" => ("nlt", lhs, rhs, false),
-            "ngt" => ("nlt", rhs, lhs, false),
-            "nle" => ("nle", lhs, rhs, false),
-            "nge" => ("nle", rhs, lhs, false),
-            _ => return None,
-        };
-        if matches!(op, "eq" | "lg" | "o" | "u" | "nlg" | "neq") && rhs < lhs {
-            std::mem::swap(&mut lhs, &mut rhs);
-        }
-        Some((CompareKey { op, ty, lhs, rhs }, negated))
-    }
-
-    fn cmp_operand(
-        &self,
-        inst: &Inst,
-        op: &Operand,
-        idx: usize,
-        f: &Valu,
-        is_64: bool,
-    ) -> Option<CmpOperand> {
-        let dwords = match *op {
-            Operand::Scalar { code: NULL, dwords } => vec![Term::Const(0); usize::from(dwords)],
-            Operand::Scalar { code, dwords } => (0..dwords)
-                .map(|k| Some(self.origin(inst.read(Reg::S(code + k))?)))
-                .collect::<Option<Vec<_>>>()?,
-            Operand::Vector { reg, dwords } => (0..dwords)
-                .map(|k| Some(self.unconditional_vorigin(inst.read(Reg::V(reg + k))?)))
-                .collect::<Option<Vec<_>>>()?,
-            Operand::Const(c) if !is_64 => vec![Term::Const(inline(c)?)],
-            Operand::Const(c @ 128..=208) => {
-                let lo = inline(c)?;
-                vec![Term::Const(lo), Term::Const(((lo as i32) >> 31) as u32)]
-            }
-            Operand::Literal(x) if !is_64 => vec![Term::Const(x)],
-            _ => return None,
-        };
-        Some(CmpOperand {
-            abs: (f.abs >> idx) & 1 != 0,
-            neg: (f.neg >> idx) & 1 != 0,
-            hi: (f.opsel >> idx) & 1 != 0,
-            dwords,
-        })
-    }
-
-    /// Follows only unguarded plain `v_mov_b32` copies from `v`.
-    fn unconditional_vorigin(&self, mut v: Value) -> Term {
-        for _ in 0..MAX_JOINS * 2 {
-            let Some(site) = self.defs[v.0 as usize] else {
-                break;
-            };
-            if self
-                .lanes
-                .and_then(|l| l.guards.get(site.0).and_then(|g| g.get(site.1)))
-                .is_some_and(Option::is_some)
-            {
-                break;
-            }
-            let inst = self.inst(site);
-            let Fields::Valu(f) = &inst.fields else {
-                break;
-            };
-            if inst.name() != "v_mov_b32"
-                || f.abs != 0
-                || f.neg != 0
-                || f.clamp
-                || f.omod != 0
-                || f.sdwa.is_some()
-                || f.dpp.is_some()
-            {
-                break;
-            }
-            let Some(next) = f.src.first().and_then(|s| self.raw(inst, s)) else {
-                break;
-            };
-            match next {
-                Term::Value(u) if u != v => v = u,
-                other => return other,
-            }
-        }
-        Term::Value(v)
     }
 
     /// One copy of [`Self::vorigin`]: what the `v_mov_b32` writing `v`
@@ -1427,7 +1508,7 @@ impl<'a> Tracer<'a> {
         };
         let mut skips = known.clone();
         skips.extend([(lanes.reach[site.0], true), (guard, false)]);
-        if self.lanes_meet(&skips) {
+        if meet(lanes, &skips) {
             return Err("a per-lane descriptor written where some lanes may keep the old one");
         }
         Ok(())
@@ -1690,7 +1771,7 @@ impl<'a> Tracer<'a> {
             {
                 known.push((when, taken == block));
             }
-            let arg = if self.lanes_meet(known) {
+            let arg = if meet(lanes, known) {
                 let edge: Vec<Term> = words
                     .iter()
                     .map(|w| match phi_of(w) {
@@ -1791,7 +1872,7 @@ impl<'a> Tracer<'a> {
             return Err(SELECT);
         }
         let reach = (lanes.reach[b], true);
-        let meet = |conditions: &[(Bool, bool)]| lanes.bools.meet(conditions);
+        let meet = |conditions: &[(Bool, bool)]| self::meet(lanes, &conditions.to_vec());
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
         for (i, inst) in block.insts[..access].iter().enumerate() {
@@ -1975,7 +2056,7 @@ impl Tracer<'_> {
 }
 
 /// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
+pub(crate) fn lane_of(op: Operand) -> Option<u32> {
     match op {
         Operand::Const(c) => inline(c),
         Operand::Literal(x) => Some(x),
@@ -1991,6 +2072,12 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    // A mask of S0 bits from bit S1, as the upscaler's compiler makes an
+    // immediate sampler's word.
+    if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
+        let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
+        return Some(Moved::Const(((1u32 << w) - 1) << at));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2003,6 +2090,11 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
+        // shortcut: a literal below 2^31, whose high dword is 0 whether the
+        // hardware extends it with zeros or with its sign.
+        ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => {
+            Some(Moved::Const(if k == 0 { x } else { 0 }))
+        }
         // 64-bit inline integers are sign-extended.
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
@@ -2033,91 +2125,6 @@ pub(crate) fn inline(code: u8) -> Option<u32> {
         248 => Some(0x3E22_F983),
         _ => None,
     }
-}
-
-/// Assigns each BDD atom reachable from `all` a rank consistent with the
-/// BDD's variable order (`rank[parent] < rank[child]` for every node edge).
-fn bdd_ranks(bools: &Bools, all: &[(Bool, bool)]) -> HashMap<Atom, usize> {
-    let mut visited = Vec::new();
-    let mut postorder = Vec::new();
-    let mut stack: Vec<(Bool, bool)> = all.iter().map(|&(b, _)| (b, false)).collect();
-    while let Some((b, done)) = stack.pop() {
-        let Some((atom, lo, hi)) = bools.node(b) else {
-            continue;
-        };
-        if done {
-            if !postorder.contains(&atom) {
-                postorder.push(atom);
-            }
-            continue;
-        }
-        if visited.contains(&b) {
-            continue;
-        }
-        visited.push(b);
-        stack.push((b, true));
-        stack.push((hi, false));
-        stack.push((lo, false));
-    }
-    postorder
-        .into_iter()
-        .rev()
-        .enumerate()
-        .map(|(i, a)| (a, i))
-        .collect()
-}
-
-/// Satisfiability of `all` under `equiv` (`atom -> (group_id, negated)`).
-/// Returns `true` conservatively if `budget` runs out.
-fn meet_equiv(
-    bools: &Bools,
-    mut all: Vec<(Bool, bool)>,
-    rank: &HashMap<Atom, usize>,
-    equiv: &HashMap<Atom, (usize, bool)>,
-    assigned: &mut [Option<bool>],
-    budget: &mut usize,
-) -> bool {
-    let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
-    if all.iter().any(fails) {
-        return false;
-    }
-    all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
-    if all.is_empty() || *budget == 0 {
-        return true;
-    }
-    *budget -= 1;
-    let atom = all
-        .iter()
-        .filter_map(|&(b, _)| bools.node(b).map(|(a, _, _)| a))
-        .min_by_key(|a| rank[a])
-        .expect("not empty");
-    let step = |val: bool, assigned: &mut [Option<bool>], budget: &mut usize| {
-        let next = all
-            .iter()
-            .map(|&(b, holds)| match bools.node(b) {
-                Some((top, lo, hi)) if top == atom => (if val { hi } else { lo }, holds),
-                _ => (b, holds),
-            })
-            .collect();
-        meet_equiv(bools, next, rank, equiv, assigned, budget)
-    };
-    if let Some(&(group, neg)) = equiv.get(&atom) {
-        if let Some(gval) = assigned[group] {
-            return step(gval ^ neg, assigned, budget);
-        }
-        for gval in [false, true] {
-            assigned[group] = Some(gval);
-            let ok = step(gval ^ neg, assigned, budget);
-            assigned[group] = None;
-            if ok {
-                return true;
-            }
-        }
-        return false;
-    }
-    [false, true]
-        .into_iter()
-        .any(|val| step(val, assigned, budget))
 }
 
 #[cfg(test)]
@@ -2361,6 +2368,75 @@ pub(crate) mod tests {
         assert_eq!(r.scalar, [((0, 2), at(0, 0)), ((0, 3), at(0, 0x10))]);
     }
 
+    /// The FidelityFX upscaler's byte accesses make a loaded buffer
+    /// descriptor raw first (stride cleared, records times stride, bounds
+    /// in bytes): the access reads the loaded descriptor. Any other change
+    /// still fails.
+    #[test]
+    fn a_descriptor_made_raw_is_the_loaded_one() {
+        let words = |mask: u32| -> Vec<u8> {
+            [
+                0xBE88_0304, // s_mov_b32 s8, s4
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF408_0204,
+                0xFA00_0160, // s_load_dwordx4 s[8:11], s[8:9], 0x160
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x938C_FF09,
+                0x000E_0010, // s_bfe_u32 s12, s9, 0x000e0010
+                0x848C_810C, // s_max_u32 s12, s12, 1
+                0x8709_FF09,
+                mask, // s_and_b32 s9, s9, mask
+                0x870B_FF0B,
+                0xCFFF_FFFF, // s_and_b32 s11, s11, 0xcfffffff
+                0x930A_0C0A, // s_mul_i32 s10, s10, s12
+                0x880B_FF0B,
+                0x3000_0000, // s_or_b32 s11, s11, 0x30000000
+                0xE078_1000,
+                0x8002_0007, // buffer_store_dwordx4 v[0:3], v7, s[8:11], 0 offen
+                S_ENDPGM,
+            ]
+            .iter()
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect()
+        };
+        let run = |mask| {
+            let p = crate::ir::build(&words(mask), false, 256).unwrap();
+            track(&p, &[param(Table, 4, 1)], HwStage::Cs, lanes(&p).as_ref())
+        };
+        assert!(run(0xC000_FFFF).is_ok());
+        assert_eq!(
+            run(0xC000_FFFE).unwrap_err(),
+            ShaderError::Unsupported {
+                offset: 0x3c,
+                what: "a descriptor changed after loading"
+            }
+        );
+    }
+
+    /// Immediate sampler words the upscaler's compiler makes with a bit
+    /// mask and a 64-bit move of a literal.
+    #[test]
+    fn sampler_words_from_bit_masks_and_wide_literals_are_constants() {
+        let code: Vec<u8> = [
+            0xB010_3092, // s_movk_i32 s16, 0x3092
+            0x9211_8C8C, // s_bfm_b32 s17, 12, 12
+            0xBE92_04FF,
+            0x1850_0000, // s_mov_b64 s[18:19], 0x18500000
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 4, 1)];
+        let t = Tracer::new(&p, &layout, HwStage::Cs, None).unwrap();
+        let block = &p.blocks[0];
+        let value = |n: usize, k: usize| t.origin(block.insts[n].writes[k].1);
+        assert_eq!(value(1, 0), Term::Const(0x00FF_F000));
+        assert_eq!(value(2, 0), Term::Const(0x1850_0000));
+        assert_eq!(value(2, 1), Term::Const(0));
+    }
+
     #[test]
     fn a_selection_that_mixes_two_descriptors_fails() {
         // The high half picked from the first load whatever SCC is: when
@@ -2391,6 +2467,60 @@ pub(crate) mod tests {
                 what: "a descriptor changed after loading"
             }
         );
+    }
+
+    /// A compute program whose root parameters do not fit its 16 user
+    /// SGPRs loads them through the pointer in user data 0-1: the loads are
+    /// user data (dword 16 at 0x40), their values the parameters'.
+    #[test]
+    fn root_parameters_past_the_user_sgprs_load_from_the_pointer() {
+        let r = track_words(
+            &[
+                0xBE82_0300, // s_mov_b32 s2, s0
+                0x8703_FF01,
+                0x0000_00FF, // s_and_b32 s3, s1, 0xff
+                0xF404_0101,
+                0xFA00_0008, // s_load_dwordx2 s[4:5], s[2:3], 0x8 (user data 18)
+                0xBE86_03C1, // s_mov_b32 s6, -1
+                0xBE87_03FF,
+                0x1101_4FAC, // s_mov_b32 s7, 0x11014fac
+                0xF420_0202,
+                0xFA00_0000, // s_buffer_load_dword s8, s[4:7], null
+                S_ENDPGM,
+            ],
+            &[param(Constants, 16, 2), param(Descriptor, 18, 2)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar[0].1, at(USER_DATA, 0x48));
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: at(1, 0),
+                bits: 0,
+                words: [u32::MAX, 0x1101_4FAC]
+            }
+        );
+        let mut params: Vec<_> = r.params.iter().map(|p| (p.1, p.2)).collect();
+        params.sort_unstable();
+        assert_eq!(params, [(1, 0), (1, 1)]);
+    }
+
+    /// Pointers the program loads or takes from root constants address
+    /// title memory; an SGPR no root parameter fills stays refused.
+    #[test]
+    fn computed_addresses_are_title_memory() {
+        let r = track_words(
+            &[
+                0xF404_0105,
+                0xFA00_0000, // s_load_dwordx2 s[4:5], s[10:11], null (constants)
+                0xF400_0182,
+                0xFA00_0008, // s_load_dword s6, s[4:5], 0x8 (the loaded pointer)
+                S_ENDPGM,
+            ],
+            &[param(Constants, 10, 2)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar, [((0, 0), at(MEMORY, 0)), ((0, 1), at(MEMORY, 0))]);
     }
 
     #[test]
@@ -3442,122 +3572,5 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
-    }
-
-    #[test]
-    fn joined_descriptor_redundant_partial_write() {
-        // After the if/else join of WATERFALL_JOINED_WAVE32, re-writing v4
-        // with s24 under the same lane < 16 predicate leaves every lane's
-        // descriptor unchanged.
-        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
-        let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
-        words.splice(
-            at..at,
-            [
-                0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0 (lane < 16)
-                0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
-                0x7E08_0218, // v_mov_b32 v4, s24 (same word the then arm wrote)
-                0xBEFE_0312, // s_mov_b32 exec_lo, s18
-            ],
-        );
-        let r = waterfall(&words, false).unwrap();
-        let image = r
-            .descriptors
-            .iter()
-            .find(|d| d.role == Role::Resource && matches!(d.source, Source::LanePhi { .. }))
-            .unwrap();
-        let offsets: Vec<u32> = image
-            .source
-            .leaves()
-            .into_iter()
-            .map(|s| table_offset(&r, s))
-            .collect();
-        assert_eq!(offsets, vec![0, 0x20]);
-    }
-
-    #[test]
-    fn joined_descriptor_redundant_partial_write_negated_compare() {
-        // Same as above, targeting the else arm (lane >= 16) via the negated
-        // integer compare `v_cmp_le_u32 16, v0` and writing s32 to v4.
-        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
-        let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
-        words.splice(
-            at..at,
-            [
-                0x7D86_0090, // v_cmp_le_u32 vcc_lo, 16, v0 (lane >= 16)
-                0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
-                0x7E08_0220, // v_mov_b32 v4, s32 (same word the else arm wrote)
-                0xBEFE_0312, // s_mov_b32 exec_lo, s18
-            ],
-        );
-        let r = waterfall(&words, false).unwrap();
-        let image = r
-            .descriptors
-            .iter()
-            .find(|d| d.role == Role::Resource && matches!(d.source, Source::LanePhi { .. }))
-            .unwrap();
-        let offsets: Vec<u32> = image
-            .source
-            .leaves()
-            .into_iter()
-            .map(|s| table_offset(&r, s))
-            .collect();
-        assert_eq!(offsets, vec![0, 0x20]);
-    }
-
-    #[test]
-    fn joined_descriptor_non_redundant_partial_write_fails() {
-        // Writing the else arm's word (s32) under the then arm's mask
-        // (lane < 16) changes active lanes' v4 and must still be refused.
-        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
-        let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
-        words.splice(
-            at..at,
-            [
-                0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0 (lane < 16)
-                0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
-                0x7E08_0220, // v_mov_b32 v4, s32 (wrong arm's word)
-                0xBEFE_0312, // s_mov_b32 exec_lo, s18
-            ],
-        );
-        let err = waterfall(&words, false).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ShaderError::Unsupported {
-                    what: "a per-lane descriptor written where some lanes may keep the old one",
-                    ..
-                }
-            ),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn joined_descriptor_wider_mask_partial_write_fails() {
-        // Writing s24 under lane < 24 overwrites lanes 16..24 (which held s32)
-        // and must still be refused.
-        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
-        let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
-        words.splice(
-            at..at,
-            [
-                0x7D88_0098, // v_cmp_gt_u32 vcc_lo, 24, v0 (lane < 24)
-                0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
-                0x7E08_0218, // v_mov_b32 v4, s24
-                0xBEFE_0312, // s_mov_b32 exec_lo, s18
-            ],
-        );
-        let err = waterfall(&words, false).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ShaderError::Unsupported {
-                    what: "a per-lane descriptor written where some lanes may keep the old one",
-                    ..
-                }
-            ),
-            "{err:?}"
-        );
     }
 }
