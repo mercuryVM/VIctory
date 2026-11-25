@@ -135,6 +135,7 @@ fn lower_cs(words: &[u32]) -> Result<HostShader, ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        linked_cols: None,
     })?;
     let shader = HostShader {
         stage: HwStage::Cs,
