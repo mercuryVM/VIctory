@@ -618,6 +618,7 @@ pub fn emit(
 
 /// [`emit`]; with `link`, a mesh program declares the outputs and a pixel
 /// program the inputs [`link_elements`] keeps.
+#[allow(clippy::too_many_arguments)]
 fn emit_linked(
     c: &Container,
     native: &NativeProgram,
