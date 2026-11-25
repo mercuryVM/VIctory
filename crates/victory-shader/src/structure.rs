@@ -294,6 +294,82 @@ impl Bools {
         }
     }
 
+    /// Whether two lanes that both satisfy every Bool of `within`, and agree
+    /// on every atom `varies` does not name, can differ on `b`: lanes share
+    /// such atoms (SCC values, compares of data that is the same in every
+    /// lane), each picks the others for itself. Yes when the search grows
+    /// too large to finish.
+    pub fn varies(&self, b: Bool, within: &[Bool], varies: &dyn Fn(Atom) -> bool) -> bool {
+        self.varies_within(b, within, varies, MAX_MEET)
+    }
+
+    /// [`Bools::varies`] giving up (yes) after `budget` case splits. No
+    /// atom of `b` that varies: no.
+    pub fn varies_within(
+        &self,
+        b: Bool,
+        within: &[Bool],
+        varies: &dyn Fn(Atom) -> bool,
+        mut budget: usize,
+    ) -> bool {
+        if !self.vars(b).into_iter().any(|v| varies(self.atoms[v as usize])) {
+            return false;
+        }
+        let lane = |holds: bool| {
+            within
+                .iter()
+                .map(|&w| (w, true))
+                .chain([(b, holds)])
+                .collect::<Vec<_>>()
+        };
+        self.differ_in(lane(true), lane(false), varies, &mut budget)
+    }
+
+    fn differ_in(
+        &self,
+        mut a: Vec<(Bool, bool)>,
+        mut b: Vec<(Bool, bool)>,
+        varies: &dyn Fn(Atom) -> bool,
+        budget: &mut usize,
+    ) -> bool {
+        let fails = |&(x, holds): &(Bool, bool)| x == if holds { Bool::FALSE } else { Bool::TRUE };
+        if a.iter().any(fails) || b.iter().any(fails) {
+            return false;
+        }
+        a.retain(|&(x, _)| x != Bool::FALSE && x != Bool::TRUE);
+        b.retain(|&(x, _)| x != Bool::FALSE && x != Bool::TRUE);
+        if a.is_empty() && b.is_empty() || *budget == 0 {
+            return true;
+        }
+        *budget -= 1;
+        let top = |x: Bool| self.nodes[x.0 as usize].0;
+        let v = a
+            .iter()
+            .chain(&b)
+            .map(|&(x, _)| top(x))
+            .min()
+            .expect("not empty");
+        let set = |all: &[(Bool, bool)], value: bool| -> Vec<(Bool, bool)> {
+            all.iter()
+                .map(|&(x, holds)| {
+                    let (lo, hi) = self.split(x, v);
+                    (if value { hi } else { lo }, holds)
+                })
+                .collect()
+        };
+        if varies(self.atoms[v as usize]) {
+            [false, true].into_iter().any(|va| {
+                [false, true]
+                    .into_iter()
+                    .any(|vb| self.differ_in(set(&a, va), set(&b, vb), varies, budget))
+            })
+        } else {
+            [false, true]
+                .into_iter()
+                .any(|value| self.differ_in(set(&a, value), set(&b, value), varies, budget))
+        }
+    }
+
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
@@ -374,6 +450,8 @@ pub struct Structured {
     pub bools: Bools,
     /// Per block.
     pub exits: Vec<LaneExit>,
+    /// Joins with an incoming edge that only part of a wave can take.
+    pub(crate) divergent_joins: Vec<bool>,
     /// Per block and instruction: the condition, beyond reaching it, under
     /// which a lane runs a vector instruction; `None` when reaching it is
     /// enough (lanes outside EXEC then never get there, so a VGPR write
@@ -398,6 +476,21 @@ pub struct Structured {
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
     pub discards: HashMap<(usize, usize), Bool>,
+    /// Per block and instruction: the lane's EXEC bit at each vector
+    /// instruction, whatever path the lane took (`None` for scalar ones).
+    /// What a program run as the console runs it, every lane through every
+    /// block, guards its vector instructions with ([`structure_console`]).
+    pub execs: Vec<Vec<Option<Bool>>>,
+    /// The lane's bit of values read as masks that derive from neither
+    /// EXEC nor a VALU result (constants, uniform selects, opaque ones), by
+    /// low dword. What a mask join takes on an edge such a value arrives by:
+    /// a loop's exit mask starts as a constant 0 before lanes are added.
+    pub others: HashMap<Value, Bool>,
+    /// The high dword read with each low dword of a wave64 mask in
+    /// [`Self::masks`] or [`Self::others`], where the two are different
+    /// values: the halves of a mask held as a number need not come from
+    /// one instruction.
+    pub pairs: HashMap<Value, Value>,
 }
 
 impl Structured {
@@ -412,7 +505,7 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true)
+    structure_as(program, true, false)
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -420,16 +513,33 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false)
+    structure_as(program, false, false)
 }
 
-fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
-    let mut l = Lanes::new(program)?;
+/// The same for a program run as the console runs it: every lane of the
+/// console wave through every block, the branches taken wave-wide. Masks
+/// joined at a block are never resolved from what the lanes arriving there
+/// know, since lanes outside EXEC arrive too: each join that differs
+/// between edges is a phi ([`Atom::Phi`]). Guard vector instructions with
+/// [`Structured::execs`] and ignore [`Structured::exits`]' conditions.
+pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, true, true)
+}
+
+fn structure_as(program: &Program, helpers: bool, console: bool) -> Result<Structured, ShaderError> {
+    let mut l = Lanes::new(program, console)?;
     if !helpers {
         l.kills.clear();
     }
+    run(l)
+}
+
+fn run(mut l: Lanes) -> Result<Structured, ShaderError> {
     loop {
         let execs = l.masks_in_order();
+        while let Some(key) = l.console_pending.pop() {
+            l.mask(key);
+        }
         let cond = l.paths()?;
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
@@ -446,6 +556,9 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    /// See [`structure_console`].
+    console: bool,
+    console_pending: Vec<Key>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -502,7 +615,7 @@ struct SopMasks {
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
-    fn new(p: &'a Program) -> Result<Self, ShaderError> {
+    fn new(p: &'a Program, console: bool) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
         let order = crate::ir::reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
@@ -527,6 +640,8 @@ impl<'a> Lanes<'a> {
         }
         let mut l = Lanes {
             p,
+            console,
+            console_pending: Vec::new(),
             order,
             index,
             incoming,
@@ -748,6 +863,25 @@ impl<'a> Lanes<'a> {
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
         let blocks = &self.p.blocks;
+        // Test the incoming edges before the loop-header path calculation
+        // forgets the atoms defined in the loop. A scalar phi on a divergent
+        // back edge must carry one value for the wave's next iteration.
+        let divergent_joins = blocks
+            .iter()
+            .enumerate()
+            .map(|(n, block)| {
+                !self.console
+                    && block.phis.iter().any(|phi| !matches!(phi.reg, Reg::V(_)))
+                    && (0..self.incoming[n].len()).any(|i| {
+                        let (q, taken) = self.incoming[n][i];
+                        let edge = self.edge(cond[q], q, taken);
+                        self.b
+                            .support(edge)
+                            .iter()
+                            .any(|a| !matches!(a, Atom::Uniform(_)))
+                    })
+            })
+            .collect();
         let b = &mut self.b;
         let guards = blocks
             .iter()
@@ -804,7 +938,6 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
             restored: self.restored.into_iter().collect(),
             discards: self
@@ -814,7 +947,18 @@ impl<'a> Lanes<'a> {
                 .collect(),
             bools: self.b,
             exits,
+            divergent_joins,
             guards,
+            execs: execs.to_vec(),
+            others: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            pairs: self
+                .masks
+                .keys()
+                .chain(self.other.keys())
+                .filter(|(lo, hi)| lo != hi)
+                .copied()
+                .collect(),
+            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             reach: cond.to_vec(),
         })
     }
@@ -932,7 +1076,7 @@ impl<'a> Lanes<'a> {
         {
             return Some((m, derived));
         }
-        if !self.unresolved.contains(&id) {
+        if !self.console && !self.unresolved.contains(&id) {
             for value in [true, false] {
                 let b = &mut self.b;
                 let holds = forward.iter().all(|&(e, m)| {
@@ -950,6 +1094,9 @@ impl<'a> Lanes<'a> {
                     return Some((m, derived));
                 }
             }
+        }
+        if self.console {
+            self.console_pending.extend(args);
         }
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))

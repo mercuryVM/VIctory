@@ -613,6 +613,12 @@ mod tests {
     }
 }
 
+/// Bytes of a list's fold buffer per indirect execution: the record count,
+/// then up to two records of a root constant and three group counts.
+pub(crate) const FOLD_REGION: u32 = 64;
+/// Fold regions per list (folded indirect dispatches between resets).
+const FOLD_REGIONS: u32 = 1024;
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -646,6 +652,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Where the argument clamp writes the records of folded dispatches
+    /// (`crate::indirect`), [`FOLD_REGION`] bytes per execution.
+    fold: OnceLock<Option<ID3D12Resource>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -840,6 +849,8 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Fold regions taken since the reset ([`HostList::fold_region`]).
+    fold_regions: u32,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
@@ -918,6 +929,47 @@ impl Host {
         })
     }
 
+    /// The wave sizes the host runs (D3D12 options 1), which translated
+    /// compute shaders that declare the console's wave size must fit;
+    /// logged once. Unknown (the query fails): any.
+    pub(crate) fn target(&self) -> victory_shader::emit::Target {
+        static TARGET: OnceLock<victory_shader::emit::Target> = OnceLock::new();
+        *TARGET.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes the structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let target = if ok && options.WaveOps.as_bool() && options.WaveLaneCountMin > 0 {
+                victory_shader::emit::Target {
+                    lanes_min: options.WaveLaneCountMin,
+                    lanes_max: options.WaveLaneCountMax,
+                }
+            } else {
+                victory_shader::emit::Target::ANY
+            };
+            tracing::info!(
+                lanes_min = target.lanes_min,
+                lanes_max = target.lanes_max,
+                "host wave sizes"
+            );
+            if !target.runs(64) {
+                tracing::warn!(
+                    "the host has no 64-lane waves: console wave64 compute programs that need \
+                     their whole wave run as two 32-lane waves where there is a form for \
+                     them; the rest do not translate, and their dispatches are dropped"
+                );
+            }
+            target
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -955,6 +1007,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
+                fold: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1933,7 +1986,8 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                // The budget, then the log of reduced records (`crate::indirect`).
+                let (b, d) = host()?.shared_buffer(1024)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -1941,13 +1995,37 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+            // SAFETY: the list's own mapped words, read (what its last run
+            // logged) and zeroed before it runs.
+            deferred.copies.push(Step::Host(Box::new(move || unsafe {
+                let words = std::slice::from_raw_parts(at as *const u32, 256);
+                let read: Vec<u32> = words.iter().map(|w| std::ptr::read_volatile(w)).collect();
+                crate::indirect::take_log(&read);
+                (at as *mut u32).write_volatile(0);
+                (at as *mut u32).add(1).write_volatile(0);
+            })));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// A region of the list's fold buffer for one indirect execution until
+    /// the list is reset: the buffer, the region's host address and its
+    /// offset; none when the list has used them all.
+    pub(crate) fn fold_region(&self) -> Option<(ID3D12Resource, u64, u64)> {
+        let buffer = self
+            .fold
+            .get_or_init(|| Some(host()?.shared_buffer(u64::from(FOLD_REGION * FOLD_REGIONS))?.0))
+            .as_ref()?;
+        let mut deferred = self.deferred();
+        if deferred.fold_regions >= FOLD_REGIONS {
+            return None;
+        }
+        let offset = u64::from(deferred.fold_regions * FOLD_REGION);
+        deferred.fold_regions += 1;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + offset;
+        Some((buffer.clone(), gpu, offset))
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -2631,6 +2709,7 @@ impl Meter {
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
+        let slot_use = crate::descriptor::host::take_slot_use(frames);
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -2644,6 +2723,13 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
+            if !slot_use.is_empty() {
+                tracing::info!("title view slots draws read per frame, by range:{slot_use}");
+            }
+            let pages = crate::descriptor::host::pool_use();
+            if !pages.is_empty() {
+                tracing::info!("{pages}");
+            }
             if let Some(host) = host() {
                 host.log_video_memory();
             }
@@ -2983,6 +3069,7 @@ pub(crate) fn retire(resource: ID3D12Resource) {
 
 /// After a submission has run, with none running: the retired resources go.
 pub(crate) fn release_retired() {
+    crate::descriptor::host::released();
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
     drop(retired);
 }

@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, Target, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -64,7 +64,17 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        let build = key(victory_shader::SOURCE_HASH, ENCODING, limit);
+        if !victory_shader::emit::wave64_as_32() {
+            return build;
+        }
+        tracing::warn!(
+            "VICTORY_DIAG_WAVE64_AS_32: wave64 programs no form runs here are translated as wave32 (not the console's results)"
+        );
+        let mut h = blake3::Hasher::new();
+        h.update(&build);
+        h.update(b"wave64-as-32");
+        *h.finalize().as_bytes()
     })
 }
 
@@ -79,22 +89,39 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one, and whether it came from there: the program
-/// [`victory_shader::emit::translate`] picks, or with `stage` the program of
-/// that hardware stage (the ES or GS half of a geometry pipeline).
-pub fn host_shader(container: &[u8], stage: Option<HwStage>) -> (Result<HostShader, String>, bool) {
+/// The translation of a console shader container for a host that runs
+/// `target`'s wave sizes, from the cache when there is one, and whether it
+/// came from there: the program [`victory_shader::emit::translate`] picks,
+/// or with `stage` the program of that hardware stage (the ES or GS half of
+/// a geometry pipeline).
+pub fn host_shader(
+    container: &[u8],
+    stage: Option<HwStage>,
+    target: Target,
+) -> (Result<HostShader, String>, bool) {
     let translate = |c: &[u8]| {
         match stage {
-            Some(stage) => victory_shader::emit::translate_stage(c, stage),
-            None => victory_shader::emit::translate(c),
+            Some(stage) => victory_shader::emit::translate_stage_for(c, stage, target),
+            None => victory_shader::emit::translate_for(c, target),
         }
         .map_err(|e| e.to_string())
     };
     match CACHE.get() {
-        Some(cache) => cached(cache, &build_for(build(), stage), container, translate),
+        Some(cache) => {
+            let key = target_key(&build_for(build(), stage), target);
+            cached(cache, &key, container, translate)
+        }
         None => (translate(container), false),
     }
+}
+
+/// The part of an entry's key before the container: the build, and the
+/// host's wave sizes (a translation for one host's waves is not another's).
+fn target_key(build: &[u8; 32], target: Target) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(&target.key());
+    *h.finalize().as_bytes()
 }
 
 /// The build key of a translation: the build's own for the default
@@ -237,6 +264,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         view_addresses,
         heap,
         heap_writes,
+        group_waves,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -287,6 +315,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap) << 3
             | u32::from(*heap_writes) << 4,
     );
+    word(&mut out, *group_waves);
     out
 }
 
@@ -348,6 +377,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let memory = r.word()?;
+    let group_waves = r.word()?;
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
         dxil,
@@ -362,6 +392,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         view_addresses: memory & 4 != 0,
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
+        group_waves,
     }))
 }
 
@@ -394,6 +425,7 @@ mod tests {
             view_addresses: true,
             heap: true,
             heap_writes: true,
+            group_waves: 4,
         }
     }
 
@@ -495,6 +527,22 @@ mod tests {
             assert_eq!(root_code(root), code, "{root:?}");
             assert_eq!(root_type(code), root, "{code:#x}");
         }
+    }
+
+    #[test]
+    fn keys_tell_hosts_wave_sizes_apart() {
+        let build = [7u8; 32];
+        let nvidia = Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        };
+        let rdna = Target {
+            lanes_min: 32,
+            lanes_max: 64,
+        };
+        assert_eq!(target_key(&build, nvidia), target_key(&build, nvidia));
+        assert_ne!(target_key(&build, nvidia), target_key(&build, rdna));
+        assert_ne!(target_key(&build, nvidia), target_key(&[8; 32], nvidia));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

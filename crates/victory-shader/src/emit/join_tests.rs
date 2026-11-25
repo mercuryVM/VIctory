@@ -125,18 +125,30 @@ fn lower_cs(words: &[u32]) -> Result<HostShader, ShaderError> {
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
-    let lowered = lower::lower(&lower::Parts {
+    let parts = |st, console_cf| lower::Parts {
         native: &native,
         p: &p,
-        st: &st,
+        st,
         io: &io,
         res: &res,
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
+        console_cf,
+        per_lane_only: false,
         linked_cols: None,
-    })?;
+    };
+    // As `emit` lowers: a program the per-lane form refuses for the console
+    // flow (a named lane read in divergent code) runs as the console runs it.
+    let lowered = match lower::lower(&parts(&st, false)) {
+        Err(crate::ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
+            let console = structure::structure_console(&p)?;
+            lower::lower(&parts(&console, true))?
+        }
+        l => l?,
+    };
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -151,6 +163,7 @@ fn lower_cs(words: &[u32]) -> Result<HostShader, ShaderError> {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        group_waves: lowered.group_waves,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

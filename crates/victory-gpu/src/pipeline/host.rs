@@ -269,6 +269,9 @@ pub(crate) struct Stage {
     pub(crate) memory_dirty: Option<u32>,
     /// Our root parameter of the heap's view addresses (`crate::memory`).
     pub(crate) view_addresses: Option<u32>,
+    /// Our root parameter of a compute stage's group fold (one root
+    /// constant, `GROUP_FOLD_ROW`): 0 unless a dispatch runs folded.
+    pub(crate) fold: Option<u32>,
 }
 
 impl Stage {
@@ -421,7 +424,22 @@ impl HostPipeline {
                 memory: None,
                 memory_dirty: None,
                 view_addresses: None,
+                fold: None,
             };
+            if compute.is_some() {
+                stage.fold = Some(params.len() as u32);
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            ShaderRegister: 1,
+                            RegisterSpace: USER_DATA_SPACE,
+                            Num32BitValues: 1,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+            }
             let dwords = t.user_data_dwords();
             if dwords > 0 {
                 stage.user_data = Some((params.len() as u32, dwords));
@@ -824,7 +842,9 @@ fn linked(ms: &Arc<Shader>, ps: &Arc<Shader>) -> Option<(HostShader, HostShader)
             && a.root_cbvs == b.root_cbvs
             && a.root_srvs == b.root_srvs
     };
-    match victory_shader::emit::translate_linked(&ms.container, &ps.container, &p.dxil) {
+    // For the host's wave sizes, as the shaders were (`pipeline::translate`).
+    let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
+    match victory_shader::emit::translate_linked(&ms.container, &ps.container, &p.dxil, target) {
         Ok(None) => None,
         Ok(Some((lm, lp))) if same(&lm, m) && same(&lp, p) => {
             tracing::info!(shaders = ?[ms, ps], "mesh outputs past 32 KiB: linked to the pixel shader");

@@ -67,10 +67,22 @@ pub(crate) struct Shader {
     /// vertex shader in most pipelines and as an ES half in geometry ones.
     #[cfg(windows)]
     translated: [OnceLock<Option<Translated>>; 3],
+    /// By [`Program`]: whether a pipeline worker took on the translation
+    /// (see `make::translate_own`); the others leave pipelines that need it
+    /// and make other ones meanwhile.
+    #[cfg(windows)]
+    pub(crate) translating: [std::sync::atomic::AtomicBool; 3],
     /// Whether its native program runs in 64-lane console waves
     /// (diagnostics: `VICTORY_SKIP_WAVE64`).
     #[cfg(all(windows, feature = "diagnostics"))]
     wave64: OnceLock<bool>,
+    /// Its native program's thread-group size in threads (0: unknown).
+    #[cfg(windows)]
+    group: OnceLock<u32>,
+    /// Whether its native code intersects rays with a BVH
+    /// (`image_bvh*_intersect_ray`, [`Shader::ray_traces`]).
+    #[cfg(windows)]
+    ray_traces: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -101,9 +113,45 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: Default::default(),
+            #[cfg(windows)]
+            translating: Default::default(),
             #[cfg(all(windows, feature = "diagnostics"))]
             wave64: OnceLock::new(),
+            #[cfg(windows)]
+            group: OnceLock::new(),
+            ray_traces: OnceLock::new(),
         }
+    }
+}
+
+/// Whether native GFX10 `code` holds `image_bvh_intersect_ray` or
+/// `image_bvh64_intersect_ray` (code that does not decode: no).
+#[cfg(windows)]
+fn intersects_rays(code: &[u8]) -> bool {
+    victory_shader::gfx10::decode(code).is_ok_and(|insts| {
+        insts
+            .iter()
+            .any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh")))
+    })
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// Whether the container's native code intersects rays with a BVH
+    /// (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`): its
+    /// traversal loops, emulated node by node, cost far more per thread
+    /// than other code (see `crate::indirect`).
+    pub(crate) fn ray_traces(&self) -> bool {
+        *self.ray_traces.get_or_init(|| {
+            victory_shader::Container::parse(&self.container)
+                .ok()
+                .and_then(|c| {
+                    c.part(victory_shader::FourCC::DXIL)
+                        .map(|p| p.data.to_vec())
+                })
+                .and_then(|d| victory_shader::native::native_programs(&d).ok())
+                .is_some_and(|ps| ps.iter().any(|p| intersects_rays(&p.code)))
+        })
     }
 }
 
@@ -206,6 +254,11 @@ impl Shader {
             .as_ref()
     }
 
+    /// Whether the translation of `program` is done (made or refused).
+    pub(crate) fn has_translation(&self, program: Program) -> bool {
+        self.translated[program as usize].get().is_some()
+    }
+
     /// Whether the translation of `program` was tried and failed.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn failed(&self, program: Program) -> bool {
@@ -242,7 +295,10 @@ fn translate(
     container: &[u8],
     stage: Option<victory_shader::HwStage>,
 ) -> (Result<Translated, String>, bool) {
-    let (host, cached) = crate::shader_cache::host_shader(container, stage);
+    // Translated for the host's wave sizes (the console's wave64 programs
+    // run as two 32-lane waves where the host has no 64-lane ones).
+    let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
+    let (host, cached) = crate::shader_cache::host_shader(container, stage, target);
     (host.and_then(|host| with_resources(container, stage, host)), cached)
 }
 
@@ -270,6 +326,46 @@ fn with_resources(
         None => Vec::new(),
     };
     Ok(Translated { host, used })
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// Its native program's thread-group size in threads: `numthreads` of a
+    /// compute program, the lanes of a mesh program's group; 0 if neither.
+    fn group(&self) -> u32 {
+        *self.group.get_or_init(|| {
+            use victory_shader::native::StageIo;
+            victory_shader::Container::parse(&self.container)
+                .ok()
+                .and_then(|c| {
+                    c.part(victory_shader::FourCC::DXIL)
+                        .map(|p| p.data.to_vec())
+                })
+                .and_then(|d| victory_shader::native::native_programs(&d).ok())
+                .and_then(|ps| {
+                    ps.iter().find_map(|p| match &p.io {
+                        StageIo::Cs(cs) => Some(cs.threads.iter().product::<u32>()),
+                        StageIo::Ms(ms) => Some(ms.threads),
+                        _ => None,
+                    })
+                })
+                .unwrap_or(0)
+        })
+    }
+}
+
+/// The thread-group size in threads of the compute or mesh program of the
+/// pipeline `this` (0 if unknown), and that program's hash.
+#[cfg(windows)]
+pub(crate) fn group_of(this: This) -> (u32, String) {
+    if this.is_null() {
+        return (0, String::new());
+    }
+    pipeline(this)
+        .shaders
+        .iter()
+        .find(|s| matches!(s.stage, "compute" | "mesh"))
+        .map_or((0, String::new()), |s| (s.group(), s.hash.clone()))
 }
 
 #[repr(C)]
@@ -818,6 +914,22 @@ mod tests {
         );
         assert_eq!(super::parse_skip_stages("hull,pixel"), ["pixel"]);
         assert!(super::parse_skip_stages("").is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn ray_tracing_code_is_told_by_its_bvh_instruction() {
+        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        // image_bvh_intersect_ray v[20:23], v[2:12], s[12:15]; s_endpgm.
+        let bvh = words(&[0xF198_9F01, 20 << 8 | 3 << 16 | 2, 0xBF81_0000]);
+        // image_bvh64_intersect_ray, then the end.
+        let bvh64 = words(&[0xF19C_9F01, 20 << 8 | 3 << 16 | 2, 0xBF81_0000]);
+        // v_mov_b32 v1, v0; s_endpgm.
+        let plain = words(&[0x7E02_0300, 0xBF81_0000]);
+        assert!(super::intersects_rays(&bvh));
+        assert!(super::intersects_rays(&bvh64));
+        assert!(!super::intersects_rays(&plain));
+        assert!(!super::intersects_rays(&[1, 2, 3]));
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]

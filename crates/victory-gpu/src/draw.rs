@@ -407,7 +407,7 @@ impl State {
         };
         self.heap_of(table)
             .and_then(|heap| Some((heap.host()?, heap.index(table)?)))
-            .is_some_and(|(host, index)| index >= host.count())
+            .is_some_and(|(host, index)| !host.remapped() && index >= host.count())
     }
 
     /// The host addresses of the bound view heap's title-memory page table
@@ -677,6 +677,11 @@ impl State {
                     }
                 }
             }
+            // Not folded unless the dispatch says so.
+            if let Some(param) = stage.fold {
+                // SAFETY: an open list; the parameter is one root constant.
+                unsafe { l.SetComputeRoot32BitConstant(param, 0, 0) };
+            }
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
                     if kind == 1 && slot == victory_shader::emit::VIEW_STRIDES {
@@ -814,7 +819,7 @@ impl State {
         };
         let copy = std::sync::Arc::as_ptr(&shadow) as usize;
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
-            return Some((index, offset));
+            return Some((host.shader_index(index), offset));
         }
         let (run_heap, next, end) = self.root_run;
         if run_heap != key || next >= end {
@@ -830,7 +835,8 @@ impl State {
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
         host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
         self.root_slots.insert((key, copy, uav), index);
-        Some((index, offset))
+        // Shaders see it at its index in a capped heap's map.
+        Some((host.shader_index(index), offset))
     }
 
     /// Gives the host list the title's heaps if it has others.
@@ -941,6 +947,19 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // A shader emitted as one console wave per host group runs that
+        // many host groups per console group, along x.
+        let waves = group_waves(p);
+        let Some(x) = x.checked_mul(waves).filter(|&x| x <= 65535 || waves == 1) else {
+            once!(
+                pipeline = format_args!("{:#x}", self.pipeline),
+                "a dispatch of more host groups than D3D12 runs in a dimension dropped"
+            );
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            return;
+        };
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -951,8 +970,27 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        let row = victory_shader::emit::GROUP_FOLD_ROW;
+        match p.stages.first().and_then(|s| s.fold) {
+            // More groups than the host runs along x: in rows along z,
+            // then the rest (`GROUP_FOLD_ROW`).
+            Some(param) if x > row && y == 1 && z == 1 => {
+                let (rows, rest) = (x / row, x % row);
+                // SAFETY: an open list with everything set; the parameter
+                // is one root constant.
+                unsafe {
+                    list.list.SetComputeRoot32BitConstant(param, 1, 0);
+                    list.list.Dispatch(row, 1, rows);
+                    if rest != 0 {
+                        list.list.SetComputeRoot32BitConstant(param, rows * row + 1, 0);
+                        list.list.Dispatch(rest, 1, 1);
+                    }
+                    list.list.SetComputeRoot32BitConstant(param, 0, 0);
+                }
+            }
+            // SAFETY: an open list with everything set.
+            _ => unsafe { list.list.Dispatch(x, y, z) },
+        }
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1108,7 +1146,7 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            if !host.remapped() && index >= host.count() {
                 fresh.push(u.slot);
             }
         }
@@ -1620,8 +1658,40 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        // One uncounted dispatch of a compute program may run folded
+        // (`GROUP_FOLD_ROW`): the clamp writes its records to a region of
+        // the list's fold buffer, with the fold root constant.
+        let folded = (kind == DISPATCH && count.is_none() && max == 1)
+            .then(|| crate::pipeline::host_pipeline(self.pipeline as This))
+            .flatten()
+            .filter(|p| p.compute)
+            .and_then(|p| {
+                let param = p.stages.first()?.fold?;
+                let signature = fold_signature(&p.root, param)?;
+                Some((list.fold_region()?, signature))
+            });
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        let (threads, hash) = crate::pipeline::group_of(self.pipeline as This);
+        let tag = crate::indirect::tag(&hash);
+        // Ray tracing counts many times over (`crate::indirect`).
+        let weight = match crate::pipeline::host_pipeline(self.pipeline as This) {
+            Some(p)
+                if kind == DISPATCH
+                    && p.compute
+                    && p.stages.iter().any(|s| s.shader.ray_traces()) =>
+            {
+                crate::indirect::ray_weight()
+            }
+            _ => 1,
+        };
+        if !crate::indirect::bound(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            (kind, stride, max),
+            (threads, tag, weight),
+            folded.as_ref().map(|((buffer, gpu, _), _)| (buffer, *gpu)),
+        ) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -1636,13 +1706,19 @@ impl State {
             }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
+                // shortcut: a shader emitted as one console wave per host
+                // group needs the records' x multiplied on the GPU; until
+                // the clamp does that, its indirect dispatches are dropped.
+                Some(p) if p.compute && group_waves(p) == 1 => self.bind(list, p, true),
                 _ => false,
             },
             _ => false,
         };
         if !ran {
             crate::indirect::done(list, &args.buffer);
+            if let Some(((buffer, ..), _)) = &folded {
+                crate::indirect::done_fold(list, buffer);
+            }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1666,17 +1742,26 @@ impl State {
             )
         });
         // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
+        // copies the list keeps alive (refresh) or its own fold buffer, the
+        // signatures are cached.
         unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
+            match &folded {
+                Some(((buffer, _, offset), signature)) => {
+                    list.list.ExecuteIndirect(signature, 2, buffer, offset + 16, buffer, *offset)
+                }
+                None => list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &args.buffer,
+                    args.offset(arguments),
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                ),
+            }
         };
+        if let Some(((buffer, ..), _)) = &folded {
+            crate::indirect::done_fold(list, buffer);
+        }
         // A listed frame: what the records held (after the clamp).
         #[cfg(feature = "diagnostics")]
         if crate::capture::dump_on() {
@@ -1692,6 +1777,63 @@ impl State {
         }
         true
     }
+}
+
+/// The host command signature of folded dispatches for the root signature
+/// `root`, whose root parameter `param` is the fold constant: records of
+/// that constant and a dispatch, 16 bytes apart. Made once per root
+/// signature (kept alive here).
+fn fold_signature(root: &ID3D12RootSignature, param: u32) -> Option<ID3D12CommandSignature> {
+    static MADE: std::sync::Mutex<Vec<(ID3D12RootSignature, u32, ID3D12CommandSignature)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((.., s)) = made.iter().find(|(r, p, _)| r == root && *p == param) {
+        return Some(s.clone());
+    }
+    let arguments = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: 0,
+                    Num32BitValuesToSet: 1,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: 16,
+        NumArgumentDescs: 2,
+        pArgumentDescs: arguments.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: a description of two arguments for a live root signature.
+    let result = unsafe {
+        crate::host::host()?
+            .device
+            .CreateCommandSignature(&desc, root, &mut signature)
+    };
+    if let Err(e) = result {
+        once!(error = %e, param, "host command signature for folded dispatches refused");
+        return None;
+    }
+    let signature = signature?;
+    made.push((root.clone(), param, signature.clone()));
+    Some(signature)
+}
+
+/// Host thread groups per console thread group of a compute pipeline
+/// (`HostShader::group_waves`).
+fn group_waves(p: &HostPipeline) -> u32 {
+    p.stages
+        .first()
+        .map_or(1, |s| s.translated().host.group_waves.max(1))
 }
 
 /// The host command signature for one argument of `kind` with records

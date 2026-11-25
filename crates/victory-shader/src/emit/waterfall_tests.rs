@@ -20,6 +20,15 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 }
 
 fn build_with_handle_count(words: &[u32], buffers: bool, nonuniform_handles: u32) -> HostShader {
+    let lowered = lower_as(words, buffers, false).expect("lower");
+    // Accesses with each lane's own heap index, no wave operation.
+    assert_eq!(lowered.nonuniform_handles, nonuniform_handles);
+    assert!(!lowered.wave_ops);
+    host_shader(lowered)
+}
+
+/// The wave32 compute program of 32 threads [`build`] lowers.
+fn native(words: &[u32], buffers: bool) -> NativeProgram {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -43,7 +52,7 @@ fn build_with_handle_count(words: &[u32], buffers: bool, nonuniform_handles: u32
     } else {
         range(ResourceType::Srv, 0, 8, 0, 0)
     };
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 32,
@@ -58,26 +67,41 @@ fn build_with_handle_count(words: &[u32], buffers: bool, nonuniform_handles: u32
             threads: [32, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
+    }
+}
+
+/// [`build`]'s program lowered in the per-lane form, or with `console_cf`
+/// in the console flow (`lower::CONSOLE_FLOW`).
+fn lower_as(
+    words: &[u32],
+    buffers: bool,
+    console_cf: bool,
+) -> Result<lower::Lowered, crate::ShaderError> {
+    let native = native(words, buffers);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
+    let console = structure::structure_console(&p).expect("structure_console");
+    lower::lower(&lower::Parts {
         native: &native,
         p: &p,
-        st: &st,
+        st: if console_cf { &console } else { &st },
         io: &io,
         res: &res,
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf,
+        per_lane_only: false,
         linked_cols: None,
     })
-    .expect("lower");
-    assert_eq!(lowered.nonuniform_handles, nonuniform_handles);
-    assert!(!lowered.wave_ops);
+}
+
+/// The host shader of `lowered`, validated by `dxil.dll` when present.
+fn host_shader(lowered: lower::Lowered) -> HostShader {
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -92,6 +116,7 @@ fn build_with_handle_count(words: &[u32], buffers: bool, nonuniform_handles: u32
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        group_waves: lowered.group_waves,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -293,6 +318,90 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         assert!(!results.is_empty());
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
+        }
+    }
+}
+
+/// In the console flow every lane reaches a join by the edge the wave took,
+/// so the edge does not say which descriptor a lane holds. Lowered there,
+/// all 32 lanes sampled the second texture where lanes 0-15 hold the first
+/// (RTX 5070).
+/// The console flow refuses it by name, and `emit` keeps the per-lane form
+/// where that translates.
+#[test]
+fn the_console_flow_refuses_descriptors_joined_per_lane() {
+    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+    match lower_as(WATERFALL_JOINED_WAVE32, false, true) {
+        Err(crate::ShaderError::Unsupported { what, .. }) => {
+            assert_eq!(what, lower::LANE_PHI_IN_CONSOLE_FLOW);
+        }
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("lowered in the console flow"),
+    }
+}
+
+/// [`WATERFALL_JOINED_WAVE32`] with a named lane read (the sample's second
+/// coordinate comes from lane 5), which with the arms' branches asks for
+/// the console flow on every host.
+///
+/// [`WATERFALL_JOINED_WAVE32`]: crate::resource::tests::WATERFALL_JOINED_WAVE32
+fn joined_with_a_lane_read() -> Vec<u32> {
+    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+    const MOV: u32 = 0x7E06_0302; // v_mov_b32 v3, v2
+    let at = WATERFALL_JOINED_WAVE32
+        .iter()
+        .position(|&w| w == MOV)
+        .expect("the coordinate's copy");
+    let mut words = WATERFALL_JOINED_WAVE32[..at].to_vec();
+    words.extend([
+        0xD760_002C,
+        (128 + 5) << 9 | 0x100, // v_readlane_b32 s44, v0, 5
+        0x7E06_022C,            // v_mov_b32 v3, s44
+    ]);
+    words.extend(&WATERFALL_JOINED_WAVE32[at + 1..]);
+    words
+}
+
+/// A program that takes the console flow only for its lane reads, with a
+/// descriptor joined per lane: it asks for the console flow, the console
+/// flow refuses the join, and `emit` keeps the per-lane form.
+#[test]
+fn joined_descriptors_keep_the_per_lane_form_when_the_console_flow_is_asked_for() {
+    let words = joined_with_a_lane_read();
+    let why = |l: Result<lower::Lowered, crate::ShaderError>| match l {
+        Err(crate::ShaderError::Unsupported { what, .. }) => what,
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("lowered"),
+    };
+    assert_eq!(why(lower_as(&words, false, false)), lower::CONSOLE_FLOW);
+    assert_eq!(
+        why(lower_as(&words, false, true)),
+        lower::LANE_PHI_IN_CONSOLE_FLOW
+    );
+    let native = native(&words, false);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let container = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&container).expect("container");
+    for target in [
+        super::Target::ANY,
+        super::Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        },
+        super::Target {
+            lanes_min: 32,
+            lanes_max: 64,
+        },
+    ] {
+        let shader = super::emit(&c, &native, &p, &st, &io, &res, target).expect("emit");
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
         }
     }
 }

@@ -74,7 +74,8 @@ unsafe impl Send for SharedDevice {}
 // SAFETY: as above.
 unsafe impl Sync for SharedDevice {}
 
-fn create_device(warp: bool) -> Result<ID3D12Device, String> {
+/// A device on WARP, on `adapter`, or (neither) on DXGI's default adapter.
+fn create_device(warp: bool, adapter: Option<&IDXGIAdapter>) -> Result<ID3D12Device, String> {
     // SAFETY: plain D3D12/DXGI calls with valid out pointers.
     unsafe {
         let mut device: Option<ID3D12Device> = None;
@@ -83,6 +84,8 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
                 CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
             let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+        } else if let Some(adapter) = adapter {
+            D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
         }
@@ -132,6 +135,121 @@ fn default_adapter_is_warp() -> bool {
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
 static WARP_LOCK: Mutex<()> = Mutex::new(());
 
+/// Root signatures made with a group fold parameter, and its index.
+static FOLDS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether an adapter is hardware. A machine without a GPU (a CI runner)
+/// can list the Microsoft Basic Render Driver, which is WARP, as an
+/// ordinary adapter without the software flag: its ids, or its name, tell.
+fn hardware(d: &DXGI_ADAPTER_DESC1) -> bool {
+    let basic_render_driver = d.VendorId == 0x1414 && d.DeviceId == 0x8c
+        || description(&d.Description) == "Microsoft Basic Render Driver";
+    d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && !basic_render_driver
+}
+
+/// The hardware adapters that run waves of 32 or 64 lanes, in DXGI's
+/// order: each one's description. An integrated GPU with narrower waves
+/// (some Intel ones report 16-16) runs none of the console's programs
+/// that depend on the wave size: the translator refuses them for it by
+/// name, and what walks this list expects a pipeline. An adapter no SM 6.6
+/// device can be made on stays listed, for its user to skip.
+pub fn adapters() -> Result<Vec<String>, String> {
+    // SAFETY: plain DXGI calls.
+    let mut out = unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Ok(a) = factory.EnumAdapters1(i) {
+            let d = a.GetDesc1().map_err(err)?;
+            if hardware(&d) {
+                out.push(description(&d.Description));
+            }
+            i += 1;
+        }
+        out
+    };
+    out.retain(|name| {
+        Host::on(name).map_or(true, |host| {
+            let target = host.target();
+            target.runs(32) || target.runs(64)
+        })
+    });
+    Ok(out)
+}
+
+fn description(wide: &[u16]) -> String {
+    let n = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    String::from_utf16_lossy(&wide[..n])
+}
+
+/// Root signatures made, latest last, with the index of their view-stride
+/// table parameter if they have one (every one is listed: a new root
+/// signature may take a released one's address).
+static STRIDES: std::sync::Mutex<Vec<(usize, Option<u32>)>> = std::sync::Mutex::new(Vec::new());
+
+/// [`stride_table`] of no strides, made once per device (16 MiB each: one
+/// per draw ran the test process out of memory).
+#[cfg(test)]
+fn default_stride_table(device: &ID3D12Device) -> Result<ID3D12Resource, String> {
+    static MADE: std::sync::Mutex<Vec<(usize, ID3D12Resource)>> = std::sync::Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let key = device.as_raw() as usize;
+    if let Some((_, b)) = made.iter().find(|m| m.0 == key) {
+        return Ok(b.clone());
+    }
+    let b = stride_table(device, &[])?;
+    made.push((key, b.clone()));
+    Ok(b)
+}
+
+/// A view-stride table as the host gives one (`t`[`super::VIEW_STRIDES`]):
+/// `strides` from index 0, then the identity map entries shaders read
+/// heap indices through (`super::HEAP_MAP`).
+fn stride_table(device: &ID3D12Device, strides: &[u32]) -> Result<ID3D12Resource, String> {
+    let dwords = (super::HEAP_MAP + super::HEAP_VIEWS) as usize;
+    let mut data = vec![0u32; dwords];
+    data[..strides.len().min(super::HEAP_VIEWS as usize)]
+        .copy_from_slice(&strides[..strides.len().min(super::HEAP_VIEWS as usize)]);
+    for i in 0..super::HEAP_VIEWS {
+        data[(super::HEAP_MAP + i) as usize] = i;
+    }
+    // SAFETY: plain creation, mapping and filling of an upload buffer.
+    unsafe {
+        let mut b: Option<ID3D12Resource> = None;
+        device
+            .CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_UPLOAD,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: (dwords * 4) as u64,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut b,
+            )
+            .map_err(err)?;
+        let b = b.ok_or("no stride table")?;
+        let mut p = std::ptr::null_mut();
+        b.Map(0, None, Some(&mut p)).map_err(err)?;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), p.cast::<u32>(), dwords);
+        b.Unmap(0, None);
+        Ok(b)
+    }
+}
+
 impl Host {
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
         self.warp
@@ -146,7 +264,10 @@ impl Host {
         }
     }
 
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`, or
+    /// when the default adapter is WARP), or the first hardware adapter
+    /// whose description holds `VICTORY_ADAPTER` (ignoring case:
+    /// `nvidia`, `radeon`...).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp
             || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1")
@@ -155,7 +276,7 @@ impl Host {
             static WARP: OnceLock<Result<SharedDevice, String>> = OnceLock::new();
             let shared = WARP.get_or_init(|| {
                 let _guard = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                create_device(true).map(SharedDevice)
+                create_device(true, None).map(SharedDevice)
             });
             return shared
                 .as_ref()
@@ -165,10 +286,65 @@ impl Host {
                 })
                 .map_err(Clone::clone);
         }
+        if let Ok(name) = std::env::var("VICTORY_ADAPTER")
+            && !name.is_empty()
+        {
+            return Self::on(&name);
+        }
         Ok(Host {
-            device: create_device(false)?,
+            device: create_device(false, None)?,
             warp: false,
         })
+    }
+
+    /// The first hardware adapter whose description holds `name`,
+    /// ignoring case.
+    pub fn on(name: &str) -> Result<Self, String> {
+        let want = name.to_lowercase();
+        // SAFETY: plain DXGI calls.
+        let adapter = unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
+            let mut i = 0;
+            loop {
+                let a = factory
+                    .EnumAdapters1(i)
+                    .map_err(|_| format!("no adapter named {name:?}"))?;
+                let d = a.GetDesc1().map_err(err)?;
+                if hardware(&d) && description(&d.Description).to_lowercase().contains(&want) {
+                    break a;
+                }
+                i += 1;
+            }
+        };
+        let adapter: IDXGIAdapter = adapter.cast().map_err(err)?;
+        Ok(Host {
+            device: create_device(false, Some(&adapter))?,
+            warp: false,
+        })
+    }
+
+    /// The wave sizes the device runs ([`super::Target::ANY`] if it does
+    /// not say).
+    pub fn target(&self) -> super::Target {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes the structure of the given size.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+                .is_ok()
+        };
+        if ok && o.WaveOps.as_bool() && o.WaveLaneCountMin > 0 {
+            super::Target {
+                lanes_min: o.WaveLaneCountMin,
+                lanes_max: o.WaveLaneCountMax,
+            }
+        } else {
+            super::Target::ANY
+        }
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -218,6 +394,12 @@ impl Host {
             .collect();
         views.sort_unstable();
         views.dedup();
+        // The view-stride table last, after the title-memory views: every
+        // shader indexing the heap reads it, and tests name the others by
+        // their place.
+        let stride_view = (super::VIEW_STRIDES, 1);
+        let with_strides = views.contains(&stride_view);
+        views.retain(|&v| v != stride_view);
         let mut views: Vec<(u32, u32, u8)> = views
             .into_iter()
             .map(|(slot, kind)| (u32::from(slot), super::ROOT_CBV_SPACE, kind))
@@ -231,7 +413,15 @@ impl Host {
         if stages.iter().any(|(s, _)| s.view_addresses) {
             views.push((1, super::MEMORY_SPACE, 1));
         }
+        if with_strides {
+            views.push((u32::from(super::VIEW_STRIDES), super::ROOT_CBV_SPACE, 1));
+        }
+        let mut strides = None;
         for (register, space, kind) in views {
+            if (register, space, kind) == (u32::from(super::VIEW_STRIDES), super::ROOT_CBV_SPACE, 1)
+            {
+                strides = Some(params.len() as u32);
+            }
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
                     0 => D3D12_ROOT_PARAMETER_TYPE_CBV,
@@ -248,6 +438,21 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        // A compute stage's group fold (`GROUP_FOLD_ROW`), last.
+        let fold = stages.iter().any(|(s, _)| s.stage == crate::native::HwStage::Cs).then(|| {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 1,
+                        RegisterSpace: super::USER_DATA_SPACE,
+                        Num32BitValues: 1,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+            params.len() as u32 - 1
+        });
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
@@ -295,7 +500,18 @@ impl Host {
         let bytes = unsafe {
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
         };
-        self.root_signature_bytes(bytes)
+        let made = self.root_signature_bytes(bytes)?;
+        if let Some(param) = fold {
+            FOLDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((made.as_raw() as usize, param));
+        }
+        STRIDES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((made.as_raw() as usize, strides));
+        Ok(made)
     }
 
     /// Creates a root signature from serialized root signature bytes (or a
@@ -303,7 +519,44 @@ impl Host {
     pub fn root_signature_bytes(&self, bytes: &[u8]) -> Result<ID3D12RootSignature, String> {
         let _guard = self.lock_warp();
         // SAFETY: `bytes` is a live slice of root-signature or container bytes.
-        unsafe { self.device.CreateRootSignature(0, bytes) }.map_err(err)
+        let made: ID3D12RootSignature =
+            unsafe { self.device.CreateRootSignature(0, bytes) }.map_err(err)?;
+        // Listed without a view-stride table (`root_signature_for` lists
+        // its own after): it may take a released one's address.
+        STRIDES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((made.as_raw() as usize, None));
+        Ok(made)
+    }
+
+    /// The root parameter of the view-stride table (`t`[`super::VIEW_STRIDES`])
+    /// in a root signature [`Host::root_signature_for`] made, if a stage
+    /// reads it: bound to [`stride_table`] of no strides unless a
+    /// dispatch's roots give one.
+    pub fn strides_param(root: &ID3D12RootSignature) -> Option<u32> {
+        let key = root.as_raw() as usize;
+        STRIDES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|f| f.0 == key)
+            .and_then(|f| f.1)
+    }
+
+    /// The root parameter of the group fold in a root signature
+    /// [`Host::root_signature_for`] made for a compute stage: 0 unless a
+    /// dispatch's roots set it.
+    pub fn fold_param(root: &ID3D12RootSignature) -> Option<u32> {
+        let key = root.as_raw() as usize;
+        FOLDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|f| f.0 == key)
+            .map(|f| f.1)
     }
 
     /// A compute pipeline; user data is root parameter 0.
@@ -689,6 +942,15 @@ impl Host {
                 user_data.as_ptr().cast(),
                 0,
             );
+            // The view-stride table every heap index goes through.
+            let _strides = match Host::strides_param(&root) {
+                Some(param) => {
+                    let b = stride_table(dev, &[])?;
+                    list.SetComputeRootShaderResourceView(param, b.GetGPUVirtualAddress());
+                    Some(b)
+                }
+                None => None,
+            };
             list.Dispatch(1, 1, 1);
             list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                 Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -787,6 +1049,9 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         linked_cols: None,
     })?;
     Ok(HostShader {
@@ -803,6 +1068,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        group_waves: lowered.group_waves,
     })
 }
 
@@ -901,6 +1167,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         view_addresses: false,
         heap: false,
         heap_writes: false,
+        group_waves: 1,
     }
 }
 
@@ -1164,6 +1431,10 @@ impl Host {
                 }
             }
             list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+            if let Some(param) = Host::strides_param(root) {
+                let b = default_stride_table(dev)?;
+                list.SetGraphicsRootShaderResourceView(param, b.GetGPUVirtualAddress());
+            }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
@@ -1359,6 +1630,28 @@ impl Host {
         root: &ID3D12RootSignature,
         pso: &ID3D12PipelineState,
         d: &Dispatch,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_as(root, pso, d, false)
+    }
+
+    /// [`Host::dispatch`] for a mesh pipeline: `d.groups[0]` mesh groups
+    /// (`DispatchMesh`), no render target bound, root arguments as the
+    /// graphics root's. The UAVs are what the mesh program writes.
+    pub fn dispatch_mesh(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_as(root, pso, d, true)
+    }
+
+    fn dispatch_as(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        mesh: bool,
     ) -> Result<Vec<Vec<u32>>, String> {
         let _guard = self.lock_warp();
         let dev = &self.device;
@@ -1842,15 +2135,31 @@ impl Host {
                 dev.CreateSampler(s, at);
             }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
-            list.SetComputeRootSignature(root);
+            if mesh {
+                list.SetGraphicsRootSignature(root);
+            } else {
+                list.SetComputeRootSignature(root);
+                if let Some(param) = Host::fold_param(root) {
+                    list.SetComputeRoot32BitConstant(param, 0, 0);
+                }
+            }
             for (param, arg) in &d.roots {
                 match arg {
+                    Root::Constants(data) if mesh => list.SetGraphicsRoot32BitConstants(
+                        *param,
+                        data.len() as u32,
+                        data.as_ptr().cast(),
+                        0,
+                    ),
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
                         *param,
                         data.len() as u32,
                         data.as_ptr().cast(),
                         0,
                     ),
+                    Root::Table { .. } | Root::View { .. } if mesh => {
+                        return Err("mesh dispatch: root constants only".into());
+                    }
                     Root::Table { sampler, index } => {
                         let (h, size) = if *sampler {
                             (&samplers, sampler_size)
@@ -1862,7 +2171,11 @@ impl Host {
                         list.SetComputeRootDescriptorTable(*param, at);
                     }
                     Root::View { srv, data } => {
-                        let b = upload(data)?;
+                        let b = if *srv && Host::strides_param(root) == Some(*param) {
+                            stride_table(dev, data)?
+                        } else {
+                            upload(data)?
+                        };
                         let va = b.GetGPUVirtualAddress();
                         if *srv {
                             list.SetComputeRootShaderResourceView(*param, va);
@@ -1888,8 +2201,20 @@ impl Host {
                     }
                 }
             }
+            // The view-stride table where the dispatch gives none.
+            if let Some(param) = Host::strides_param(root)
+                && !d.roots.iter().any(|r| r.0 == param)
+            {
+                let b = default_stride_table(dev)?;
+                list.SetComputeRootShaderResourceView(param, b.GetGPUVirtualAddress());
+            }
             let [x, y, z] = d.groups;
-            list.Dispatch(x, y, z);
+            if mesh {
+                let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
+                list6.DispatchMesh(x, y, z);
+            } else {
+                list.Dispatch(x, y, z);
+            }
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(

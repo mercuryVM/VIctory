@@ -193,6 +193,9 @@ fn build(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         linked_cols: None,
     })
     .expect("lower");
@@ -214,6 +217,7 @@ fn build(
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        group_waves: lowered.group_waves,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

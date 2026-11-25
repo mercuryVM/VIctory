@@ -2,11 +2,22 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
 pub const USER_DATA_SPACE: u32 = 0;
+/// Groups per row of a folded dispatch. The host runs at most 65,535
+/// groups per dimension, the console more: a one-dimensional dispatch of
+/// more groups runs folded, as rows of this many groups along z, the
+/// groups past the last full row in a second dispatch. Compute shaders
+/// that read their group id read the fold from `b1` in
+/// [`USER_DATA_SPACE`] (one dword; every compute root signature has it): 0
+/// for a dispatch as given, else the first group the dispatch runs plus
+/// one; their group is then that first group plus x plus z times this,
+/// and z is 0.
+pub const GROUP_FOLD_ROW: u32 = 65535;
+
 /// Where immediate samplers are bound: `s<n>` in this space.
 pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
@@ -29,6 +40,13 @@ pub const HEAP_SAMPLERS: u32 = 2048;
 /// holds no buffer view where a shader reads one at an index it computes
 /// (`emit`, "Buffer views at computed heap indices").
 pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+/// View heap indices shaders compute are title indices (and the host's
+/// own past them, below [`HEAP_VIEWS`]); the host may keep a slot elsewhere
+/// in its heap (NVIDIA takes 10^6 views, a title's heap may hold more).
+/// The host slot of index `i` is at dword `HEAP_MAP + i` of the view-stride
+/// table (`t`[`VIEW_STRIDES`]), which shaders read before they index the
+/// heap.
+pub const HEAP_MAP: u32 = HEAP_VIEWS;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -103,6 +121,9 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// The group fold's handle (`b1` in [`USER_DATA_SPACE`]), once read:
+    /// see [`GROUP_FOLD_ROW`].
+    pub fold: Option<V>,
     /// The title-memory page table's handle, once read.
     pub memory: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
@@ -119,8 +140,28 @@ pub(crate) struct Shader {
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
+    /// Wave64 mesh: the group-shared buffer console waves exchange lanes
+    /// through, in dwords (see `emit::halves`).
+    pub xch_dwords: u32,
+    xch: Option<V>,
     main: V,
     pub entry: usize,
+    /// The `dx.op` operations called (names without overload).
+    ops: std::collections::BTreeSet<String>,
+}
+
+thread_local! {
+    /// See [`last_summary`].
+    static LAST: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// What the module this thread finished last declares and calls: its
+/// thread-group size and wave size, and its `dx.op` operations. A
+/// diagnostic for tools that report a module the validator refuses, since
+/// the validator's message for an operation the stage or the entry's
+/// properties do not allow names neither.
+pub(crate) fn last_summary() -> String {
+    LAST.with(|l| l.borrow().clone())
 }
 
 impl Shader {
@@ -167,6 +208,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            fold: None,
             memory: None,
             memory_dirty: None,
             view_addresses: None,
@@ -176,8 +218,11 @@ impl Shader {
             wave_size: None,
             lds_dwords: 0,
             lds: None,
+            xch_dwords: 0,
+            xch: None,
             main,
             entry,
+            ops: std::collections::BTreeSet::new(),
         }
     }
 
@@ -190,6 +235,19 @@ impl Shader {
         let arr = self.m.array(self.lds_dwords, self.t.i32);
         let g = self.m.global("lds", arr, 3);
         self.lds = Some(g);
+        g
+    }
+
+    /// The exchange buffer of `dwords` dwords in address space 3, made on
+    /// first use.
+    pub fn xch(&mut self, dwords: u32) -> V {
+        if let Some(g) = self.xch {
+            return g;
+        }
+        let arr = self.m.array(dwords, self.t.i32);
+        let g = self.m.global("xch", arr, 3);
+        self.xch_dwords = dwords;
+        self.xch = Some(g);
         g
     }
 
@@ -207,6 +265,8 @@ impl Shader {
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
         self.m.ptr(fty);
+        self.ops
+            .insert(name.split('.').next().unwrap_or(name).to_owned());
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
@@ -257,6 +317,30 @@ impl Shader {
         );
         // The size is known in `finish`, which fixes this placeholder.
         self.annotate(block, h, 13, u32::MAX)
+    }
+
+    /// The handle of the group fold constant (`b1` in [`USER_DATA_SPACE`],
+    /// one dword), made in the entry block.
+    pub fn fold_handle(&mut self) -> V {
+        if let Some(h) = self.fold {
+            return h;
+        }
+        let one = self.m.i32(1);
+        let bind = [one, one, self.m.i32(USER_DATA_SPACE), self.m.i8(2)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let block = self.entry;
+        let (i, f) = (self.m.i32(1), self.m.bool(false));
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, i, f],
+        );
+        let h = self.annotate(block, h, 13, 16);
+        self.fold = Some(h);
+        h
     }
 
     /// The handle of the root CBV of root parameter `slot`, made in the
@@ -467,7 +551,26 @@ impl Shader {
         // reads whatever memory follows its heap): the last slot instead.
         let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
-        let index = self.m.select(block, over, last, index);
+        let mut index = self.m.select(block, over, last, index);
+        if !sampler {
+            // Where the host keeps the slot (`HEAP_MAP`).
+            let table = self.root_srv_handle(VIEW_STRIDES);
+            let first = self.m.i32(HEAP_MAP);
+            let entry = self.m.bin(block, Bin::Add, index, first);
+            let four = self.m.i32(4);
+            let at = self.m.bin(block, Bin::Mul, entry, four);
+            let (iu, mask) = (self.m.undef(self.t.i32), self.m.i8(1));
+            let r = self.op(
+                block,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.t.res_ret,
+                139,
+                &[table, at, iu, mask, four],
+            );
+            let host = self.m.extract(block, r, 0);
+            index = self.m.cast(block, Cast::Bitcast, host, self.t.i32);
+        }
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -482,6 +585,13 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        let threads = self
+            .threads
+            .map_or(String::new(), |[x, y, z]| format!("threads {x}x{y}x{z}, "));
+        let wave = self.wave_size.map_or("any".to_owned(), |n| n.to_string());
+        let ops: Vec<&str> = self.ops.iter().map(String::as_str).collect();
+        let summary = format!("{threads}wave size {wave}; ops: {}", ops.join(", "));
+        LAST.with(|l| *l.borrow_mut() = summary);
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -491,6 +601,7 @@ impl Shader {
             s.m.md_value(c)
         };
         if self.user_data > 0
+            || self.fold.is_some()
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
@@ -522,6 +633,29 @@ impl Shader {
                     kind: 2,
                     space: USER_DATA_SPACE,
                     register: 0,
+                    dxil_kind: 13,
+                });
+            }
+            if self.fold.is_some() {
+                let arr = self.m.array(4, self.t.i32);
+                let ty = self.m.named_struct("GroupFold", vec![arr]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let ops = vec![
+                    Some(i32c(&mut self, cbv_list.len() as u32)),
+                    Some(self.m.md_value(u)),
+                    Some(empty),
+                    Some(i32c(&mut self, USER_DATA_SPACE)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, 16)),
+                    None,
+                ];
+                cbv_list.push(Some(self.m.md_node(ops)));
+                bindings.push(Binding {
+                    kind: 2,
+                    space: USER_DATA_SPACE,
+                    register: 1,
                     dxil_kind: 13,
                 });
             }
@@ -857,7 +991,9 @@ impl Shader {
             inputs: &self.inputs,
             outputs: &self.outputs,
             prims: &self.prims,
-            mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            mesh: self
+                .mesh
+                .map(|m| (m, (self.lds_dwords + self.xch_dwords) * 4)),
             gs: self.gs,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),

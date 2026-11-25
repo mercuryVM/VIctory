@@ -179,6 +179,9 @@ fn program() -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         linked_cols: None,
     })
     .expect("lower");
@@ -198,6 +201,7 @@ fn program() -> HostShader {
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        group_waves: l.group_waves,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -404,10 +408,17 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         linked_cols: None,
     })
     .expect("lower");
-    assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
+    // (The view-stride table, which every heap index goes through.)
+    assert!(
+        l.root_srvs.iter().all(|&s| s == super::VIEW_STRIDES) && !l.memory,
+        "no root descriptor, no title memory"
+    );
     let marks: Vec<(u32, u32)> = l
         .user_data
         .iter()
@@ -429,6 +440,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        group_waves: l.group_waves,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
