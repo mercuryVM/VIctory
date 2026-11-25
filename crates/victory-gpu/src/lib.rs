@@ -63,9 +63,30 @@ mod texture;
 mod twin;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod inplace;
+#[cfg(all(windows, test))]
+mod zero_copy_probe;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+/// The runtime reserved title GPU memory `[base, base + len)`
+/// (`XMemVirtualAlloc`): the host GPU may use it in place
+/// (`VICTORY_ZERO_COPY`).
+#[cfg(windows)]
+pub fn title_memory_allocated(base: usize, len: usize) {
+    inplace::allocated(base, len);
+}
+
+/// The title is about to free title memory at `at` (`len` bytes, or with
+/// `release` the whole allocation): heaps the host GPU has open on it go
+/// first (`VICTORY_ZERO_COPY`).
+#[cfg(windows)]
+pub fn title_memory_freeing(at: usize, len: usize, release: bool) {
+    inplace::freeing(at, len, release);
+}
+
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped,

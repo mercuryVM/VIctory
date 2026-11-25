@@ -225,6 +225,7 @@ fn process_memory() -> Option<ProcessMemory> {
 /// Logs the counters per frame over `frames` frames, and the ranges that
 /// took most bytes.
 pub(crate) fn log(frames: f64) {
+    crate::inplace::log(frames);
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let memory = process_memory();
     // Keep the previous successful sample when the OS query fails; otherwise

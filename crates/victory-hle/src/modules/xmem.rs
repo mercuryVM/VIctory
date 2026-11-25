@@ -176,6 +176,9 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+        if !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER == 0 {
+            victory_gpu::title_memory_allocated(at as usize, size);
+        }
     }
     at
 }
@@ -334,6 +337,8 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            // A heap the host GPU has open on it would keep it.
+            victory_gpu::title_memory_freeing(address as usize, 0, true);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
