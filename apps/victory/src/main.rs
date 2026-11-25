@@ -91,7 +91,8 @@ enum Command {
         /// Include runtime hashes and duplicate DXIL containers in the per-program listing.
         #[arg(long)]
         list: bool,
-        /// Worker threads (default: every logical core).
+        /// Worker threads (default: every logical core but two, so the
+        /// desktop stays responsive while the pre-build compiles).
         #[arg(long)]
         jobs: Option<usize>,
         /// Only translate into the shader cache `run` reads (the warm-up):

@@ -197,7 +197,7 @@ pub fn run(
         .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+        jobs.unwrap_or_else(default_jobs);
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
     let started = std::time::Instant::now();
@@ -349,7 +349,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         anyhow::bail!("no shader cache in {}", shaders.display());
     };
     let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+        jobs.unwrap_or_else(default_jobs);
     // The pre-build's key listing (diagnostics) translates nothing.
     if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
         return crate::prebuild::run(&paths, threads);
@@ -891,6 +891,13 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Worker threads when `--jobs` is not given: every logical core but two
+/// (at least one). With every core compiling pipelines, the pre-build left
+/// the desktop unresponsive, and the machine froze once.
+fn default_jobs() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_sub(2).max(1)
 }
 
 #[cfg(test)]
