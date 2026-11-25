@@ -196,6 +196,7 @@ fn build(
         target: crate::emit::Target::ANY,
         console_cf: false,
         per_lane_only: false,
+        linked_cols: None,
     })
     .expect("lower");
     let shader = HostShader {

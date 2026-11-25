@@ -138,6 +138,7 @@ fn lower_cs(words: &[u32]) -> Result<HostShader, ShaderError> {
         target: crate::emit::Target::ANY,
         console_cf,
         per_lane_only: false,
+        linked_cols: None,
     };
     // As `emit` lowers: a program the per-lane form refuses for the console
     // flow (a named lane read in divergent code) runs as the console runs it.

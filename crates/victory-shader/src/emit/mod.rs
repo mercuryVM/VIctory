@@ -432,12 +432,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] for a host that runs the wave sizes of `target`.
 pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
-    translate_program(
-        container,
-        |s| matches!(s, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms),
-        "a container without a vertex, pixel, compute or mesh program",
-        target,
-    )
+    translate_program(container, ANY_PROGRAM, NO_PROGRAM, None, target)
 }
 
 /// Translates the container's program of hardware stage `stage`: for a
@@ -458,14 +453,133 @@ pub fn translate_stage_for(
         container,
         |s| s == stage,
         "a container without a program of the stage asked for",
+        None,
         target,
     )
 }
+
+/// A mesh program and a pixel program re-emitted for each other, when the
+/// mesh program's outputs pass D3D12's 32 KiB even at one vertex and one
+/// primitive per lane. `ps_dxil` is the pixel program's host container:
+/// arbitrary values it never reads leave both signatures, and the ones it
+/// reads end after their last read component (D3D12 links only equal
+/// masks). `None` when the mesh program fits as it is, is no mesh program,
+/// or still passes the cap.
+pub fn translate_linked(
+    container: &[u8],
+    ps_container: &[u8],
+    ps_dxil: &[u8],
+    target: Target,
+) -> Result<Option<(HostShader, HostShader)>, ShaderError> {
+    let c = Container::parse(container)?;
+    let Some(dxil) = c.part(FourCC::DXIL) else {
+        return Ok(None);
+    };
+    let Some(ms) = crate::native_programs(dxil.data)?
+        .into_iter()
+        .find_map(|p| match p.io {
+            crate::native::StageIo::Ms(ms) => Some(ms),
+            _ => None,
+        })
+    else {
+        return Ok(None);
+    };
+    let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
+        c.part(fourcc)
+            .map_or(Ok(Vec::new()), |part| signature(part.data))
+    };
+    let outputs = sig(FourCC::OSG1)?;
+    let mut prims = sig(FourCC::PSG1)?;
+    prims.retain(|e| !matches!(e.kind, 10 | 30));
+    let (v, p) = (
+        ms.max_vertices.min(ms.threads),
+        ms.max_primitives.min(ms.threads),
+    );
+    let fits = |outputs: &[container::SigElement]| {
+        container::mesh_output_bytes(outputs, &prims, v, p) <= container::MESH_OUTPUT_LIMIT
+    };
+    if fits(&outputs) {
+        return Ok(None);
+    }
+    let reads = pixel_reads(ps_dxil)?;
+    let (mut linked, cols) = link_elements(outputs, &reads);
+    for (e, &n) in linked.iter_mut().zip(&cols) {
+        e.cols = n;
+    }
+    linked.retain(|e| e.cols > 0);
+    if !fits(&linked) {
+        return Ok(None);
+    }
+    let ms = translate_program(container, ANY_PROGRAM, NO_PROGRAM, Some(&reads), target)?;
+    let ps = translate_program(ps_container, ANY_PROGRAM, NO_PROGRAM, Some(&reads), target)?;
+    Ok(Some((ms, ps)))
+}
+
+/// A host pixel shader's arbitrary inputs: semantic name, index, and the
+/// components it reads (a mask over the row, as `ISG1` gives it).
+fn pixel_reads(ps_dxil: &[u8]) -> Result<Vec<(String, u32, u8)>, ShaderError> {
+    let c = Container::parse(ps_dxil)?;
+    let Some(part) = c.part(FourCC::ISG1) else {
+        return Ok(Vec::new());
+    };
+    let base = crate::dxbc::u32_at(part.data, 4)? as usize;
+    let elements = signature(part.data)?;
+    Ok(elements
+        .into_iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == 0)
+        .map(|(i, e)| {
+            let rw = part.data.get(base + 32 * i + 25).copied().unwrap_or(0xf);
+            (e.name, e.index, rw)
+        })
+        .collect())
+}
+
+/// The columns arbitrary element `e` keeps between linked mesh and pixel
+/// programs: through the last one the pixel program reads (`reads`), 0 when
+/// it reads none or does not declare it.
+fn linked_cols(e: &container::SigElement, reads: &[(String, u32, u8)]) -> u8 {
+    reads
+        .iter()
+        .find(|(n, i, _)| *i == e.index && n.eq_ignore_ascii_case(&e.name))
+        .map_or(0, |&(_, _, rw)| {
+            let read = (rw >> e.col) & ((1u8 << e.cols) - 1);
+            8 - read.leading_zeros() as u8
+        })
+}
+
+/// Mesh outputs or pixel inputs linked between the two programs: system
+/// values stay, arbitrary ones keep their [`linked_cols`]; the ones left
+/// out (0 columns) move last. With the columns each declares
+/// ([`lower::Parts::linked_cols`]).
+fn link_elements(
+    elements: Vec<container::SigElement>,
+    reads: &[(String, u32, u8)],
+) -> (Vec<container::SigElement>, Vec<u8>) {
+    let cols = |e: &container::SigElement| {
+        if e.kind == 0 {
+            linked_cols(e, reads)
+        } else {
+            e.cols
+        }
+    };
+    let (mut kept, dropped): (Vec<_>, Vec<_>) = elements.into_iter().partition(|e| cols(e) > 0);
+    let mut n: Vec<u8> = kept.iter().map(cols).collect();
+    n.resize(kept.len() + dropped.len(), 0);
+    kept.extend(dropped);
+    (kept, n)
+}
+
+/// The programs [`translate`] picks: vertex, pixel, compute or mesh.
+const ANY_PROGRAM: fn(HwStage) -> bool =
+    |s| matches!(s, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms);
+const NO_PROGRAM: &str = "a container without a vertex, pixel, compute or mesh program";
 
 fn translate_program(
     container: &[u8],
     wanted: impl Fn(HwStage) -> bool,
     missing: &'static str,
+    link: Option<&[(String, u32, u8)]>,
     target: Target,
 ) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
@@ -486,7 +600,7 @@ fn translate_program(
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res, target)
+    emit_linked(&c, &native, &p, &st, &io, &res, link, target)
 }
 
 /// Emits a program whose earlier stages already ran, for `target`.
@@ -499,6 +613,21 @@ pub fn emit(
     res: &resource::Resources,
     target: Target,
 ) -> Result<HostShader, ShaderError> {
+    emit_linked(c, native, p, st, io, res, None, target)
+}
+
+/// [`emit`]; with `link`, a mesh program declares the outputs and a pixel
+/// program the inputs [`link_elements`] keeps.
+fn emit_linked(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    link: Option<&[(String, u32, u8)]>,
+    target: Target,
+) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -508,6 +637,19 @@ pub fn emit(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
+    let mut linked_cols = None;
+    if let Some(reads) = link {
+        let elements = match native.stage {
+            HwStage::Ms => Some(&mut outputs),
+            HwStage::Ps => Some(&mut inputs),
+            _ => None,
+        };
+        if let Some(elements) = elements {
+            let (kept, cols) = link_elements(std::mem::take(elements), reads);
+            *elements = kept;
+            linked_cols = Some(cols);
+        }
+    }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
@@ -567,6 +709,7 @@ pub fn emit(
         target,
         console_cf,
         per_lane_only,
+        linked_cols: linked_cols.clone(),
     };
     let l = match lower::lower(&parts(st, res, false, false)) {
         // A program that needs the whole console wave where the host's
@@ -1879,5 +2022,206 @@ mod tests {
                 what: "an unknown minimum-precision signature element",
             })
         );
+    }
+
+    /// A mesh program of `threads` lanes declaring `max` vertices and
+    /// primitives; each lane exports its vertex (the position, then
+    /// `vertex_rows` four-component rows) and its primitive (`prim_rows`
+    /// rows), translated.
+    fn mesh(
+        threads: u32,
+        max: u32,
+        vertex_rows: u8,
+        prim_rows: u8,
+    ) -> Result<HostShader, ShaderError> {
+        mesh_linked(threads, max, vertex_rows, prim_rows, None)
+    }
+
+    /// [`mesh`] linked to a pixel program reading `link`.
+    fn mesh_linked(
+        threads: u32,
+        max: u32,
+        vertex_rows: u8,
+        prim_rows: u8,
+        link: Option<&[(String, u32, u8)]>,
+    ) -> Result<HostShader, ShaderError> {
+        use crate::native::{MeshIo, Usage, VsOutput};
+        let element = |name: &str, row: u8, kind: u8| SigElement {
+            name: name.into(),
+            index: row.into(),
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row.into()),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let mut vertex = vec![element("SV_Position", 0, 3)];
+        vertex.extend((1..=vertex_rows).map(|r| element("TEXCOORD", r, 0)));
+        let prims: Vec<SigElement> = (0..prim_rows).map(|r| element("PRIMDATA", r, 0)).collect();
+        let mut words: Vec<u32> = vec![
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_02F2, // v_mov_b32 v1, 1.0
+            0xF800_00CF, // exp pos0 v0, v0, v0, v1
+            0x0100_0000,
+        ];
+        let mut outputs = Vec::new();
+        for n in 0..vertex_rows + prim_rows {
+            // exp param<n> v1, v1, v1, v1; the last ones per-primitive.
+            words.extend([0xF800_000F | (32 + u32::from(n)) << 4, 0x0101_0101]);
+            let primitive = n >= vertex_rows;
+            outputs.push(VsOutput {
+                usage: Usage::Generic,
+                row: if primitive { n - vertex_rows } else { n + 1 },
+                param: if primitive { 0x80 | n } else { n },
+                fp16: false,
+                pack2: false,
+            });
+        }
+        words.extend([
+            0xF800_0941, // exp prim v0, off, off, off done
+            0x0000_0000,
+            0xBF81_0000, // s_endpgm
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs,
+                clip_cntl: 0,
+                threads,
+                max_vertices: max,
+                max_primitives: max,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = super::container::signature(&vertex, false);
+        let psg1 = super::container::signature(&prims, false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1), (FourCC::PSG1, &psg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        emit_linked(&c, &native, &p, &st, &io, &res, link, Target::ANY)
+    }
+
+    /// The vertex and primitive maxima a translated mesh shader's `PSV0`
+    /// declares (bytes 12 and 14 of the runtime info, after its size).
+    fn psv_maxima(dxil: &[u8]) -> (u16, u16) {
+        let c = Container::parse(dxil).unwrap();
+        let d = c.part(FourCC::PSV0).unwrap().data;
+        let half = |at: usize| u16::from_le_bytes([d[4 + at], d[5 + at]]);
+        (half(12), half(14))
+    }
+
+    /// What `dxil.dll` says of a container; `None` without it.
+    #[cfg(windows)]
+    fn validated(dxil: &[u8]) -> Option<Result<(), String>> {
+        let path = super::validator::Validator::default_path();
+        let mut v = super::validator::Validator::load(path.as_deref()).ok()?;
+        Some(v.validate(&mut dxil.to_vec()))
+    }
+
+    #[cfg(not(windows))]
+    fn validated(_: &[u8]) -> Option<Result<(), String>> {
+        None
+    }
+
+    /// 64 lanes declaring 256 vertices and primitives, with 28 vertex and 8
+    /// primitive output components: 36 KiB at those maxima, past the 32 KiB
+    /// D3D12 allows (the validator refused it: "vertex plus primitive output
+    /// size is greater than 32768"). The lanes write vertices and primitives
+    /// 0-63 alone, so the maxima come down to 64. Outputs that fit keep the
+    /// console's maxima.
+    #[test]
+    fn mesh_maxima_past_the_lanes_come_down_to_fit() {
+        for (rows, maxima) in [((6, 2), (64, 64)), ((1, 1), (256, 256))] {
+            let s = mesh(64, 256, rows.0, rows.1).unwrap();
+            match validated(&s.dxil) {
+                Some(r) => r.unwrap_or_else(|e| panic!("{rows:?}: {e}")),
+                None => eprintln!("no dxil.dll; validation skipped"),
+            }
+            assert_eq!(psv_maxima(&s.dxil), maxima, "{rows:?}");
+        }
+    }
+
+    /// 128 lanes, 256 vertices and primitives, 64 vertex and 8 primitive
+    /// output components: past 32 KiB even at the lane count. Still
+    /// translated as before, with the maxima down to the lanes.
+    #[test]
+    fn mesh_outputs_past_32_kib_at_the_lane_count_keep_the_lane_maxima() {
+        let s = mesh(128, 256, 15, 2).unwrap();
+        assert_eq!(psv_maxima(&s.dxil), (128, 128));
+    }
+
+    /// 128 lanes with the position and 16 vertex rows: 68 components, 34 KiB
+    /// at 128 vertices, past 32 KiB at the lane count too. Linked to a pixel
+    /// program that never reads row 16 and reads only x of row 15, the
+    /// program declares 61 components (31,232 bytes) and validates; row 15
+    /// keeps one column (D3D12 links equal masks only).
+    #[test]
+    fn a_linked_mesh_program_leaves_out_what_the_pixel_program_never_reads() {
+        let plain = mesh(128, 128, 16, 0).unwrap();
+        if let Some(r) = validated(&plain.dxil) {
+            assert!(r.unwrap_err().contains("greater than 32768"));
+        }
+        let mut reads: Vec<(String, u32, u8)> =
+            (1..=14).map(|r| ("TEXCOORD".to_owned(), r, 0xf)).collect();
+        reads.push(("TEXCOORD".into(), 15, 0x1));
+        reads.push(("TEXCOORD".into(), 16, 0));
+        let linked = mesh_linked(128, 128, 16, 0, Some(&reads)).unwrap();
+        let c = Container::parse(&linked.dxil).unwrap();
+        let out = signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        assert_eq!(out.len(), 16);
+        assert!(!out.iter().any(|e| e.name == "TEXCOORD" && e.index == 16));
+        let row15 = out.iter().find(|e| e.index == 15).unwrap();
+        assert_eq!((row15.col, row15.cols), (0, 1));
+        let comps: u32 = out.iter().map(|e| u32::from(e.cols)).sum();
+        assert_eq!(comps, 61);
+        if let Some(r) = validated(&linked.dxil) {
+            r.unwrap();
+        }
+    }
+
+    /// Linked elements: system values stay, unread ones move last with no
+    /// columns, read ones end after their last read component.
+    #[test]
+    fn linked_elements_keep_system_values_and_read_columns() {
+        let el = |name: &str, index: u32, kind: u8, col: u8, cols: u8| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp: 2,
+            row: Some(index),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let elements = vec![
+            el("SV_Position", 0, 3, 0, 4),
+            el("TEXCOORD", 1, 0, 0, 4),
+            el("TEXCOORD", 2, 0, 1, 3),
+            el("TEXCOORD", 3, 0, 0, 2),
+            el("TEXCOORD", 4, 0, 0, 4),
+        ];
+        let reads = vec![
+            ("texcoord".to_owned(), 1, 0x0),
+            ("TEXCOORD".to_owned(), 2, 0x4),
+            ("TEXCOORD".to_owned(), 4, 0xb),
+        ];
+        let (kept, cols) = link_elements(elements, &reads);
+        let order: Vec<u32> = kept.iter().map(|e| e.index).collect();
+        assert_eq!(order, [0, 2, 4, 1, 3]);
+        assert_eq!(cols, [4, 2, 4, 0, 0]);
     }
 }

@@ -82,6 +82,12 @@ pub(crate) struct Parts<'a> {
     /// Never ask for the console flow: the per-lane form or nothing (what
     /// a program falls back to when the console flow cannot lower it).
     pub per_lane_only: bool,
+    /// Linked mesh and pixel programs: the columns each mesh output or
+    /// pixel input declares in the signature (0: left out; those come last).
+    /// All of them stay while the program is lowered (16-bit halves are
+    /// placed from every element of a row); exports past them are dropped,
+    /// reads past them stop the program.
+    pub linked_cols: Option<Vec<u8>>,
 }
 
 /// What [`lower`] stops with when a program should run as the console runs
@@ -1781,6 +1787,21 @@ impl<'a> Lower<'a> {
         let memory_writes = self.s.memory_dirty.is_some();
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
+        if let Some(cols) = &self.x.linked_cols {
+            let elements = if self.s.pixel {
+                &mut self.s.inputs
+            } else {
+                &mut self.s.outputs
+            };
+            for (e, &n) in elements.iter_mut().zip(cols) {
+                if u32::from(e.usage) >> n != 0 {
+                    return Err(unsupported(0, "a linked input or output past its columns"));
+                }
+                e.cols = n;
+            }
+            let kept = cols.iter().take_while(|&&n| n != 0).count();
+            elements.truncate(kept);
+        }
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -3586,13 +3607,37 @@ impl<'a> Lower<'a> {
     // program's count are culled and vertices past it unused; this costs
     // the host the unused vertex and primitive slots. Pass the program's own
     // counts if that shows in frame time.
-    fn mesh_prologue(&mut self, mesh: super::shader::Mesh) -> Result<(), Why> {
+    fn mesh_prologue(&mut self, mut mesh: super::shader::Mesh) -> Result<(), Why> {
         let threads = self.s.threads.expect("mesh")[0];
         if mesh.topology != 2 {
             return Err("a mesh shader not drawing triangles");
         }
         if threads > 128 || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
             return Err("a mesh shader beyond the host's limits");
+        }
+        // D3D12 caps the outputs of the declared maxima at 32 KiB. Lane n
+        // writes only vertex n and primitive n, so maxima past the lanes are
+        // never reached: they come down to the lane count when they do not
+        // fit.
+        use super::container::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
+        let mut outputs = self.s.outputs.clone();
+        if let Some(cols) = &self.x.linked_cols {
+            for (e, &n) in outputs.iter_mut().zip(cols) {
+                e.cols = n;
+            }
+        }
+        let (outputs, prims) = (&outputs, &self.s.prims);
+        let fits = |m: super::shader::Mesh| {
+            mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
+        };
+        if !fits(mesh) {
+            mesh.max_vertices = mesh.max_vertices.min(threads);
+            mesh.max_primitives = mesh.max_primitives.min(threads);
+            // shortcut: outputs that pass the cap even at the lane count are
+            // still emitted, as before, with the lower maxima: drivers have
+            // been seen to take such modules, and refusing them would drop
+            // draws that may work today.
+            self.s.mesh = Some(mesh);
         }
         let e = self.s.entry;
         let void = self.s.t.void;
@@ -10042,6 +10087,14 @@ impl<'a> Lower<'a> {
             (true, true) => ("storePrimitiveOutput", 172),
         };
         for (id, col, value, half) in stores {
+            // Linked to a pixel program that reads no more of the element.
+            if mesh
+                && !primitive
+                && let Some(cols) = &self.x.linked_cols
+                && col >= cols[id]
+            {
+                continue;
+            }
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
@@ -11254,6 +11307,7 @@ mod tests {
             target: super::super::Target::ANY,
             console_cf: false,
             per_lane_only: false,
+            linked_cols: None,
         })
         .map(|_| ())
     }
@@ -11307,6 +11361,7 @@ mod tests {
             target: crate::emit::Target::ANY,
             console_cf: false,
             per_lane_only: false,
+            linked_cols: None,
         })
     }
 
@@ -11413,6 +11468,7 @@ mod tests {
             target: super::super::Target::ANY,
             console_cf: false,
             per_lane_only: false,
+            linked_cols: None,
         }).unwrap();
 
         let container =

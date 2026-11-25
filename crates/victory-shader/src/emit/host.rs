@@ -934,6 +934,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         target: crate::emit::Target::ANY,
         console_cf: false,
         per_lane_only: false,
+        linked_cols: None,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,

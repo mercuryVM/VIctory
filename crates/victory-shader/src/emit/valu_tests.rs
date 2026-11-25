@@ -143,6 +143,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         target: super::Target::ANY,
         console_cf: false,
         per_lane_only: false,
+        linked_cols: None,
     })?;
 
     let shader = HostShader {
@@ -1147,6 +1148,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         target: crate::emit::Target::ANY,
         console_cf: false,
         per_lane_only: false,
+        linked_cols: None,
     })
     .expect("lower");
     let shader = HostShader {

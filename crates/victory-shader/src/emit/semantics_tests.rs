@@ -295,6 +295,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         target: crate::emit::Target::ANY,
         console_cf: false,
         per_lane_only: false,
+        linked_cols: None,
     })
     .map_err(e)?;
     Ok(HostShader {

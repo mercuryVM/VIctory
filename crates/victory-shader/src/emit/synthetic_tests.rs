@@ -139,6 +139,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         target: crate::emit::Target::ANY,
         console_cf: false,
         per_lane_only: false,
+        linked_cols: None,
     })
 }
 
