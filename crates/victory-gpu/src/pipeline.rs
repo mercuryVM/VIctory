@@ -67,6 +67,11 @@ pub(crate) struct Shader {
     /// vertex shader in most pipelines and as an ES half in geometry ones.
     #[cfg(windows)]
     translated: [OnceLock<Option<Translated>>; 3],
+    /// By [`Program`]: whether a pipeline worker took on the translation
+    /// (see `make::translate_own`); the others leave pipelines that need it
+    /// and make other ones meanwhile.
+    #[cfg(windows)]
+    pub(crate) translating: [std::sync::atomic::AtomicBool; 3],
     /// Whether its native program runs in 64-lane console waves
     /// (diagnostics: `VICTORY_SKIP_WAVE64`).
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -104,6 +109,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: Default::default(),
+            #[cfg(windows)]
+            translating: Default::default(),
             #[cfg(all(windows, feature = "diagnostics"))]
             wave64: OnceLock::new(),
             #[cfg(windows)]
@@ -209,6 +216,11 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+
+    /// Whether the translation of `program` is done (made or refused).
+    pub(crate) fn has_translation(&self, program: Program) -> bool {
+        self.translated[program as usize].get().is_some()
     }
 
     /// Whether the translation of `program` was tried and failed.
