@@ -165,6 +165,17 @@
 //!   count as `DispatchMesh(x, 1, 1)`. Per-primitive outputs (`PSG1`) are
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
+//! * **Geometry shaders** (added 2026-11-24; [`translate`] still picks
+//!   the VS, [`translate_stage`] the ES or GS half): the console's legacy ES-GS pair (rings in LDS).
+//!   The ES half of a vertex container ([`HwStage::Es`]) becomes a vertex
+//!   shader whose outputs are the container's `OSG1` (ESGS parameter n must
+//!   be row n). The GS half ([`HwStage::Gs`], `gs_6_6`) reads input row n
+//!   of each vertex where the console reads ESGS dwords 4n..4n+3, keeps
+//!   what it writes to the GSVS ring in a per-thread array, and at each
+//!   emit stores the outputs the embedded copy shader would export from it
+//!   (its `OSG1`, so the title's pixel shaders link) then `EmitStream`;
+//!   triangles in, triangle strips out, one stream, the record's maximum
+//!   vertex count. User data and descriptors as above.
 
 mod bitcode;
 #[cfg(all(test, windows))]
@@ -332,6 +343,30 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_program(
+        container,
+        |s| matches!(s, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms),
+        "a container without a vertex, pixel, compute or mesh program",
+    )
+}
+
+/// Translates the container's program of hardware stage `stage`: for a
+/// pipeline with a geometry stage, [`HwStage::Es`] of the vertex container
+/// (the vertex shader that feeds it) and [`HwStage::Gs`] of the geometry
+/// container. Other stages are what [`translate`] picks.
+pub fn translate_stage(container: &[u8], stage: HwStage) -> Result<HostShader, ShaderError> {
+    translate_program(
+        container,
+        |s| s == stage,
+        "a container without a program of the stage asked for",
+    )
+}
+
+fn translate_program(
+    container: &[u8],
+    wanted: impl Fn(HwStage) -> bool,
+    missing: &'static str,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -339,15 +374,10 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
         .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-            )
-        })
+        .find(|p| wanted(p.stage))
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: missing,
         })?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
@@ -714,6 +744,173 @@ mod tests {
         }
         s.m.terminate(b, super::bitcode::Term::Ret);
         s.finish()
+    }
+
+    /// A legacy GS can append its final vertex in the done message.
+    #[test]
+    #[cfg(windows)]
+    fn legacy_geometry_shader_emits_the_vertex_in_the_done_message() {
+        use super::host::{Draw, Host};
+        use super::valu_tests::{ONE_AT_A_TIME, vop3};
+        use crate::native::{GeometryIo, Usage, VsInput, VsOutput};
+
+        let to_code = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let stage = |stage, io, words: &[u32]| NativeProgram {
+            stage,
+            wave64: true,
+            vgprs: 32,
+            layout: vec![],
+            used: vec![],
+            io,
+            code: to_code(words),
+        };
+        let signature_element = |name: &str, kind| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let position = signature_element("SV_Position", 3);
+        let translate = |native: NativeProgram, input: SigElement| {
+            let isg1 = container::signature(&[input], true);
+            let osg1 = container::signature(std::slice::from_ref(&position), false);
+            let container = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&container).unwrap();
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            emit(&c, &native, &p, &st, &io, &res).unwrap()
+        };
+        let own_ring = [
+            vop3(0x365, 4, 193, 128, 0),   // v_mbcnt_lo_u32_b32 v4, -1, 0
+            vop3(0x366, 4, 193, 260, 0),   // v_mbcnt_hi_u32_b32 v4, -1, v4
+            vop3(0x346, 4, 260, 134, 128), // v_lshl_add_u32 v4, v4, 6, 0
+        ]
+        .concat();
+        const WRITE_B128: u32 = 0xDB7C_0000;
+        const READ_B128: u32 = 0xDBFC_0000;
+        const WAIT_LDS: u32 = 0xBF8C_C07F;
+        const END: u32 = 0xBF81_0000;
+        const EMIT: u32 = 0xBF90_0022;
+        const EMIT_CUT: u32 = 0xBF90_0032;
+        const DONE: u32 = 0xBF90_0003;
+        const DONE_EMIT_CUT: u32 = 0xBF90_0033;
+
+        let mut es_words = own_ring.clone();
+        es_words.extend([WRITE_B128, 0x0000_0C04, WAIT_LDS, END]);
+        let vs = translate(
+            stage(
+                HwStage::Es,
+                StageIo::Vs {
+                    inputs: vec![VsInput {
+                        usage: Usage::Generic,
+                        row: 0,
+                        mask: 15,
+                        vgpr: 12,
+                    }],
+                    outputs: vec![VsOutput {
+                        usage: Usage::Generic,
+                        row: 0,
+                        param: 0,
+                        fp16: false,
+                        pack2: false,
+                    }],
+                },
+                &es_words,
+            ),
+            signature_element("POSITION", 0),
+        );
+        let ps = HostShader {
+            stage: HwStage::Ps,
+            dxil: constant_color(),
+            ..super::host::stub_ps()
+        };
+
+        let mut gs_words = own_ring;
+        // ESGS vertex indices 0, 1, 2 are respectively v0.lo, v0.hi, v1.lo.
+        for (vertex, (packed, half)) in [(256, 128), (256, 144), (257, 128)].into_iter().enumerate()
+        {
+            gs_words.extend(vop3(0x148, 10, packed, half, 144)); // v_bfe_u32
+            gs_words.push(0x3414_1482); // v_lshlrev_b32 v10, 2, v10
+            gs_words.extend([READ_B128, 0x0C00_000A, WAIT_LDS]);
+            gs_words.extend([WRITE_B128 | (vertex as u32 * 16), 0x0000_0C04, WAIT_LDS]);
+            if vertex < 2 {
+                gs_words.push(EMIT);
+            }
+        }
+        let make_gs = |ending: &[u32]| {
+            let mut words = gs_words.clone();
+            words.extend_from_slice(ending);
+            words.push(END);
+            translate(
+                stage(
+                    HwStage::Gs,
+                    StageIo::Gs(GeometryIo {
+                        copy_code: to_code(&[
+                            READ_B128,
+                            0x0400_0000,
+                            WAIT_LDS,
+                            0xF800_08CF,
+                            0x0706_0504, // exp pos0, v4..v7 done
+                            END,
+                        ]),
+                        copy_outputs: vec![],
+                        max_vertices: 3,
+                        vertex_dwords: 4,
+                    }),
+                    &words,
+                ),
+                position.clone(),
+            )
+        };
+        let separate = make_gs(&[EMIT_CUT, DONE]);
+        let fused = make_gs(&[DONE_EMIT_CUT]);
+        if let Ok(mut validator) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            for shader in [&vs, &separate, &fused] {
+                validator.validate(&mut shader.dxil.clone()).unwrap();
+            }
+        }
+
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ran = false;
+        for (backend, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {backend} device; skipped");
+                continue;
+            };
+            for (ending, shader) in [("separate", &separate), ("fused", &fused)] {
+                let (root, pso) = host.geometry_pipeline(&vs, shader, &ps).unwrap();
+                let pixels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[
+                                -1.0, -1.0, 0.5, 1.0, -1.0, 3.0, 0.5, 1.0, 3.0, -1.0, 0.5, 1.0,
+                            ],
+                            stride: 16,
+                            size: (4, 4),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(pixels, [[1.0, 0.5, 0.25, 1.0]; 16], "{backend}: {ending}");
+            }
+            ran = true;
+        }
+        assert!(ran, "neither hardware nor WARP SM 6.6 device available");
     }
 
     #[test]

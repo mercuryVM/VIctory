@@ -56,6 +56,16 @@ pub(crate) struct Types {
     pub res_ret: Ty,
 }
 
+/// What a geometry shader declares.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Geometry {
+    pub max_vertices: u32,
+    /// DXIL `InputPrimitive` (3 triangles).
+    pub input: u32,
+    /// DXIL `PrimitiveTopology` of the output (5 triangle strips).
+    pub topology: u32,
+}
+
 /// What a mesh shader declares beyond its thread-group size.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Mesh {
@@ -75,9 +85,8 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
-    /// A geometry shader taking triangles and emitting triangle strips of
-    /// at most this many vertices (`rect`).
-    pub gs: Option<u32>,
+    /// A geometry shader.
+    pub gs: Option<Geometry>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -691,6 +700,10 @@ impl Shader {
             if self.gs.is_some() {
                 view.extend([0, 0, 0]);
             }
+            // A geometry shader lists every stream: streams 1-3 output nothing.
+            if self.gs.is_some() {
+                view.extend([0, 0, 0]);
+            }
             let arr = self.m.array(view.len() as u32, self.t.i32);
             let elems: Vec<V> = view.iter().map(|&v| self.m.i32(v)).collect();
             let arr = self.m.aggregate(arr, &elems);
@@ -750,11 +763,12 @@ impl Shader {
                 }
             }
         }
-        // Geometry state (tag 1): triangles in, maximum vertices, stream
-        // mask, triangle strips out, one instance.
-        if let Some(max) = self.gs {
+        // Geometry state (tag 1): input primitive, maximum vertices, stream
+        // mask, output topology, instance count.
+        if let Some(gs) = self.gs {
             props.push(i32c(&mut self, 1));
-            let state = [3, max, 1, 5, 1].map(|n| Some(i32c(&mut self, n)));
+            let state =
+                [gs.input, gs.max_vertices, 1, gs.topology, 1].map(|n| Some(i32c(&mut self, n)));
             props.push(self.m.md_node(state.to_vec()));
         }
         if let Some(n) = self.wave_size {

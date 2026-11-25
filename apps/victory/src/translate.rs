@@ -69,6 +69,14 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// The same for the halves of merged ES-GS stages (ES: vertex programs
+    /// that feed a geometry program).
+    es_programs: usize,
+    es_emitted: usize,
+    es_validated: usize,
+    gs_programs: usize,
+    gs_emitted: usize,
+    gs_validated: usize,
     /// Reason → programs stopped by it, and the smallest recorded label.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: per-program result rows, including runtime hashes.
@@ -133,6 +141,12 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.es_programs += other.es_programs;
+        self.es_emitted += other.es_emitted;
+        self.es_validated += other.es_validated;
+        self.gs_programs += other.gs_programs;
+        self.gs_emitted += other.gs_emitted;
+        self.gs_validated += other.gs_validated;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -283,6 +297,11 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    println!(
+        "             {} emitted of {} geometry programs; {} validated ({} of {} \
+         ES halves emitted, {} validated)",
+        t.gs_emitted, t.gs_programs, t.gs_validated, t.es_emitted, t.es_programs, t.es_validated
+    );
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -370,7 +389,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 }
                                 let one = std::time::Instant::now();
                                 let (done, cached) =
-                                    victory_gpu::shader_cache::host_shader(container);
+                                    victory_gpu::shader_cache::host_shader(container, None);
                                 let k = if cached {
                                     0
                                 } else if done.is_ok() {
@@ -543,8 +562,9 @@ fn translate(
                 };
                 let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
                 let compute = p.stage == HwStage::Cs;
+                let geometry = matches!(p.stage, HwStage::Es | HwStage::Gs);
                 let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
+                if graphics || compute || geometry || p.stage == HwStage::Ms {
                     t.io_programs += usize::from(graphics);
                     match io::raise(&program, &p) {
                         Ok(r) => {
@@ -625,7 +645,9 @@ fn check(
             &shader.dxil,
         );
     }
-    if let Some((h, stub_ps)) = &checks.host {
+    if let Some((h, stub_ps)) = &checks.host
+        && !matches!(shader.stage, HwStage::Es | HwStage::Gs)
+    {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
@@ -696,6 +718,19 @@ fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
             &mut t.ms_emitted,
             &mut t.ms_validated,
             &mut t.ms_pipelines,
+        ],
+        // No pipelines yet: the last counter is a scratch one.
+        HwStage::Es => [
+            &mut t.es_programs,
+            &mut t.es_emitted,
+            &mut t.es_validated,
+            &mut t.pipelines,
+        ],
+        HwStage::Gs => [
+            &mut t.gs_programs,
+            &mut t.gs_emitted,
+            &mut t.gs_validated,
+            &mut t.pipelines,
         ],
         _ => [
             &mut t.emit_programs,

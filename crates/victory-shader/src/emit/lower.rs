@@ -14,7 +14,7 @@ use super::container::SigElement;
 use super::shader::{Shader, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
+use crate::io::{Barycentric, Copied, Elsewhere, Export, Input, Interp, Io, Ring, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
@@ -101,6 +101,10 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+/// `s_sendmsg` ids of a legacy GS: GS_OP_* in bits 4-5 (1 cut, 2 emit, 3
+/// both), the stream in bits 8-9; then the end of the primitive's work.
+const MSG_GS: u16 = 2;
+const MSG_GS_DONE: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Numeric {
@@ -258,6 +262,11 @@ struct Lower<'a> {
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
     mode16: Option<u8>,
+    /// ES and GS: ring accesses by site.
+    rings: HashMap<Site, Ring>,
+    /// GS: the vertices it emits (the GSVS ring), then the count emitted:
+    /// a per-thread array.
+    gsvs: Option<V>,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -583,6 +592,20 @@ impl<'a> Lower<'a> {
             }
         }
         let mut no_barrier = HashSet::new();
+        // ES and GS halves meet at a barrier on the console (the rings in
+        // LDS); the host passes vertices between stages itself.
+        if matches!(x.native.stage, HwStage::Es | HwStage::Gs) {
+            no_barrier.extend(0..p.blocks.len());
+        }
+        if let StageIo::Gs(gs) = &x.native.io {
+            // shortcut: triangles in, triangle strips out (what the stage
+            // data's other fields say is not decoded).
+            s.gs = Some(super::shader::Geometry {
+                max_vertices: gs.max_vertices,
+                input: 3,
+                topology: 5,
+            });
+        }
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
@@ -702,6 +725,8 @@ impl<'a> Lower<'a> {
             abort: None,
             round16: round16(p),
             mode16: Some(0),
+            rings: x.io.rings.iter().copied().collect(),
+            gsvs: None,
         }
     }
 
@@ -2991,6 +3016,9 @@ impl<'a> Lower<'a> {
         if *gds {
             return Err("GDS");
         }
+        if matches!(self.x.native.stage, HwStage::Es | HwStage::Gs) {
+            return self.ring(inst, b, i);
+        }
         let name = inst.name();
         let guard = self.guard(b, i)?;
         let c = self.cur;
@@ -3290,6 +3318,12 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        if let Fields::Sopp { imm } = inst.fields
+            && name == "s_sendmsg"
+            && self.s.gs.is_some()
+        {
+            return self.gs_message(imm).map_err(|w| unsupported(offset, w));
+        }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -9088,6 +9122,304 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// An LDS access of a merged ES or GS half, which must be a ring access
+    /// ([`Io::rings`]). ES: a write to its ESGS item is an output (the row
+    /// of the parameter, which must be its index). GS: a read of an input
+    /// vertex's item is that vertex's input (row = dword / 4, the ES's
+    /// parameter); a write to its GSVS area goes to the per-thread array
+    /// the emits read.
+    fn ring(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let Fields::Ds {
+            dst,
+            data,
+            offset0,
+            offset1,
+            ..
+        } = &inst.fields
+        else {
+            unreachable!()
+        };
+        let ring = *self
+            .rings
+            .get(&(b, i))
+            .ok_or("an LDS access off the stage's rings")?;
+        let name = inst.name();
+        let guard = self.guard(b, i)?;
+        let width = match name.rsplit('_').next() {
+            Some("b64") => 2,
+            Some("b96") => 3,
+            Some("b128") => 4,
+            Some("b32") => 1,
+            _ => return Err("a ring access of bytes or halves"),
+        };
+        // (byte offset, dwords) per element.
+        let elements: Vec<(u32, u32)> =
+            if name.starts_with("ds_read2_") || name.starts_with("ds_write2_") {
+                let scale = 4 * width;
+                vec![
+                    (u32::from(*offset0) * scale, width),
+                    (u32::from(*offset1) * scale, width),
+                ]
+            } else if name.starts_with("ds_read_") || name.starts_with("ds_write_") {
+                vec![(u32::from(*offset0) | u32::from(*offset1) << 8, width)]
+            } else {
+                return Err("a ring operation");
+            };
+        let base = match ring {
+            Ring::Vertex { byte, .. } | Ring::Own { byte } => byte,
+        };
+        let dword = |off: u32| -> Result<u32, Why> {
+            let at = base.wrapping_add(off);
+            if at % 4 != 0 {
+                return Err("a ring access off dwords");
+            }
+            Ok(at / 4)
+        };
+        let parts = self.x;
+        let gs = match &parts.native.io {
+            StageIo::Gs(gs) => Some((gs.max_vertices, gs.vertex_dwords)),
+            _ => None,
+        };
+        if name.starts_with("ds_read") {
+            let Ring::Vertex { vertex, .. } = ring else {
+                return Err("a ring read of the lane's own area");
+            };
+            if gs.is_none() || vertex >= 3 {
+                return Err("a ring read of an input vertex past the primitive's");
+            }
+            let reg = match dst {
+                Some(Operand::Vector { reg, .. }) => *reg,
+                _ => return Err("an LDS read result"),
+            };
+            let mut n = 0;
+            for (off, w) in elements {
+                let d0 = dword(off)?;
+                for k in 0..w {
+                    let d = d0 + k;
+                    let (row, col) = ((d / 4) as u8, (d % 4) as u8);
+                    // shortcut: a channel the input signature leaves out
+                    // reads 0.
+                    let x = match self.find_input(row, col) {
+                        Some((id, c)) => self.load_vertex_input(id, c, vertex)?,
+                        None => self.s.m.i32(0),
+                    };
+                    self.write(inst, Reg::V(reg + n as u8), x, guard);
+                    n += 1;
+                }
+            }
+            return Ok(());
+        }
+        if !name.starts_with("ds_write") {
+            return Err("a ring operation");
+        }
+        let Ring::Own { .. } = ring else {
+            return Err("a ring write to another lane's area");
+        };
+        let mut stores = Vec::new();
+        for (e, (off, w)) in elements.into_iter().enumerate() {
+            let vals = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;
+            let d0 = dword(off)?;
+            for (k, x) in vals.into_iter().enumerate() {
+                stores.push((d0 + k as u32, x));
+            }
+        }
+        let at = self.begin_guarded(guard);
+        for (d, x) in stores {
+            match gs {
+                Some((max, size)) => {
+                    if d >= max * size {
+                        return Err("a GSVS write past the maximum vertex count");
+                    }
+                    let g = self.gsvs_array();
+                    let index = self.s.m.i32(d);
+                    let p = self.s.m.element(self.cur, g, index);
+                    self.s.m.store(self.cur, p, x);
+                }
+                None => {
+                    let (param, col) = ((d / 4) as u8, (d % 4) as u8);
+                    let StageIo::Vs { outputs, .. } = &parts.native.io else {
+                        return Err("an ES half without its stage data");
+                    };
+                    let o = outputs
+                        .iter()
+                        .find(|o| o.param == param)
+                        .ok_or("an ESGS write the stage data does not list")?;
+                    // The GS half reads parameter n as input row n.
+                    if o.row != param {
+                        return Err("an ESGS parameter of another signature row");
+                    }
+                    if let Some((id, c)) = self.find_output(o.row, col) {
+                        self.store_output(id, c, x)?;
+                    }
+                }
+            }
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// GS: the per-thread array of emitted vertices, the emit count after
+    /// them.
+    fn gsvs_array(&mut self) -> V {
+        if let Some(g) = self.gsvs {
+            return g;
+        }
+        let n = match &self.x.native.io {
+            StageIo::Gs(gs) => gs.max_vertices * gs.vertex_dwords + 1,
+            _ => 1,
+        };
+        let ty = self.s.m.array(n, self.s.t.i32);
+        let z = self.s.m.i32(0);
+        let init = self.s.m.aggregate(ty, &vec![z; n as usize]);
+        let g = self.s.m.static_global("gsvs", init);
+        self.gsvs = Some(g);
+        g
+    }
+
+    /// GS: `s_sendmsg` GS_OP_EMIT stores the vertex the copy shader would
+    /// export from the GSVS ring and emits it; GS_OP_CUT ends the strip.
+    fn gs_message(&mut self, imm: u16) -> Result<(), Why> {
+        let (msg, op, stream) = (imm & 0xF, imm >> 4 & 3, imm >> 8 & 3);
+        // GS_DONE can carry the same emit and cut operations as GS.
+        if !matches!(msg, MSG_GS | MSG_GS_DONE) {
+            return Err("a GS message");
+        }
+        if stream != 0 {
+            return Err("a second GS output stream");
+        }
+        let void = self.s.t.void;
+        let s0 = self.s.m.i8(0);
+        if op & 2 != 0 {
+            let x = self.x;
+            let StageIo::Gs(gs) = &x.native.io else {
+                unreachable!()
+            };
+            let (max, size) = (gs.max_vertices, gs.vertex_dwords);
+            let g = self.gsvs_array();
+            let c = self.cur;
+            let ci = self.s.m.i32(max * size);
+            let cp = self.s.m.element(c, g, ci);
+            let count = self.s.m.load(c, cp);
+            let k = self.s.m.i32(size);
+            let first = self.s.m.bin(c, Bin::Mul, count, k);
+            for e in &x.io.copy {
+                for (ch, src) in e.values.iter().enumerate() {
+                    let Some(src) = *src else {
+                        continue;
+                    };
+                    let ch = ch as u8;
+                    let found = match e.target {
+                        Target::Position(0) => self
+                            .s
+                            .outputs
+                            .iter()
+                            .position(|o| o.kind == 3)
+                            .map(|id| (id, ch)),
+                        Target::Param { row, .. } => self.find_output(row, ch),
+                        _ => None,
+                    };
+                    let Some((id, col)) = found else {
+                        continue;
+                    };
+                    let value = match src {
+                        Copied::Constant(k) => self.s.m.i32(k),
+                        Copied::Gsvs(d) if d < size => {
+                            let d = self.s.m.i32(d);
+                            let at = self.s.m.bin(c, Bin::Add, first, d);
+                            let p = self.s.m.element(c, g, at);
+                            self.s.m.load(c, p)
+                        }
+                        Copied::Gsvs(_) => return Err("a copy shader read past the vertex"),
+                    };
+                    self.store_output(id, col, value)?;
+                }
+            }
+            self.s.op(c, "emitStream", Attr::NoUnwind, void, 97, &[s0]);
+            let one = self.s.m.i32(1);
+            let next = self.s.m.bin(c, Bin::Add, count, one);
+            self.s.m.store(c, cp, next);
+        }
+        if op & 1 != 0 {
+            self.s
+                .op(self.cur, "cutStream", Attr::NoUnwind, void, 98, &[s0]);
+        }
+        Ok(())
+    }
+
+    /// The output element holding channel `channel` of signature row `row`,
+    /// with the channel within it.
+    fn find_output(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
+        self.s.outputs.iter().enumerate().find_map(|(id, e)| {
+            let r = e.row?;
+            (r == u32::from(row) && channel >= e.col && channel < e.col + e.cols)
+                .then(|| (id, channel - e.col))
+        })
+    }
+
+    /// `storeOutput` of a 32-bit value to output element `id`.
+    fn store_output(&mut self, id: usize, col: u8, x: V) -> Result<(), Why> {
+        let el = &mut self.s.outputs[id];
+        if el.half {
+            return Err("a 16-bit output of a ring");
+        }
+        el.usage |= 1 << col;
+        let (suffix, x) = match el.comp {
+            9 => (".f32", self.as_float(x)),
+            _ => (".i32", x),
+        };
+        let args = [
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            x,
+        ];
+        let void = self.s.t.void;
+        self.s.op(
+            self.cur,
+            &format!("storeOutput{suffix}"),
+            Attr::NoUnwind,
+            void,
+            5,
+            &args,
+        );
+        Ok(())
+    }
+
+    /// GS: channel `col` of input element `id` of input vertex `vertex`.
+    fn load_vertex_input(&mut self, id: usize, col: u8, vertex: u8) -> Result<V, Why> {
+        let e = &mut self.s.inputs[id];
+        if e.half {
+            return Err("a 16-bit input of a ring");
+        }
+        e.usage |= 1 << col;
+        let int = e.comp != 9;
+        let (ty, suffix) = if int {
+            (self.s.t.i32, ".i32")
+        } else {
+            (self.s.t.f32, ".f32")
+        };
+        let entry = self.s.entry;
+        let args = [
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            self.s.m.i32(u32::from(vertex)),
+        ];
+        let v = self.s.op(
+            entry,
+            &format!("loadInput{suffix}"),
+            Attr::ReadNone,
+            ty,
+            4,
+            &args,
+        );
+        Ok(if int {
+            v
+        } else {
+            self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.i32)
+        })
+    }
+
     /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
     /// bits: a 9-bit vertex index and, above it, its edge flag (bits 9, 19
     /// and 29), which only the console's edge-flag rasterisation reads and
@@ -9213,6 +9545,8 @@ impl<'a> Lower<'a> {
                 }
                 Term::Ret
             }
+            // A merged ES half ends jumping to its GS half.
+            LaneExit::Indirect if self.x.native.stage == HwStage::Es => Term::Ret,
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
         let _ = Exit::End;

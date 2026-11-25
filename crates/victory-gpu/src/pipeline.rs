@@ -9,9 +9,11 @@
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
 //!
-//! shortcut: only vertex plus pixel pipelines from streams and compute
-//! pipelines get host pipelines; mesh, tessellation and geometry stages,
-//! and the plain graphics description, keep their containers only. The 32-byte
+//! shortcut: only pipelines from streams (vertex or mesh plus pixel, and
+//! vertex plus geometry plus pixel: the ES half of the vertex container,
+//! the GS half of the geometry one) and compute pipelines get host
+//! pipelines; tessellation stages and the plain graphics description keep
+//! their containers only. The 32-byte
 //! packet after the header stays zero: titles only copy it inline, which
 //! our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -61,8 +63,10 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Its translations, by [`Program`]: a vertex container runs as a
+    /// vertex shader in most pipelines and as an ES half in geometry ones.
     #[cfg(windows)]
-    translated: OnceLock<Option<Translated>>,
+    translated: [OnceLock<Option<Translated>>; 3],
     /// Whether its native program runs in 64-lane console waves
     /// (diagnostics: `VICTORY_SKIP_WAVE64`).
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -96,7 +100,7 @@ impl Shader {
             hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
             container: bytes.to_vec(),
             #[cfg(windows)]
-            translated: OnceLock::new(),
+            translated: Default::default(),
             #[cfg(all(windows, feature = "diagnostics"))]
             wave64: OnceLock::new(),
         }
@@ -110,15 +114,54 @@ pub(crate) struct Translated {
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
+/// Which program of a container a pipeline runs.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Program {
+    /// The vertex, pixel, compute or mesh program.
+    Main,
+    /// The ES half of a vertex container, in a pipeline with a geometry
+    /// stage.
+    Es,
+    /// The GS half of a geometry container.
+    Gs,
+}
+
+#[cfg(windows)]
+impl Program {
+    /// The program the stage named `stage` runs in a pipeline with
+    /// (`geometry`) or without a geometry stage.
+    pub(crate) fn of(stage: &str, geometry: bool) -> Program {
+        match (stage, geometry) {
+            ("vertex", true) => Program::Es,
+            ("geometry", _) => Program::Gs,
+            _ => Program::Main,
+        }
+    }
+
+    fn hw_stage(self) -> Option<victory_shader::HwStage> {
+        match self {
+            Program::Main => None,
+            Program::Es => Some(victory_shader::HwStage::Es),
+            Program::Gs => Some(victory_shader::HwStage::Gs),
+        }
+    }
+}
+
 #[cfg(windows)]
 impl Shader {
-    /// The translation, made on first use (or taken from the cache); a
-    /// shader that does not translate is logged once.
+    /// The translation of the container's own program (see [`Self::translated_as`]).
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
+        self.translated_as(Program::Main)
+    }
+
+    /// The translation of `program`, made on first use; one that does not
+    /// translate is logged once.
+    pub(crate) fn translated_as(&self, program: Program) -> Option<&Translated> {
+        self.translated[program as usize]
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let (done, cached) = translate(&self.container);
+                let (done, cached) = translate(&self.container, program.hw_stage());
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 // Diagnostics: `VICTORY_SHADER_DUMP=<dir>` keeps each
@@ -136,6 +179,7 @@ impl Shader {
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
+                        ?program,
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
@@ -147,6 +191,7 @@ impl Shader {
                     ),
                     Err(e) => tracing::warn!(
                         stage = self.stage,
+                        ?program,
                         hash = %self.hash,
                         error = %e,
                         cached,
@@ -159,6 +204,12 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+
+    /// Whether the translation of `program` was tried and failed.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn failed(&self, program: Program) -> bool {
+        matches!(self.translated[program as usize].get(), Some(None))
     }
 }
 
@@ -184,16 +235,21 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
     ((now.0 - then.0) / 10_000, (now.1 - then.1) / 10_000)
 }
 
-/// The translation, and whether it came from the cache.
+/// The translation, and whether it came from the cache: of the program
+/// `emit::translate` picks, or with `stage` of that hardware stage.
 #[cfg(windows)]
-fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
-    let (host, cached) = crate::shader_cache::host_shader(container);
-    (host.and_then(|host| with_resources(container, host)), cached)
+fn translate(
+    container: &[u8],
+    stage: Option<victory_shader::HwStage>,
+) -> (Result<Translated, String>, bool) {
+    let (host, cached) = crate::shader_cache::host_shader(container, stage);
+    (host.and_then(|host| with_resources(container, stage, host)), cached)
 }
 
 #[cfg(windows)]
 fn with_resources(
     container: &[u8],
+    stage: Option<victory_shader::HwStage>,
     host: victory_shader::emit::HostShader,
 ) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
@@ -202,11 +258,12 @@ fn with_resources(
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
-            .find(|p| {
-                matches!(
+            .find(|p| match stage {
+                Some(stage) => p.stage == stage,
+                None => matches!(
                     p.stage,
                     HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-                )
+                ),
             })
             .map(|p| p.used)
             .unwrap_or_default(),

@@ -151,6 +151,8 @@ pub struct Waterfall {
     pub loads: Vec<Site>,
 }
 
+const NOT_ROOT: &str = "an address in an SGPR that is no root parameter";
+
 /// Traces every descriptor and scalar address of `p`, which runs as
 /// `stage`, to the root parameters in `layout`. Fails on the first one it
 /// cannot trace. `lanes`, `p` as one lane runs it, tells which paths the
@@ -231,7 +233,16 @@ pub fn track(
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    let address = match t.smem_address(inst, base, *offset, soffset) {
+                        Ok(a) => a,
+                        // shortcut: a merged GS half loads its GSVS ring's LDS
+                        // base from a driver table at user data 0-1, no root
+                        // parameter; the translation keeps the rings
+                        // elsewhere, so the load is left untraced (its value
+                        // missing).
+                        Err(NOT_ROOT) if stage == HwStage::Gs => continue,
+                        Err(what) => return Err(fail(what)),
+                    };
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -975,7 +986,7 @@ impl<'a> Tracer<'a> {
             return "an address from a root parameter that is no address";
         }
         if self.inputs[v.0 as usize].is_some() {
-            return "an address in an SGPR that is no root parameter";
+            return NOT_ROOT;
         }
         if self
             .leaves(v)

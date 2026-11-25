@@ -58,10 +58,18 @@
 //!             u16 maximum primitives, u8 user SGPRs, u8 output topology
 //!             (2 triangles); code follows at E+0x45c
 //! record +0x4c u32 LDS bytes (`lds_byte_size`; mesh programs read it here)
+//! ES  as VS: the inputs' VGPRs are the merged stage's (5 above a VS's);
+//!     `param<n>` is the ESGS ring item's dwords 4n..4n+3
+//! GS  E+0x34  the 0x54-byte record of the copy shader (code offset and
+//!             size payload-relative, as any record), E+0x88 its stage data
+//!             (VS layout: the outputs, `param<n>` to a row of `OSG1`)
+//!     E+0x284 u32 maximum output vertices, E+0x28c u32 GSVS vertex size
+//!             in dwords (the copy shader reads vertex n at n times it)
 //! ```
 //!
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
-//! Merged stages keep their stage data in another layout (not read).
+//! Other merged stages (LS, HS) keep their stage data in another layout
+//! (not read).
 //!
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
@@ -132,6 +140,10 @@ const PACKET_RSRC1: usize = 0x14;
 const PACKET_RSRC2: usize = 0x18;
 const FSPX_RECORDS: usize = 0x18;
 const FSPX_RECORD: usize = 32;
+const GS_COPY_RECORD: usize = 0x34;
+const GS_COPY_DATA: usize = 0x88;
+const GS_MAX_VERTICES: usize = 0x284;
+const GS_VERTEX_DWORDS: usize = 0x28c;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -180,8 +192,35 @@ impl NativeProgram {
     /// The code with each render target's export patched for its full
     /// 32-bit format, so exports carry the shader's values unconverted (as
     /// the console does at pipeline creation for that format).
+    ///
+    /// A merged ES or GS half first limits EXEC to the lanes the hardware
+    /// filled (`s_bfm_b64 exec` of a lane count from s3, `s_cselect_b64
+    /// exec, -1, exec` for a full wave). On the host every invocation is one
+    /// vertex or primitive, so those writes become `s_nop` and EXEC stays as
+    /// the program entered.
     pub fn patched_code(&self) -> Vec<u8> {
         let mut code = self.code.clone();
+        if matches!(self.stage, HwStage::Es | HwStage::Gs)
+            && let Ok(list) = crate::gfx10::decode(&self.code)
+        {
+            const S_NOP: u32 = 0xBF80_0000;
+            for inst in list.iter().take(16) {
+                let writes_exec = matches!(
+                    inst.fields(self.wave64),
+                    crate::gfx10::Fields::Sop {
+                        dst: Some(crate::gfx10::Operand::Scalar { code: 126, .. }),
+                        ..
+                    }
+                );
+                let name = inst.name().unwrap_or("");
+                if writes_exec
+                    && inst.words.len() == 1
+                    && matches!(name, "s_bfm_b64" | "s_cselect_b64")
+                {
+                    code[inst.offset..inst.offset + 4].copy_from_slice(&S_NOP.to_le_bytes());
+                }
+            }
+        }
         if let StageIo::Ps { patches, .. } = &self.io {
             for p in patches {
                 let at = p.offset as usize * 4;
@@ -280,6 +319,22 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    Gs(GeometryIo),
+}
+
+/// A geometry program on the legacy (non-NGG) path: it reads its input
+/// vertices from the ESGS ring and writes the vertices it emits to the GSVS
+/// ring, from which the copy shader (a small VS) exports them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeometryIo {
+    /// The copy shader's machine code: GSVS dwords (or constants) to
+    /// `exp pos0` and `exp param<n>`.
+    pub copy_code: Vec<u8>,
+    /// The copy shader's outputs: `param<n>` to a row of `OSG1`.
+    pub copy_outputs: Vec<VsOutput>,
+    pub max_vertices: u32,
+    /// GSVS dwords per emitted vertex.
+    pub vertex_dwords: u32,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -671,6 +726,10 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+            // Stage data that does not parse leaves the program without I/O
+            // rather than failing the container's other programs.
+            HwStage::Es => vs_io(stage_data).unwrap_or_default(),
+            HwStage::Gs => gs_io(payload, stage_data).unwrap_or_default(),
             _ => StageIo::None,
         };
         out.push(NativeProgram {
@@ -769,6 +828,32 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
         })
         .collect();
     Ok(StageIo::Vs { inputs, outputs })
+}
+
+fn gs_io(payload: &[u8], data: &[u8]) -> Result<StageIo, ShaderError> {
+    let record = data
+        .get(GS_COPY_RECORD..GS_COPY_RECORD + RECORD_SIZE as usize)
+        .ok_or(Malformed("stage data out of bounds"))?;
+    let copy_code = bytes(payload, u64_at(record, 0)?, u64_at(record, 8)?)
+        .ok_or(Malformed("copy shader out of bounds"))?
+        .to_vec();
+    let StageIo::Vs { outputs, .. } = vs_io(data.get(GS_COPY_DATA..).unwrap_or_default())? else {
+        unreachable!()
+    };
+    let max_vertices = u32_at(data, GS_MAX_VERTICES)?;
+    let vertex_dwords = u32_at(data, GS_VERTEX_DWORDS)?;
+    if !(1..=1024).contains(&max_vertices)
+        || !(4..=128).contains(&vertex_dwords)
+        || max_vertices * vertex_dwords > 1024
+    {
+        return Err(Malformed("implausible geometry output sizes"));
+    }
+    Ok(StageIo::Gs(GeometryIo {
+        copy_code,
+        copy_outputs: outputs,
+        max_vertices,
+        vertex_dwords,
+    }))
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {

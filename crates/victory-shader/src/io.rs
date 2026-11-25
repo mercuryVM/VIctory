@@ -30,11 +30,21 @@
 //! each with an edge flag above it, bit 31 culls); `param` entries with
 //! bit 7 are per-primitive outputs. One lane sends the output counts
 //! (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices | primitives << 12).
+//!
+//! Merged ES and GS halves (the legacy geometry path, rings in LDS) do not
+//! export. The ES half writes each vertex's outputs to its own item of the
+//! ESGS ring (`param<n>` at dwords 4n..4n+3); the GS half reads the items of
+//! its input vertices (v0 bits 0-15 and 16-31, v1 bits 0-15: their dword
+//! offsets) and writes each vertex it emits to its own area of the GSVS
+//! ring before `s_sendmsg` GS_OP_EMIT; the copy shader then exports GSVS
+//! dwords (or constants) as `pos0` and `param<n>`. [`Io::rings`] says what
+//! each LDS access of such a program is, from how its address is computed;
+//! [`Io::copy`] what each copy-shader export carries.
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Inst, Program, Reg, Value};
-use crate::native::{HwStage, NativeProgram, PsInput, StageIo, Usage};
+use crate::native::{GeometryIo, HwStage, NativeProgram, PsInput, StageIo, Usage};
 use crate::resource::Site;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +214,36 @@ pub struct Io {
     /// root parameter's, then the primitive mask and the ordered-section
     /// (POPS) collision id, as every pixel program of the title reads them).
     pub initialized_sgprs: Option<u8>,
+    /// ES and GS: the LDS accesses that are ring accesses.
+    pub rings: Vec<(Site, Ring)>,
+    /// GS: the copy shader's exports.
+    pub copy: Vec<CopyExport>,
+}
+
+/// An LDS access of a merged ES or GS half, by its address (the byte
+/// offsets of the instruction come on top).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ring {
+    /// GS: input vertex `vertex`'s ESGS item, from byte `byte`.
+    Vertex { vertex: u8, byte: u32 },
+    /// The lane's own area from byte `byte`: its ESGS item (ES), its GSVS
+    /// vertices (GS, vertex n at n times the vertex size).
+    Own { byte: u32 },
+}
+
+/// What one copy-shader export carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyExport {
+    /// `Position(0)` or `Param`.
+    pub target: Target,
+    pub values: [Option<Copied>; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Copied {
+    /// Dword n of the emitted vertex in the GSVS ring.
+    Gsvs(u32),
+    Constant(u32),
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
@@ -256,6 +296,22 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             loaded.extend(info.map(|s| (Reg::S(s), Input::GroupInfo)));
             (loaded, &[][..], &[][..])
         }
+        // shortcut (unverified): a merged ES half gets a VS's system VGPRs
+        // 5 higher (vertex id v5, instance id v8), as its attributes are.
+        (StageIo::Vs { inputs, .. }, HwStage::Es) => {
+            let mut loaded = vec![(Reg::V(5), Input::VertexId), (Reg::V(8), Input::InstanceId)];
+            for i in inputs {
+                for channel in (0..4).filter(|c| i.mask >> c & 1 != 0) {
+                    let input = Input::Attribute {
+                        row: i.row,
+                        channel,
+                    };
+                    loaded.push((Reg::V(i.vgpr + channel), input));
+                }
+            }
+            (loaded, &[][..], &[][..])
+        }
+        (StageIo::Gs(_), HwStage::Gs) => (Vec::new(), &[][..], &[][..]),
         (StageIo::Ms(ms), HwStage::Ms) => {
             let group = p.inputs.iter().find(|i| i.0 == Reg::V(5)).map(|i| i.1);
             // The group input holds the same value in every lane only as the
@@ -323,6 +379,12 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         },
         ..Io::default()
     };
+    if matches!(native.stage, HwStage::Es | HwStage::Gs) {
+        io.rings = rings(p);
+    }
+    if let StageIo::Gs(gs) = &native.io {
+        io.copy = copy_exports(gs, native.wave64)?;
+    }
     let defs: std::collections::HashMap<Value, Site> = p
         .blocks
         .iter()
@@ -638,6 +700,314 @@ impl Halves<'_> {
         }
         Ok(())
     }
+}
+
+/// What a value of a merged ES or GS half is, as far as its ring
+/// addresses need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sym {
+    K(u32),
+    /// A VGPR as the hardware set it.
+    Input(u8),
+    /// Bits 0-15 (`false`) or 16-31 of an input VGPR.
+    Half(u8, bool),
+    /// An input VGPR shifted left by 2, both halves.
+    Shl2(u8),
+    /// Byte address of input vertex k's ESGS item, plus bytes.
+    Vertex(u8, u32),
+    MbcntLo,
+    /// The lane's index in the wave (`v_mbcnt` of all lanes).
+    Lane,
+    /// The lane index times a stride.
+    LaneTimes,
+    /// The lane's own ring area, plus bytes.
+    Own(u32),
+    /// The same in every lane (an SGPR's value).
+    Uniform,
+    Unknown,
+}
+
+/// The ring accesses of a merged ES or GS half: LDS reads and writes whose
+/// address is an input vertex's item or the lane's own area plus a
+/// constant. Others are left out (the emitter refuses them).
+fn rings(p: &Program) -> Vec<(Site, Ring)> {
+    let mut defs = std::collections::HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            for w in &inst.writes {
+                defs.insert(w.1, (b, i));
+            }
+        }
+    }
+    let mut syms = Syms {
+        p,
+        defs,
+        memo: std::collections::HashMap::new(),
+    };
+    let mut out = Vec::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            let Fields::Ds {
+                addr: Some(Operand::Vector { reg, .. }),
+                gds: false,
+                ..
+            } = &inst.fields
+            else {
+                continue;
+            };
+            let name = inst.name();
+            if !(name.starts_with("ds_read") || name.starts_with("ds_write")) {
+                continue;
+            }
+            let ring = match inst.read(Reg::V(*reg)).map(|v| syms.value(v)) {
+                Some(Sym::Vertex(vertex, byte)) => Ring::Vertex { vertex, byte },
+                Some(Sym::Own(byte)) => Ring::Own { byte },
+                _ => continue,
+            };
+            out.push(((b, i), ring));
+        }
+    }
+    out
+}
+
+struct Syms<'a> {
+    p: &'a Program,
+    defs: std::collections::HashMap<Value, Site>,
+    memo: std::collections::HashMap<Value, Sym>,
+}
+
+impl Syms<'_> {
+    fn value(&mut self, v: Value) -> Sym {
+        if let Some(&s) = self.memo.get(&v) {
+            return s;
+        }
+        // Guards against cycles (phis are Unknown anyway).
+        self.memo.insert(v, Sym::Unknown);
+        let s = self.compute(v);
+        self.memo.insert(v, s);
+        s
+    }
+
+    fn operand(&mut self, inst: &Inst, op: &Operand) -> Sym {
+        match *op {
+            Operand::Const(c) => crate::resource::inline(c).map_or(Sym::Unknown, Sym::K),
+            Operand::Literal(k) => Sym::K(k),
+            Operand::Vector { reg, .. } => inst
+                .read(Reg::V(reg))
+                .map_or(Sym::Unknown, |v| self.value(v)),
+            Operand::Scalar { code, .. } => match inst.read(Reg::S(code)) {
+                Some(v) => match self.value(v) {
+                    k @ Sym::K(_) => k,
+                    _ => Sym::Uniform,
+                },
+                None => Sym::Uniform,
+            },
+            Operand::Attr { .. } => Sym::Unknown,
+        }
+    }
+
+    fn compute(&mut self, v: Value) -> Sym {
+        if let Some(&(reg, _)) = self.p.inputs.iter().find(|i| i.1 == v) {
+            return match reg {
+                Reg::V(n) => Sym::Input(n),
+                _ => Sym::Uniform,
+            };
+        }
+        let Some(&(b, i)) = self.defs.get(&v) else {
+            return Sym::Unknown;
+        };
+        let p = self.p;
+        let inst = &p.blocks[b].insts[i];
+        let name = inst.name();
+        let src: Vec<Operand> = match &inst.fields {
+            Fields::Sop { src, .. } => {
+                return match (name, src.first()) {
+                    ("s_mov_b32", Some(op)) => self.operand(inst, &op.clone()),
+                    _ => Sym::Uniform,
+                };
+            }
+            Fields::Valu(f) if f.dpp.is_none() => f.src.clone(),
+            _ => return Sym::Unknown,
+        };
+        let sel = |k: usize| match &inst.fields {
+            Fields::Valu(f) => f.sdwa.map_or(6, |s| s.src_sel[k.min(1)]),
+            _ => 6,
+        };
+        let ops: Vec<Sym> = src.iter().map(|o| self.operand(inst, o)).collect();
+        let at = |k: usize| ops.get(k).copied().unwrap_or(Sym::Unknown);
+        // The vertex whose offset is in half `hi` of input VGPR `r`.
+        let vertex = |r: u8, hi: bool| match r {
+            0 | 1 => Sym::Vertex(2 * r + u8::from(hi), 0),
+            _ => Sym::Unknown,
+        };
+        use Sym::*;
+        match name {
+            "v_mov_b32" => at(0),
+            "v_mbcnt_lo_u32_b32" if at(0) == K(u32::MAX) && at(1) == K(0) => MbcntLo,
+            "v_mbcnt_hi_u32_b32" if at(0) == K(u32::MAX) && at(1) == MbcntLo => Lane,
+            "v_lshlrev_b32" => match (at(0), at(1), sel(1)) {
+                (K(2), Input(r), 4) => vertex(r, false),
+                (K(2), Input(r), 5) => vertex(r, true),
+                (K(2), Input(r), 6) => Shl2(r),
+                (K(2), Half(r, hi), 6) => vertex(r, hi),
+                (K(_), Lane, 6) => LaneTimes,
+                _ => Unknown,
+            },
+            "v_lshrrev_b32" => match (at(0), at(1)) {
+                (K(16), Input(r)) => Half(r, true),
+                _ => Unknown,
+            },
+            "v_and_b32" => match (at(0), at(1)) {
+                (K(0x3FFFC), Shl2(r)) | (Shl2(r), K(0x3FFFC)) => vertex(r, false),
+                (K(0xFFFF), Input(r)) | (Input(r), K(0xFFFF)) => Half(r, false),
+                _ => Unknown,
+            },
+            "v_bfe_u32" => match (at(0), at(1), at(2)) {
+                (Input(r), K(0), K(16)) => Half(r, false),
+                (Input(r), K(16), K(16)) => Half(r, true),
+                _ => Unknown,
+            },
+            "v_mul_u32_u24" | "v_mul_lo_u32" => match (at(0), at(1)) {
+                (K(4), Half(r, hi)) | (Half(r, hi), K(4)) => vertex(r, hi),
+                (K(_), Lane) | (Lane, K(_)) => LaneTimes,
+                _ => Unknown,
+            },
+            "v_mad_u32_u24" => match (at(0), at(1), at(2)) {
+                (K(_), Lane, c) | (Lane, K(_), c) => match c {
+                    K(k) => Own(k),
+                    Uniform => Own(0),
+                    _ => Unknown,
+                },
+                _ => Unknown,
+            },
+            "v_lshl_add_u32" => match (at(0), at(1), at(2)) {
+                (Lane, K(_), K(k)) => Own(k),
+                (Lane, K(_), Uniform) => Own(0),
+                (Half(r, hi), K(2), K(k)) => match vertex(r, hi) {
+                    Vertex(n, _) => Vertex(n, k),
+                    _ => Unknown,
+                },
+                _ => Unknown,
+            },
+            "v_add_nc_u32" | "v_add_u32" | "v_add_co_u32" => match (at(0), at(1)) {
+                (K(a), K(b)) => K(a.wrapping_add(b)),
+                (Vertex(n, o), K(k)) | (K(k), Vertex(n, o)) => Vertex(n, o.wrapping_add(k)),
+                (Own(o), K(k)) | (K(k), Own(o)) => Own(o.wrapping_add(k)),
+                (Own(o), Uniform) | (Uniform, Own(o)) => Own(o),
+                (LaneTimes, Uniform) | (Uniform, LaneTimes) => Own(0),
+                (LaneTimes, K(k)) | (K(k), LaneTimes) => Own(k),
+                _ => Unknown,
+            },
+            _ => Unknown,
+        }
+    }
+}
+
+/// The copy shader's exports: which GSVS dword (or constant) each channel
+/// carries, followed through its LDS reads and moves.
+fn copy_exports(gs: &GeometryIo, wave64: bool) -> Result<Vec<CopyExport>, ShaderError> {
+    let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
+    let mut vgpr: [Option<Copied>; 256] = [None; 256];
+    let mut out = Vec::new();
+    for inst in crate::gfx10::decode(&gs.copy_code)? {
+        let name = inst.name().unwrap_or("");
+        if name == "s_endpgm" {
+            break;
+        }
+        match inst.fields(wave64) {
+            Fields::Ds {
+                dst: Some(Operand::Vector { reg, .. }),
+                offset0,
+                offset1,
+                ..
+            } if name.starts_with("ds_read") => {
+                let w: u32 = match name.rsplit('_').next() {
+                    Some("b64") => 2,
+                    Some("b96") => 3,
+                    Some("b128") => 4,
+                    _ => 1,
+                };
+                let starts = if name.starts_with("ds_read2_") {
+                    vec![u32::from(offset0) * w, u32::from(offset1) * w]
+                } else if matches!(
+                    name,
+                    "ds_read_b32" | "ds_read_b64" | "ds_read_b96" | "ds_read_b128"
+                ) {
+                    let bytes = u32::from(offset0) | u32::from(offset1) << 8;
+                    if bytes % 4 != 0 {
+                        return Err(unsupported(inst.offset, "a copy shader read off dwords"));
+                    }
+                    vec![bytes / 4]
+                } else {
+                    return Err(unsupported(inst.offset, "a copy shader LDS operation"));
+                };
+                let mut r = usize::from(reg);
+                for d in starts {
+                    for k in 0..w {
+                        *vgpr
+                            .get_mut(r)
+                            .ok_or(unsupported(inst.offset, "a copy shader read"))? =
+                            Some(Copied::Gsvs(d + k));
+                        r += 1;
+                    }
+                }
+            }
+            Fields::Valu(f) => {
+                let Some(Operand::Vector { reg, .. }) = f.dst else {
+                    continue;
+                };
+                let plain = f.sdwa.is_none() && f.dpp.is_none();
+                let value = match (name, f.src.first()) {
+                    ("v_mov_b32", Some(&Operand::Const(c))) if plain => {
+                        crate::resource::inline(c).map(Copied::Constant)
+                    }
+                    ("v_mov_b32", Some(&Operand::Literal(k))) if plain => Some(Copied::Constant(k)),
+                    ("v_mov_b32", Some(&Operand::Vector { reg: r, .. })) if plain => {
+                        vgpr[usize::from(r)]
+                    }
+                    _ => None,
+                };
+                vgpr[usize::from(reg)] = value;
+            }
+            Fields::Exp {
+                target, src, compr, ..
+            } => {
+                if compr {
+                    return Err(unsupported(inst.offset, "a compressed copy shader export"));
+                }
+                let target = match target {
+                    12 => Target::Position(0),
+                    t @ 32..=63 => {
+                        let o = gs.copy_outputs.iter().find(|o| o.param == t - 32).ok_or(
+                            unsupported(
+                                inst.offset,
+                                "a copy shader export the stage data does not list",
+                            ),
+                        )?;
+                        Target::Param {
+                            usage: o.usage,
+                            row: o.row,
+                        }
+                    }
+                    _ => {
+                        return Err(unsupported(inst.offset, "a copy shader export target"));
+                    }
+                };
+                let mut values = [None; 4];
+                for (c, s) in src.iter().enumerate() {
+                    if let Some(Operand::Vector { reg, .. }) = s {
+                        values[c] = Some(vgpr[usize::from(*reg)].ok_or(unsupported(
+                            inst.offset,
+                            "a copy shader export of a computed value",
+                        ))?);
+                    }
+                }
+                out.push(CopyExport { target, values });
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

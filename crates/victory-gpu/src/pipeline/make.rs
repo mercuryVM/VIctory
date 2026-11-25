@@ -110,10 +110,11 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
         Some(Some(_)) => None,
         None => Some("being made".into()),
         Some(None) => {
+            let geometry = p.shaders.iter().any(|s| s.stage == "geometry");
             let failed: Vec<String> = p
                 .shaders
                 .iter()
-                .filter(|s| matches!(s.translated.get(), Some(None)))
+                .filter(|s| s.failed(super::Program::of(s.stage, geometry)))
                 .map(|s| format!("{} {}", s.stage, s.hash))
                 .collect();
             Some(if failed.is_empty() {

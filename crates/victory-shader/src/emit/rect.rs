@@ -24,7 +24,12 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
         e.usage = (1 << e.cols) - 1;
     }
     let mut s = Shader::new(false);
-    s.gs = Some(6);
+    // Triangles in, triangle strips of at most 6 vertices out.
+    s.gs = Some(super::shader::Geometry {
+        max_vertices: 6,
+        input: 3,
+        topology: 5,
+    });
     let b = s.entry;
     // Corner k's values, element by element, component by component.
     let mut corners: Vec<Vec<Vec<super::bitcode::V>>> = Vec::new();
