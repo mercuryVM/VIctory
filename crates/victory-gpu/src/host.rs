@@ -1130,7 +1130,8 @@ impl Host {
                 .map(|chunk| &lists[chunk[0].0..chunk[chunk.len() - 1].1])
                 .collect()
         };
-        let mut removed_in = None;
+        // The final device check already identifies the run in a single-run submission.
+        let mut removed_in = (runs.len() == 1).then_some(0);
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1153,7 +1154,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
-            if timing() && groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -1163,7 +1164,10 @@ impl Host {
                 }
             }
             // SAFETY: a plain query.
-            if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            if removed_in.is_none()
+                && groups.len() == runs.len()
+                && unsafe { self.device.GetDeviceRemovedReason() }.is_err()
+            {
                 removed_in = Some(i);
             }
             let _ = (i, started);
