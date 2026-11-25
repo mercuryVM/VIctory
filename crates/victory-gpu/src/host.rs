@@ -686,6 +686,20 @@ fn timing() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
 }
 
+/// Runs allowed in one `ExecuteCommandLists` (`VICTORY_SUBMIT_MAX_RUNS`,
+/// default: all). Splitting keeps a heavy batch from stalling the device
+/// past the host's device-removed threshold.
+fn max_submit_runs() -> usize {
+    static RUNS: OnceLock<usize> = OnceLock::new();
+    *RUNS.get_or_init(|| {
+        std::env::var("VICTORY_SUBMIT_MAX_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(usize::MAX)
+    })
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
@@ -1029,19 +1043,36 @@ impl Host {
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
+        // Per-run list ranges: each run contributes a prelude plus its list.
+        let bounds: Vec<(usize, usize)> = firsts
+            .iter()
+            .zip(firsts.iter().skip(1).chain([&lists.len()]))
+            .map(|(&a, &b)| (a, b))
+            .collect();
+        // `VICTORY_SUBMIT_MAX_RUNS`: cap runs per ExecuteCommandLists so one
+        // batch cannot stall the device past the host's reset threshold.
+        let max_runs = max_submit_runs();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
+            bounds.iter().map(|&(a, b)| &lists[a..b]).collect()
+        } else if bounds.is_empty() {
             vec![&lists[..]]
+        } else {
+            bounds
+                .chunks(max_runs)
+                .map(|chunk| &lists[chunk[0].0..chunk[chunk.len() - 1].1])
+                .collect()
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if bounds.is_empty() {
+            vec![&lists[..]]
+        } else {
+            bounds
+                .chunks(max_runs)
+                .map(|chunk| &lists[chunk[0].0..chunk[chunk.len() - 1].1])
+                .collect()
+        };
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -1065,7 +1096,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if timing() && groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
