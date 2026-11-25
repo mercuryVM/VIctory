@@ -1672,12 +1672,23 @@ impl State {
         // Bounded first: the clamp binds a compute pipeline of its own.
         let (threads, hash) = crate::pipeline::group_of(self.pipeline as This);
         let tag = crate::indirect::tag(&hash);
+        // Ray tracing counts many times over (`crate::indirect`).
+        let weight = match crate::pipeline::host_pipeline(self.pipeline as This) {
+            Some(p)
+                if kind == DISPATCH
+                    && p.compute
+                    && p.stages.iter().any(|s| s.shader.ray_traces()) =>
+            {
+                crate::indirect::ray_weight()
+            }
+            _ => 1,
+        };
         if !crate::indirect::bound(
             list,
             &args.buffer,
             args.gpu(arguments),
             (kind, stride, max),
-            (threads, tag),
+            (threads, tag, weight),
             folded.as_ref().map(|((buffer, gpu, _), _)| (buffer, *gpu)),
         ) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");

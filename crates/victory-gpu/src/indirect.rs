@@ -11,6 +11,16 @@
 //! so a list of thousands of garbage records cannot run for seconds
 //! either.
 //!
+//! A dispatch of a program that intersects rays with a BVH counts its
+//! threads [`ray_weight`] times (`VICTORY_RAY_WEIGHT`, default 64): its
+//! traversal loops, emulated node by node and bounded only by the loop
+//! limit, cost hundreds of other threads each, and one full-screen
+//! dispatch of them whose rays never end (nodes the host has not mirrored)
+//! runs until the driver resets the device. Each such record's arguments,
+//! as the title wrote them, is logged with those it was left
+//! ([`take_log`]: "ray-tracing indirect dispatch as the title asked" when
+//! it ran as asked, else "indirect arguments clamped").
+//!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^16 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
@@ -29,14 +39,18 @@ use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=8, b0), UAV(u0), UAV(u1), UAV(u2)"
+// threads: per group, as the program has them; weight: how many times each
+// counts (ray tracing, `ray_weight`); tag: the program's, logged with its
+// records.
 cbuffer Record : register(b0) {
-    uint kind; uint stride; uint records; uint threads; uint tag; uint folding; uint2 unused;
+    uint kind; uint stride; uint records; uint threads; uint tag; uint folding; uint weight; uint unused;
 };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads), at byte 0: past the
 // budget, records run empty. At byte 4 the records this list's clamps
-// reduced, the first LOGGED of them from byte 16 on (8 words each: tag,
-// kind, the arguments read, those left), read back by the host.
+// reduced (and ray-tracing ones, reduced or not), the first LOGGED of them
+// from byte 16 on (8 words each: tag, kind, the arguments read, those
+// left), read back by the host.
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
@@ -50,8 +64,15 @@ RWByteAddressBuffer fold : register(u2);
 static const uint ROW = 65535;
 static const uint FOLDED = 1u << 22;
 static const uint LOGGED = 31;
+// The cost of `g` groups: their threads, `weight` times over; one group
+// count past the whole budget on its own costs past it (no 32-bit overflow).
+uint groups_cost(uint3 g) {
+    uint groups = g.x * g.y * g.z;
+    uint per = max(threads, 1u) * max(weight, 1u);
+    return groups > BUDGET / per ? BUDGET + 1 : groups * per;
+}
 void note(uint3 raw, uint3 left) {
-    if (all(raw == left)) return;
+    if (all(raw == left) && weight <= 1) return;
     uint n;
     budget.InterlockedAdd(4, 1, n);
     if (n < LOGGED) {
@@ -94,7 +115,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             fold.Store4(16, uint4(0, g));
             left = g;
         }
-        cost = left.x * left.y * left.z * max(threads, 1u);
+        cost = groups_cost(left);
         uint before;
         budget.InterlockedAdd(0, cost, before);
         if (before >= BUDGET || before + cost > BUDGET) {
@@ -112,20 +133,21 @@ void main(uint3 id : SV_DispatchThreadID) {
             g = uint3(0, 0, 0);
         }
         // Threads per group as the program has them.
-        cost = g.x * g.y * g.z * max(threads, 1u);
+        cost = groups_cost(g);
         left = g;
         args.Store3(at, g);
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         raw = args.Load3(at);
         uint3 g = uint3(min(raw.x, GROUPS), min(raw.y, 1u), min(raw.z, 1u));
-        cost = g.x * g.y * g.z * max(threads, 1u);
+        cost = groups_cost(g);
         left = g;
         args.Store3(at, g);
     }
     uint before;
     budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
+    bool empty = before >= BUDGET || before + cost > BUDGET;
+    if (empty) {
         // Draws keep their layout with no vertices; groups become zero.
         args.Store(at, 0);
         left.x = 0;
@@ -206,7 +228,9 @@ fn make() -> windows::core::Result<Clamp> {
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
+/// `buffer`, and leaves the buffer ready to be read as arguments. A
+/// dispatch's threads count `weight` times; with a weight over 1 (ray
+/// tracing) its records are logged under `tag` ([`take_log`]). Replaces
 /// the list's compute root signature and pipeline (callers bind theirs
 /// after). False if the clamp is not available.
 pub(crate) fn bound(
@@ -214,7 +238,7 @@ pub(crate) fn bound(
     buffer: &ID3D12Resource,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
-    (threads, tag): (u32, u32),
+    (threads, tag, weight): (u32, u32, u32),
     fold: Option<(&ID3D12Resource, u64)>,
 ) -> bool {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
@@ -231,7 +255,7 @@ pub(crate) fn bound(
         (0, _) => 128,
         (n, _) => n,
     };
-    let constants = [kind, stride, records, threads, tag, u32::from(fold.is_some()), 0, 0];
+    let constants = [kind, stride, records, threads, tag, u32::from(fold.is_some()), weight, 0];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -278,6 +302,19 @@ pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
+}
+
+/// How many times a ray-tracing dispatch's threads count against the
+/// list's budget: `VICTORY_RAY_WEIGHT` (1 counts them as other threads),
+/// else 64.
+pub(crate) fn ray_weight() -> u32 {
+    static WEIGHT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *WEIGHT.get_or_init(|| {
+        std::env::var("VICTORY_RAY_WEIGHT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(64, |w| w.clamp(1, 1 << 16))
+    })
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -343,8 +380,18 @@ pub(crate) fn take_log(words: &[u32]) {
         if LINES.fetch_add(1, Ordering::Relaxed) >= 300 {
             return;
         }
+        let shader = tags.get(tag as usize).map_or("?", String::as_str);
+        if r[2..5] == r[5..8] {
+            // Logged unreduced: a ray-tracing dispatch, as the title asked.
+            tracing::info!(
+                shader,
+                read = ?[r[2], r[3], r[4]],
+                "ray-tracing indirect dispatch as the title asked"
+            );
+            continue;
+        }
         tracing::info!(
-            shader = tags.get(tag as usize).map_or("?", String::as_str),
+            shader,
             kind,
             read = ?[r[2], r[3], r[4]],
             left = ?[r[5], r[6], r[7]],
