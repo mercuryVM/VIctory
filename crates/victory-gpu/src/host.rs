@@ -308,6 +308,12 @@ mod tests {
     }
 }
 
+/// Bytes of a list's fold buffer per indirect execution: the record count,
+/// then up to two records of a root constant and three group counts.
+pub(crate) const FOLD_REGION: u32 = 64;
+/// Fold regions per list (folded indirect dispatches between resets).
+const FOLD_REGIONS: u32 = 1024;
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -338,6 +344,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Where the argument clamp writes the records of folded dispatches
+    /// (`crate::indirect`), [`FOLD_REGION`] bytes per execution.
+    fold: OnceLock<Option<ID3D12Resource>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -459,6 +468,8 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Fold regions taken since the reset ([`HostList::fold_region`]).
+    fold_regions: u32,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
@@ -571,6 +582,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                fold: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1479,6 +1491,25 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// A region of the list's fold buffer for one indirect execution until
+    /// the list is reset: the buffer, the region's host address and its
+    /// offset; none when the list has used them all.
+    pub(crate) fn fold_region(&self) -> Option<(ID3D12Resource, u64, u64)> {
+        let buffer = self
+            .fold
+            .get_or_init(|| Some(host()?.shared_buffer(u64::from(FOLD_REGION * FOLD_REGIONS))?.0))
+            .as_ref()?;
+        let mut deferred = self.deferred();
+        if deferred.fold_regions >= FOLD_REGIONS {
+            return None;
+        }
+        let offset = u64::from(deferred.fold_regions * FOLD_REGION);
+        deferred.fold_regions += 1;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + offset;
+        Some((buffer.clone(), gpu, offset))
     }
 
     /// Keeps `object` alive until the list is reset.

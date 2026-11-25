@@ -28,9 +28,9 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=8, b0), UAV(u0), UAV(u1), UAV(u2)"
 cbuffer Record : register(b0) {
-    uint kind; uint stride; uint records; uint threads; uint tag; uint3 unused;
+    uint kind; uint stride; uint records; uint threads; uint tag; uint folding; uint2 unused;
 };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads), at byte 0: past the
@@ -41,6 +41,14 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 16;
+// A one-record dispatch run folded (`folding`): the record count at byte 0
+// of `fold`, then up to two records (the fold root constant, then x, y, z)
+// from byte 16 on. Up to FOLDED groups of a one-dimensional dispatch run,
+// as rows of ROW groups along z and one more dispatch for the rest (the
+// translated shader's group is the constant minus one plus x plus z rows).
+RWByteAddressBuffer fold : register(u2);
+static const uint ROW = 65535;
+static const uint FOLDED = 1u << 22;
 static const uint LOGGED = 31;
 void note(uint3 raw, uint3 left) {
     if (all(raw == left)) return;
@@ -68,6 +76,34 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = count * instances;
         left = uint3(count, instances, 0);
         args.Store2(at, left.xy);
+    } else if (kind == 2 && folding != 0) {
+        raw = args.Load3(at);
+        uint count = 1;
+        if (raw.y == 1 && raw.z == 1 && raw.x > ROW && raw.x <= FOLDED) {
+            uint rows = raw.x / ROW;
+            uint rest = raw.x - rows * ROW;
+            fold.Store4(16, uint4(1, ROW, 1, rows));
+            fold.Store4(32, uint4(rows * ROW + 1, rest, 1, 1));
+            count = rest != 0 ? 2 : 1;
+            left = raw;
+        } else {
+            uint3 g = min(raw, uint3(65535, 65535, 65535));
+            if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+                g = uint3(0, 0, 0);
+            }
+            fold.Store4(16, uint4(0, g));
+            left = g;
+        }
+        cost = left.x * left.y * left.z * max(threads, 1u);
+        uint before;
+        budget.InterlockedAdd(0, cost, before);
+        if (before >= BUDGET || before + cost > BUDGET) {
+            count = 0;
+            left.x = 0;
+        }
+        fold.Store(0, count);
+        note(raw, left);
+        return;
     } else if (kind == 2) {
         raw = args.Load3(at);
         uint3 g = min(raw, uint3(65535, 65535, 65535));
@@ -179,6 +215,7 @@ pub(crate) fn bound(
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
     (threads, tag): (u32, u32),
+    fold: Option<(&ID3D12Resource, u64)>,
 ) -> bool {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
@@ -194,7 +231,7 @@ pub(crate) fn bound(
         (0, _) => 128,
         (n, _) => n,
     };
-    let constants = [kind, stride, records, threads, tag, 0, 0, 0];
+    let constants = [kind, stride, records, threads, tag, u32::from(fold.is_some()), 0, 0];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -205,6 +242,8 @@ pub(crate) fn bound(
         l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
+        // Unused unless folding: the budget word stands in.
+        l.SetComputeRootUnorderedAccessView(3, fold.map_or(budget, |f| f.1));
         l.Dispatch(records.div_ceil(64), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
@@ -214,6 +253,13 @@ pub(crate) fn bound(
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             ),
         ]);
+        if let Some((f, _)) = fold {
+            l.ResourceBarrier(&[transition(
+                f,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
     }
     true
 }
@@ -239,6 +285,11 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
         },
     }
+}
+
+/// [`done`] for a fold buffer [`bound`] wrote records to.
+pub(crate) fn done_fold(list: &HostList, buffer: &ID3D12Resource) {
+    done(list, buffer);
 }
 
 /// Program hashes by the tag the clamp logs them under.

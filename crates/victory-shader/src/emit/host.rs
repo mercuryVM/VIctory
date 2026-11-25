@@ -62,6 +62,9 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Root signatures made with a group fold parameter, and its index.
+static FOLDS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -175,6 +178,21 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        // A compute stage's group fold (`GROUP_FOLD_ROW`), last.
+        let fold = stages.iter().any(|(s, _)| s.stage == crate::native::HwStage::Cs).then(|| {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 1,
+                        RegisterSpace: super::USER_DATA_SPACE,
+                        Num32BitValues: 1,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+            params.len() as u32 - 1
+        });
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
@@ -221,8 +239,29 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
+            let made: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes).map_err(err)?;
+            if let Some(param) = fold {
+                FOLDS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((made.as_raw() as usize, param));
+            }
+            Ok(made)
         }
+    }
+
+    /// The root parameter of the group fold in a root signature
+    /// [`Host::root_signature_for`] made for a compute stage: 0 unless a
+    /// dispatch's roots set it.
+    pub fn fold_param(root: &ID3D12RootSignature) -> Option<u32> {
+        let key = root.as_raw() as usize;
+        FOLDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|f| f.0 == key)
+            .map(|f| f.1)
     }
 
     /// A compute pipeline; user data is root parameter 0.
@@ -1722,6 +1761,9 @@ impl Host {
             }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(root);
+            if let Some(param) = Host::fold_param(root) {
+                list.SetComputeRoot32BitConstant(param, 0, 0);
+            }
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
