@@ -91,6 +91,38 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// Title view slots draws mirrored since the last [`take_slot_use`], per
+/// [`SLOT_BUCKET`] slots (the last bucket counts every slot past the
+/// others): which ranges of the title's view heap draws read.
+static SLOT_USE: [std::sync::atomic::AtomicU64; SLOT_BUCKETS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; SLOT_BUCKETS];
+/// Slots per bucket of [`SLOT_USE`].
+const SLOT_BUCKET: u32 = 1 << 14;
+const SLOT_BUCKETS: usize = 128;
+
+fn note_slot(index: u32) {
+    let bucket = ((index / SLOT_BUCKET) as usize).min(SLOT_BUCKETS - 1);
+    SLOT_USE[bucket].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The title view slots draws mirrored since the last call, as
+/// "first-last:count" per non-empty range of [`SLOT_BUCKET`] slots, per
+/// frame over `frames` frames.
+pub(crate) fn take_slot_use(frames: f64) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for (b, n) in SLOT_USE.iter().enumerate() {
+        let n = n.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if n == 0 {
+            continue;
+        }
+        let first = b as u32 * SLOT_BUCKET;
+        let last = if b == SLOT_BUCKETS - 1 { u32::MAX } else { first + SLOT_BUCKET - 1 };
+        let _ = write!(out, " {first}-{last}:{:.0}", n as f64 / frames);
+    }
+    out
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -139,10 +171,34 @@ impl HostHeap {
             match make(count + MIN_DYNAMIC) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+                    // The largest heap the host takes, searched between
+                    // the portable limit (taken everywhere) and what this
+                    // heap would need: drivers may take more than 10^6.
+                    let (mut taken, mut refused) = (PORTABLE_VIEWS, count + MIN_DYNAMIC);
+                    let mut best = None;
+                    while refused - taken > 1024 {
+                        let mid = taken + (refused - taken) / 2;
+                        match make(mid) {
+                            Ok(h) => {
+                                (taken, best) = (mid, Some(h));
+                            }
+                            Err(_) => refused = mid,
+                        }
+                    }
+                    let (heap, total) = match best {
+                        Some(h) => (h, taken),
+                        None => (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS),
+                    };
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    tracing::warn!(
+                        error = %e,
+                        count,
+                        largest_taken = total,
+                        title_slots = total - MIN_DYNAMIC,
+                        "host view heap capped"
+                    );
+                    (heap, total - MIN_DYNAMIC, MIN_DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -590,6 +646,9 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        if for_draw && !self.sampler {
+            note_slot(index);
+        }
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -1447,6 +1506,21 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// A view heap as large as the title's (1,245,184 slots) gets every
+    /// slot the host takes: at least the portable 10^6 in all, the dynamic
+    /// slots after the title's.
+    #[test]
+    fn a_heap_past_the_host_limit_takes_what_the_host_gives() {
+        let Some(heap) = HostHeap::new(false, 1_245_184) else {
+            return; // no host GPU
+        };
+        // SAFETY: a plain query of a live heap.
+        let total = unsafe { heap.heap.GetDesc().NumDescriptors };
+        eprintln!("host view heap: {total} slots, {} for the title", heap.count);
+        assert!(total >= PORTABLE_VIEWS.min(1_245_184 + DYNAMIC));
+        assert!(heap.count + heap.dynamic <= total);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
