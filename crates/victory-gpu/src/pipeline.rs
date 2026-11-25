@@ -63,6 +63,11 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Whether a pipeline worker took on its translation (see
+    /// `make::translate_own`): the others leave pipelines that need it
+    /// and make other ones meanwhile.
+    #[cfg(windows)]
+    translating: std::sync::atomic::AtomicBool,
     /// Whether its native program runs in 64-lane console waves
     /// (diagnostics: `VICTORY_SKIP_WAVE64`).
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -92,6 +97,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                translating: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(all(windows, feature = "diagnostics"))]
                 wave64: OnceLock::new(),
             })
@@ -113,7 +120,17 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                let started = std::time::Instant::now();
                 let done = translate(&self.container);
+                if started.elapsed() > std::time::Duration::from_secs(2) {
+                    tracing::warn!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        ms = started.elapsed().as_millis() as u64,
+                        bytes = self.container.len(),
+                        "slow shader translation"
+                    );
+                }
                 // Diagnostics: `VICTORY_SHADER_DUMP=<dir>` keeps each
                 // container and its DXIL as `<hash>.bin` / `<hash>.dxil`.
                 #[cfg(feature = "diagnostics")]

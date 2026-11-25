@@ -215,6 +215,9 @@ struct Queue {
     ahead: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    /// Pipelines taken for first use whose shaders other workers are
+    /// translating: back at the front once a translation is done.
+    parked: Vec<Arc<Pending>>,
 }
 
 /// What a worker took: a pipeline to make for its use, or to build ahead.
@@ -230,7 +233,31 @@ impl Queue {
             ahead: VecDeque::new(),
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            parked: Vec::new(),
         }
+    }
+
+    /// A worker took `p` to make it (state `MAKING`) but another worker is
+    /// translating one of its shaders: it waits aside, still counted in
+    /// `WAITING`, unless that translation is done by now (asked under the
+    /// queue's lock, which [`Queue::unpark`] takes after a translation).
+    fn park(&mut self, p: Arc<Pending>) {
+        p.queue_state.store(REQUESTED, Ordering::Relaxed);
+        if p.shaders.iter().any(|s| s.translated.get().is_none()) {
+            self.parked.push(p);
+        } else {
+            self.requested.push_front(p);
+        }
+    }
+
+    /// A translation is done: parked pipelines go first again. Returns
+    /// whether any did.
+    fn unpark(&mut self) -> bool {
+        let any = !self.parked.is_empty();
+        for p in self.parked.drain(..).rev() {
+            self.requested.push_front(p);
+        }
+        any
     }
 
     /// Queues a pipeline or promotes one queued at a lower priority.
@@ -319,8 +346,45 @@ fn next() -> (Arc<Pending>, Job) {
     }
 }
 
+/// Translates the shaders of `p` no other worker is translating; true if
+/// all of them are translated now. A worker that waited for another's
+/// translation of a shared shader instead held up the rest of the queue: in
+/// the world, ~1,000 pipelines stayed "being made" for 14 minutes while
+/// the workers made about one a minute.
+fn translate_own(p: &Pending) -> bool {
+    let mut others = false;
+    let mut translated = false;
+    for s in &p.shaders {
+        if s.translated.get().is_some() {
+            continue;
+        }
+        if s.translating.swap(true, Ordering::AcqRel) {
+            others = true;
+        } else {
+            let _ = s.translated();
+            translated = true;
+        }
+    }
+    if translated {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.unpark() {
+            AVAILABLE.notify_all();
+        }
+    }
+    !others || p.shaders.iter().all(|s| s.translated.get().is_some())
+}
+
 /// Runs one job a worker took.
 fn run(p: Arc<Pending>, job: Job) {
+    if !translate_own(&p) {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        match job {
+            Job::Make => queue.park(p),
+            // Built ahead some other time (or made at its first use).
+            Job::Ahead => queue.built_ahead(&p),
+        }
+        return;
+    }
     match job {
         Job::Make => {
             p.make();
@@ -358,7 +422,7 @@ fn workers() -> bool {
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
+                .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -367,7 +431,9 @@ fn workers() -> bool {
                     }
                     loop {
                         let (p, job) = next();
+                        busy(i, Some((Instant::now(), p.clone(), job == Job::Ahead)));
                         run(p, job);
+                        busy(i, None);
                     }
                 });
             if let Err(e) = spawned {
@@ -376,8 +442,77 @@ fn workers() -> bool {
                 running = true;
             }
         }
+        if running {
+            let _ = std::thread::Builder::new()
+                .name("victory-pipelines-watch".into())
+                .spawn(|| loop {
+                    std::thread::sleep(WATCH_EVERY);
+                    report_slow_workers();
+                });
+        }
         running
     })
+}
+
+/// What each worker is making: since when, the pipeline, whether to build
+/// it ahead.
+type Work = (Instant, Arc<Pending>, bool);
+static BUSY: Mutex<Vec<Option<Work>>> = Mutex::new(Vec::new());
+
+/// How often the workers are looked at, and how long one may be busy with
+/// a pipeline before it is reported.
+const WATCH_EVERY: Duration = Duration::from_secs(10);
+const SLOW: Duration = Duration::from_secs(10);
+
+fn busy(worker: usize, work: Option<Work>) {
+    let mut busy = BUSY.lock().unwrap_or_else(|e| e.into_inner());
+    if busy.len() <= worker {
+        busy.resize_with(worker + 1, || None);
+    }
+    busy[worker] = work;
+}
+
+/// Logs the workers busy with one pipeline for longer than [`SLOW`]: what
+/// they make and which of its shaders are not translated yet (a worker
+/// making a pipeline whose shader another worker translates waits for it),
+/// with the queues' lengths. In the world 1,000 pipelines stayed "being
+/// made" for 14 minutes while the workers made about one a minute.
+fn report_slow_workers() {
+    let slow: Vec<(usize, Work)> = BUSY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .enumerate()
+        .filter_map(|(i, w)| w.clone().map(|w| (i, w)))
+        .filter(|(_, (since, ..))| since.elapsed() >= SLOW)
+        .collect();
+    if slow.is_empty() {
+        return;
+    }
+    let (requested, early, ahead) = {
+        let q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        (q.requested.len(), q.early.len(), q.ahead.len())
+    };
+    for (worker, (since, p, ahead_job)) in slow {
+        let untranslated: Vec<String> = p
+            .shaders
+            .iter()
+            .filter(|s| s.translated.get().is_none())
+            .map(|s| format!("{} {}", s.stage, s.hash))
+            .collect();
+        tracing::warn!(
+            worker,
+            seconds = since.elapsed().as_secs(),
+            ahead = ahead_job,
+            shaders = ?p.shaders,
+            ?untranslated,
+            waiting = WAITING.load(Ordering::Relaxed),
+            requested,
+            early,
+            ahead,
+            "pipeline worker slow"
+        );
+    }
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -463,6 +598,73 @@ mod tests {
         assert!(Arc::ptr_eq(&p, &ahead));
         assert_eq!(job, Job::Ahead);
         assert!(queue.pop().is_none());
+    }
+
+    /// A pipeline whose shader another worker translates waits aside, and
+    /// goes first again once a translation is done.
+    #[test]
+    fn parked_pipelines_go_first_after_a_translation() {
+        let shared = super::super::shader("compute", b"parked: shared shader");
+        let parked = Arc::new(Pending::new(vec![shared.clone()], None));
+        let other = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        queue.push(&parked, REQUESTED);
+        queue.push(&other, REQUESTED);
+        let (p, _) = queue.pop().unwrap();
+        assert!(Arc::ptr_eq(&p, &parked));
+        queue.park(p);
+        assert_eq!(parked.queue_state.load(Ordering::Relaxed), REQUESTED);
+        assert_eq!(queue.push(&parked, REQUESTED), None, "a draw does not queue it twice");
+        let (p, _) = queue.pop().unwrap();
+        assert!(Arc::ptr_eq(&p, &other));
+        assert!(queue.pop().is_none(), "parked, not taken");
+        // The other worker's translation is done.
+        let _ = shared.translated();
+        assert!(queue.unpark());
+        let (p, job) = queue.pop().unwrap();
+        assert!(Arc::ptr_eq(&p, &parked));
+        assert_eq!(job, Job::Make);
+        // Parked after its shader was done already: straight back.
+        queue.park(p);
+        assert!(!queue.unpark());
+        assert!(Arc::ptr_eq(&queue.pop().unwrap().0, &parked));
+    }
+
+    /// The workers make other pipelines while one's shader is being
+    /// translated elsewhere (here: never finished).
+    #[test]
+    fn workers_do_not_wait_for_another_workers_translation() {
+        let stuck = super::super::shader("compute", b"workers: a translation that never ends");
+        stuck.translating.store(true, Ordering::Release);
+        let blocked = Arc::new(Pending::new(vec![stuck.clone()], None));
+        let free: Vec<Arc<Pending>> = (0..32u8)
+            .map(|i| {
+                let s = super::super::shader("compute", &[b'w', b'f', i]);
+                Arc::new(Pending::new(vec![s], None))
+            })
+            .collect();
+        start(&blocked, REQUESTED);
+        for p in &free {
+            start(p, REQUESTED);
+        }
+        let started = Instant::now();
+        while free.iter().any(|p| p.made.get().is_none()) && started.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(free.iter().all(|p| p.made.get().is_some()), "workers waited");
+        assert!(blocked.made.get().is_none());
+        // The translation ends (as a worker's would, unparking).
+        let _ = stuck.translated();
+        {
+            let mut queue = QUEUE.lock().unwrap();
+            queue.unpark();
+            AVAILABLE.notify_all();
+        }
+        let started = Instant::now();
+        while blocked.made.get().is_none() && started.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(blocked.made.get().is_some(), "made once its shader was");
     }
 
     /// After a build ahead the pipeline is not queued (its first use
