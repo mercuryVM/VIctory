@@ -650,15 +650,21 @@ impl HostHeap {
             note_slot(index);
         }
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            // Diagnostic (NVIDIA heap cap): once per range of `SLOT_BUCKET`
+            // slots past the host heap, for writes and for draws (titles
+            // write whole ranges slot by slot: once per slot flooded the
+            // log). What draws read there is in the per-frame slot use.
+            static SEEN: [std::sync::atomic::AtomicU64; 2 * SLOT_BUCKETS / 64] =
+                [const { std::sync::atomic::AtomicU64::new(0) }; 2 * SLOT_BUCKETS / 64];
+            let bucket = ((index / SLOT_BUCKET) as usize).min(SLOT_BUCKETS - 1)
+                + usize::from(for_draw) * SLOT_BUCKETS;
+            let bit = 1u64 << (bucket % 64);
+            if SEEN[bucket / 64].fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
                 tracing::warn!(
                     index,
                     count = self.count,
                     for_draw,
-                    "title slot past the host heap"
+                    "title slot past the host heap (first in its range of 16,384)"
                 );
             }
             return None;
