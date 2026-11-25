@@ -1941,10 +1941,12 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+            // SAFETY: the list's own mapped words, read and written before
+            // it runs (its last run is over).
+            deferred.copies.push(Step::Host(Box::new(move || unsafe {
+                crate::indirect::log_records(at as *mut u32);
+                (at as *mut u32).write_volatile(0);
+            })));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })

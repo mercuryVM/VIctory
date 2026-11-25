@@ -71,6 +71,10 @@ pub(crate) struct Shader {
     /// (diagnostics: `VICTORY_SKIP_WAVE64`).
     #[cfg(all(windows, feature = "diagnostics"))]
     wave64: OnceLock<bool>,
+    /// Whether its native code intersects rays with a BVH
+    /// (`image_bvh*_intersect_ray`, [`Shader::ray_traces`]).
+    #[cfg(windows)]
+    ray_traces: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -103,7 +107,46 @@ impl Shader {
             translated: Default::default(),
             #[cfg(all(windows, feature = "diagnostics"))]
             wave64: OnceLock::new(),
+            #[cfg(windows)]
+            ray_traces: OnceLock::new(),
         }
+    }
+}
+
+/// Whether native GFX10 `code` holds `image_bvh_intersect_ray` or
+/// `image_bvh64_intersect_ray` (code that does not decode: no).
+#[cfg(windows)]
+fn intersects_rays(code: &[u8]) -> bool {
+    victory_shader::gfx10::decode(code).is_ok_and(|insts| {
+        insts
+            .iter()
+            .any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh")))
+    })
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// Whether the container's native code intersects rays with a BVH
+    /// (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`): its
+    /// traversal loops, emulated node by node, cost far more per thread
+    /// than other code (see `crate::indirect`).
+    pub(crate) fn ray_traces(&self) -> bool {
+        *self.ray_traces.get_or_init(|| {
+            victory_shader::Container::parse(&self.container)
+                .ok()
+                .and_then(|c| {
+                    c.part(victory_shader::FourCC::DXIL)
+                        .map(|p| p.data.to_vec())
+                })
+                .and_then(|d| victory_shader::native::native_programs(&d).ok())
+                .is_some_and(|ps| ps.iter().any(|p| intersects_rays(&p.code)))
+        })
+    }
+
+    /// [`Shader::hash`]'s first 8 digits as a number, as `crate::indirect`
+    /// logs it.
+    pub(crate) fn tag(&self) -> u32 {
+        u32::from_str_radix(&self.hash[..8], 16).unwrap_or(0)
     }
 }
 
@@ -818,6 +861,22 @@ mod tests {
         );
         assert_eq!(super::parse_skip_stages("hull,pixel"), ["pixel"]);
         assert!(super::parse_skip_stages("").is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn ray_tracing_code_is_told_by_its_bvh_instruction() {
+        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        // image_bvh_intersect_ray v[20:23], v[2:12], s[12:15]; s_endpgm.
+        let bvh = words(&[0xF198_9F01, 20 << 8 | 3 << 16 | 2, 0xBF81_0000]);
+        // image_bvh64_intersect_ray, then the end.
+        let bvh64 = words(&[0xF19C_9F01, 20 << 8 | 3 << 16 | 2, 0xBF81_0000]);
+        // v_mov_b32 v1, v0; s_endpgm.
+        let plain = words(&[0x7E02_0300, 0xBF81_0000]);
+        assert!(super::intersects_rays(&bvh));
+        assert!(super::intersects_rays(&bvh64));
+        assert!(!super::intersects_rays(&plain));
+        assert!(!super::intersects_rays(&[1, 2, 3]));
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]
