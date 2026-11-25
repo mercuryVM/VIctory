@@ -307,7 +307,9 @@ impl Shared {
             slots.push(slot);
         }
         let ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
-        let (dwords, blocks, owner) = table(&ranges, &slots, self.null);
+        // Shaders see the slots at their indices in a capped heap's map.
+        let seen: Vec<u32> = slots.iter().map(|&s| heap.shader_index(s)).collect();
+        let (dwords, blocks, owner) = table(&ranges, &seen, heap.shader_index(self.null));
         // SAFETY: the mapping has room for `CAPACITY` blocks, which `table`
         // keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };

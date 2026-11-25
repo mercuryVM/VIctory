@@ -414,7 +414,11 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         linked_cols: None,
     })
     .expect("lower");
-    assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
+    // (The view-stride table, which every heap index goes through.)
+    assert!(
+        l.root_srvs.iter().all(|&s| s == super::VIEW_STRIDES) && !l.memory,
+        "no root descriptor, no title memory"
+    );
     let marks: Vec<(u32, u32)> = l
         .user_data
         .iter()
