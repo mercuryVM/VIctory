@@ -113,6 +113,9 @@ pub(crate) fn all_threads(st: &Structured) -> Vec<bool> {
         .collect()
 }
 
+/// A [`Lanes::bool_varies`] question: the bit, the block, the guard.
+type Question = (Bool, usize, Option<Bool>);
+
 /// What may differ between the lanes of one console wave (see [`varying`]).
 struct Lanes<'a> {
     st: &'a Structured,
@@ -126,7 +129,7 @@ struct Lanes<'a> {
     /// can only make lanes differ more). Each question searches up to
     /// `MAX_MEET` steps; asked again on every pass, they took ~1 s of a
     /// world mesh program's translation.
-    answers: std::cell::RefCell<HashMap<(Bool, usize, Option<Bool>), (bool, (usize, usize))>>,
+    answers: std::cell::RefCell<HashMap<Question, (bool, (usize, usize))>>,
 }
 
 impl Lanes<'_> {

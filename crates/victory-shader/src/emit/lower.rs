@@ -102,6 +102,9 @@ enum Stop {
 
 const DIRECT_CENTER: Why = "a direct perspective-center barycentric input";
 const UNTRACKED_SELECT: Why = "a select on an untracked mask";
+/// Lowering attempts per program at most, one per phi found to have no
+/// DXIL form (see [`lower_program`]).
+const MAX_RETRIES: usize = 128;
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     match lower_program(parts, false) {
@@ -160,6 +163,15 @@ fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, Shader
         match lower.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
+                // Each retry lowers the whole program again. Of the world's
+                // slowest programs none that lowered needed more than 68;
+                // those that went on to 500 failed in the end, after minutes.
+                if bad.len() >= MAX_RETRIES {
+                    return Err(ShaderError::Unsupported {
+                        offset: 0,
+                        what: "more phis without a DXIL form than the lowering retries for",
+                    });
+                }
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
                         offset: 0,
