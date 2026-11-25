@@ -1163,9 +1163,9 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            // SAFETY: a plain query.
             if removed_in.is_none()
                 && groups.len() == runs.len()
+                // SAFETY: a plain query on the live device.
                 && unsafe { self.device.GetDeviceRemovedReason() }.is_err()
             {
                 removed_in = Some(i);
