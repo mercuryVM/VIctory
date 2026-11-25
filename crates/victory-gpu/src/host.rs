@@ -2709,6 +2709,7 @@ impl Meter {
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
+        let slot_use = crate::descriptor::host::take_slot_use(frames);
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -2722,6 +2723,9 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
+            if !slot_use.is_empty() {
+                tracing::info!("title view slots draws read per frame, by range:{slot_use}");
+            }
             if let Some(host) = host() {
                 host.log_video_memory();
             }
