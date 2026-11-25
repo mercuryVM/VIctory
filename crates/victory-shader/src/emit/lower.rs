@@ -113,11 +113,35 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     }
 }
 
+/// What [`Lower`] needs of the program that no attempt changes: a wave64
+/// mesh program's lanes that may differ and the blocks every thread runs.
+/// Made once per program, not per attempt: a world mesh program with 33
+/// phis retried took ~1.5 s per attempt here, ~50 s in all.
+struct Fixed<'a> {
+    varying: Option<super::halves::Varying<'a>>,
+    all_threads: Vec<bool>,
+}
+
+impl<'a> Fixed<'a> {
+    fn new(x: &'a Parts<'a>) -> Self {
+        let mesh = x.native.stage == HwStage::Ms;
+        Fixed {
+            varying: (mesh && x.native.wave64).then(|| super::halves::varying(x.p, x.st)),
+            all_threads: if mesh {
+                super::halves::all_threads(x.st)
+            } else {
+                vec![false; x.p.blocks.len()]
+            },
+        }
+    }
+}
+
 fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     let mut direct_center = false;
+    let fixed = Fixed::new(parts);
     loop {
-        let mut lower = Lower::new(parts, &bad, numeric_selects);
+        let mut lower = Lower::new(parts, &bad, &fixed, numeric_selects);
         if direct_center {
             lower.s.flags |= flags::BARYCENTRICS;
             lower.s.inputs.push(SigElement {
@@ -296,10 +320,10 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Wave64 mesh: values that may differ between a console wave's lanes
     /// (see [`super::halves::varying`]).
-    varying: Option<super::halves::Varying<'a>>,
+    varying: Option<&'a super::halves::Varying<'a>>,
     /// Mesh: IR blocks every thread of the group runs exactly once, where
     /// group barriers can exchange lanes (see [`super::halves`]).
-    all_threads: Vec<bool>,
+    all_threads: &'a [bool],
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
     /// Masks held as numbers whose number is being read (see `atom`).
@@ -699,7 +723,12 @@ fn scalar_constant(operand: Operand) -> Option<u32> {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        fixed: &'a Fixed<'a>,
+        numeric_selects: bool,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -973,13 +1002,8 @@ impl<'a> Lower<'a> {
                 _ => MaskData::None,
             },
             mask_ok: false,
-            varying: (x.native.stage == HwStage::Ms && x.native.wave64)
-                .then(|| super::halves::varying(p, x.st)),
-            all_threads: if x.native.stage == HwStage::Ms {
-                super::halves::all_threads(x.st)
-            } else {
-                vec![false; p.blocks.len()]
-            },
+            varying: fixed.varying.as_ref(),
+            all_threads: &fixed.all_threads,
             ballots: HashMap::new(),
             opaque_open: HashSet::new(),
             balloting: HashSet::new(),

@@ -120,6 +120,13 @@ struct Lanes<'a> {
     values: HashSet<Value>,
     /// Compare and carry results whose lane bit may differ beyond EXEC.
     bits: HashSet<Value>,
+    /// [`Lanes::bool_varies`]' answers, with the sizes of `values` and
+    /// `bits` they were given at. Both only grow, so an answer holds while
+    /// they keep their sizes, and a yes holds after (more atoms that vary
+    /// can only make lanes differ more). Each question searches up to
+    /// `MAX_MEET` steps; asked again on every pass, they took ~1 s of a
+    /// world mesh program's translation.
+    answers: std::cell::RefCell<HashMap<(Bool, usize, Option<Bool>), (bool, (usize, usize))>>,
 }
 
 impl Lanes<'_> {
@@ -135,8 +142,17 @@ impl Lanes<'_> {
     /// Whether lanes of one wave that enter block `b` (and pass `guard`)
     /// can disagree on `bit`.
     fn bool_varies(&self, bit: Bool, b: usize, guard: Option<Bool>) -> bool {
+        let now = (self.values.len(), self.bits.len());
+        let key = (bit, b, guard);
+        if let Some(&(varies, at)) = self.answers.borrow().get(&key)
+            && (varies || at == now)
+        {
+            return varies;
+        }
         let within: Vec<Bool> = [self.st.reach[b]].into_iter().chain(guard).collect();
-        self.st.bools.varies(bit, &within, &|a| self.atom_varies(a))
+        let varies = self.st.bools.varies(bit, &within, &|a| self.atom_varies(a));
+        self.answers.borrow_mut().insert(key, (varies, now));
+        varies
     }
 
     /// A lane mask's bit, by any of its dwords' values.
@@ -191,24 +207,29 @@ pub(crate) fn varying<'a>(p: &'a Program, st: &'a Structured) -> Varying<'a> {
             .map(|&(_, v)| v)
             .collect(),
         bits: HashSet::new(),
+        answers: Default::default(),
     };
     let masks: HashSet<Value> = st.masks.keys().chain(st.highs.keys()).copied().collect();
     let cycle = in_cycle(st);
+    // What each block reaches, asked again on every pass below (once per
+    // divergent branch, and per block for each one on a cycle): walked each
+    // time, that made `varying` take ~1.5 s on the world's mesh programs.
+    let reach: Vec<Vec<bool>> = (0..st.exits.len()).map(|b| reachable(st, b)).collect();
     let mut divergent_loop;
     loop {
         let before = (l.values.len(), l.bits.len());
         // Blocks reachable from each side of a divergent branch.
-        let splits: Vec<(Vec<bool>, Vec<bool>)> = (0..n)
+        let splits: Vec<(&[bool], &[bool])> = (0..n)
             .filter_map(|b| l.divergent(b))
-            .map(|(t, f)| (reachable(st, t), reachable(st, f)))
+            .map(|(t, f)| (&reach[t][..], &reach[f][..]))
             .collect();
         // Loops some lanes leave before others: a block on a cycle with a
         // divergent branch, and every block on a cycle through it.
         divergent_loop = vec![false; n];
         for b in (0..n).filter(|&b| cycle[b] && l.divergent(b).is_some()) {
-            let from = reachable(st, b);
+            let from = &reach[b];
             for c in 0..n {
-                if from[c] && reachable(st, c)[b] {
+                if from[c] && reach[c][b] {
                     divergent_loop[c] = true;
                 }
             }

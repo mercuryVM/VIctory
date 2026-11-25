@@ -512,15 +512,49 @@ fn translate(
     let container_bytes = &bytes[..container.total_size];
     for (program_index, p) in programs.into_iter().enumerate() {
         t.programs += 1;
-        match ir::build_with(&p.patched_code(), p.wave64, p.vgprs, p.spills_root_args()) {
+        // Phases of a slow program, on stderr: slow translations hold the
+        // runtime's pipeline workers (`VICTORY_SLOW_DUMP=<dir>` keeps their
+        // containers as `<runtime hash>.bin`).
+        let started = std::time::Instant::now();
+        let mut phases: Vec<(&str, std::time::Duration)> = Vec::new();
+        let mut lap = std::time::Instant::now();
+        let mut phase = |name: &'static str, phases: &mut Vec<(&str, std::time::Duration)>| {
+            phases.push((name, lap.elapsed()));
+            lap = std::time::Instant::now();
+        };
+        let built = ir::build_with(&p.patched_code(), p.wave64, p.vgprs, p.spills_root_args());
+        phase("build", &mut phases);
+        let slow = |phases: &[(&str, std::time::Duration)]| {
+            if started.elapsed() < std::time::Duration::from_secs(2) {
+                return;
+            }
+            let hash = blake3::hash(container_bytes).to_hex()[..16].to_owned();
+            let parts: Vec<String> = phases
+                .iter()
+                .map(|(n, d)| format!("{n} {} ms", d.as_millis()))
+                .collect();
+            eprintln!(
+                "slow shader: hash={hash} {:?} {} ms ({})",
+                p.stage,
+                started.elapsed().as_millis(),
+                parts.join(", ")
+            );
+            if let Some(dir) = std::env::var_os("VICTORY_SLOW_DUMP") {
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{hash}.bin")), container_bytes);
+            }
+        };
+        match built {
             Ok(program) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
                 // Per-lane descriptors are traced on the per-lane form; its
                 // failure is listed after the resources' and I/O's.
                 let structured = structure::structure(&program);
+                phase("structure", &mut phases);
                 let lanes = structured.as_ref().ok();
-                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+                let tracked = resource::track(&program, &p.layout, p.stage, lanes);
+                phase("resources", &mut phases);
+                let res = match tracked {
                     Ok(r) => {
                         tally_resources(&p, &r, t);
                         Some(r)
@@ -541,7 +575,9 @@ fn translate(
                 let mut raised = None;
                 if graphics || compute || p.stage == HwStage::Ms {
                     t.io_programs += usize::from(graphics);
-                    match io::raise(&program, &p) {
+                    let io_raised = io::raise(&program, &p);
+                    phase("io", &mut phases);
+                    match io_raised {
                         Ok(r) => {
                             if graphics {
                                 tally_io(&r, t);
@@ -573,7 +609,9 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r, checks.target) {
+                    let emitted = emit::emit(&container, &p, &program, &s, &i, &r, checks.target);
+                    phase("emit", &mut phases);
+                    match emitted {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             if Some(program_index) == cache_target
@@ -594,6 +632,7 @@ fn translate(
                         Err(e) => t.fail(format!("emit: {e}"), label),
                     }
                 }
+                slow(&phases);
             }
             Err(e) => {
                 let reason = match e {
