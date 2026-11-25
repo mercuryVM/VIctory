@@ -1186,9 +1186,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
+                // A placed texture without a usable host view gets a null
+                // descriptor, including a writable one with the switch off.
                 once!(dimension = resource[0], "placed unordered texture view not mirrored");
                 return None;
             }
@@ -1210,19 +1209,52 @@ fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// Make a placed colour texture writable. Packed RGB9E5 lighting textures
+/// are written as 32-bit integers and sampled through their original SRV.
+/// The view still selects the title's mip and array slices.
+fn writable_placed(resource: &mut [u32; 14], view: &mut [u32; 10]) {
+    let packed = DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32;
+    let uint = DXGI_FORMAT_R32_UINT.0 as u32;
+    resource[12] |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32;
+    if resource[8] == packed {
+        resource[8] = uint;
+        if view[0] == DXGI_FORMAT_UNKNOWN.0 as u32 {
+            view[0] = uint;
+        }
+    }
+    if view[0] == packed {
+        view[0] = uint;
+    }
+}
+
+/// A placed texture view resolved against the title's texture memory.
+/// Writable colour views are opt-in while testing their GPU aliases.
+/// Adapted from ScarlettPort's fx-harvest runtime (38e8e7c, GPL-3.0-or-later).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let mut words = desc[..10].try_into().ok()?;
+    if !unordered {
+        let texture = crate::resource::texture_at(address, resource)?;
+        return Some(View::Shader(texture as usize, Some(words)));
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_WRITE_VIEWS"))
+        || resource[12] & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 as u32 != 0
+        || resource[9] != 1
+    {
+        return None;
+    }
+    let mut resource = *resource;
+    writable_placed(&mut resource, &mut words);
+    let texture = crate::resource::texture_at(address, &resource)?;
+    Some(View::Unordered(texture as usize, 0, Some(words)))
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -1393,6 +1425,32 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placed_colour_uav_preserves_layout_and_uses_integer_packed_texels() {
+        let uint = DXGI_FORMAT_R32_UINT.0 as u32;
+        let packed = DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32;
+        let rgba = DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32;
+        for (format, view_format, expected, expected_view) in [
+            (packed, packed, uint, uint),
+            (packed, uint, uint, uint),
+            (packed, 0, uint, uint),
+            (rgba, rgba, rgba, rgba),
+        ] {
+            let mut resource = [
+                3, 0, 65536, 0, 32, 0, 16, 0x20001, format, 1, 0, 0x105, 1, 0,
+            ];
+            let mut view = [view_format, 5, 1, 2, 3, 4, 0, 0, 0, 0];
+            let mut expected_resource = resource;
+            let mut expected_words = view;
+            expected_resource[8] = expected;
+            expected_resource[12] = 5;
+            expected_words[0] = expected_view;
+            writable_placed(&mut resource, &mut view);
+            assert_eq!(resource, expected_resource);
+            assert_eq!(view, expected_words);
+        }
+    }
 
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]
